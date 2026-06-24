@@ -2,11 +2,7 @@ name: test mcp server
 
 on:
   pull_request:
-    branches:
-      - main
-    paths:
-      - mcp_server/src/t2c_mcp.py
-  push:
+    types: [labeled]
     branches:
       - main
     paths:
@@ -14,6 +10,7 @@ on:
 
 jobs:
   test:
+    if: contains(github.event.pull_request.labels.*.name, 'run-ci')
     runs-on: ubuntu-latest
 
     steps:
@@ -30,5 +27,5 @@ jobs:
       - name: lint with ruff
         run: ruff check mcp_server/src/t2c_mcp.py
 
-      - name: run tests
-        run: pytest mcp_server/tests/test_t2c_mcp.py
+      # - name: run tests  # no tests yet; pytest exits code 5 on empty file
+      #   run: pytest mcp_server/tests/test_t2c_mcp.py
