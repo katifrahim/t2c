@@ -1,0 +1,36 @@
+# create venv first
+# prod: run "pip install -e ."
+# dev: run "pip install -e ".[dev]""
+
+[build-system]
+requires = ["setuptools>=61.0.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "t2c_mcp"    # package name
+version = "0.1.0"
+requires-python = "==3.13.7"    # only tested on 3.13.7
+dependencies = [    # prod deps
+    "cadquery==2.7.0",
+    "mcp==1.27.0",
+    "ocp-vscode==3.3.4"
+]
+
+[project.optional-dependencies]
+dev = [     # dev deps
+    "pytest>=9.0", 
+    "ruff>=0.15"
+]
+
+[tool.setuptools]
+packages = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff.lint]
+select = []
+ignore = []
+
+[tool.ruff.format]
+indent-style = "space"    # default = 4 spaces per indent

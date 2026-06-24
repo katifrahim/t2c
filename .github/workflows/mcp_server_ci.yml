@@ -1,0 +1,34 @@
+name: test mcp server
+
+on:
+  pull_request:
+    branches:
+      - main
+    paths:
+      - mcp_server/src/t2c_mcp.py
+  push:
+    branches:
+      - main
+    paths:
+      - mcp_server/src/t2c_mcp.py
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13" # try 3.12 if pytest/ ruff give error 
+
+      - name: install package and dev dependencies
+        run: pip install -e ".[dev]"
+        working-directory: mcp_server
+
+      - name: lint with ruff
+        run: ruff check mcp_server/src/t2c_mcp.py
+
+      - name: run tests
+        run: pytest mcp_server/tests/test_t2c_mcp.py
