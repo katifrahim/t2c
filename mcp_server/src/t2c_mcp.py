@@ -1898,7 +1898,7 @@ async def assembly_api(
         Fused STEP (only if user asks for a single merged solid):
         {"method": "export", "params": {"path": "C:\\Users\\...\\assy.step", "exportType": "STEP", "mode": "fused"}}
         
-        Note: Whenever the user asks to export something, ask him/ her to provide you an absolute file path where you should export the files. Remember to include double backslahes (\\) in that path rather than single ones (\)!
+        Note: Whenever the user asks to export something, ask him/ her to provide you an absolute file path where you should export the files. Remember to include double backslahes (\\) in that path rather than single ones (\\)!
 
         Supported exportType values: 'STEP', 'XML', 'XBF', 'GLTF', 'VTKJS', 'VRML', 'STL'
 
