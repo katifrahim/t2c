@@ -2,6 +2,7 @@
 CadQuery Specialized MCP Server.
 Tools: workplane_api, sketch_api, assembly_api, query_docs
 """
+# MCP server entry point
 
 from typing import Any, Dict, List, Optional
 import inspect
