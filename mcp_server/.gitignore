@@ -18,8 +18,4 @@ build/
 .ruff_cache/
 
 # OS files
-.DS_Store
 Thumbs.db
-
-# ides
-.vscode/
