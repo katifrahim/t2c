@@ -9,7 +9,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "t2c_mcp"    # package name
 version = "0.1.0"
-requires-python = ">=3.13.7"
+requires-python = ">=3.13.7,<3.14"
 dependencies = [    # prod deps
     "cadquery==2.7.0",
     "mcp==1.27.0",
