@@ -8,6 +8,7 @@ from typing import Any, Dict, List, Optional
 import inspect
 import json
 import math
+import os
 import traceback
 import sys
 
@@ -2100,8 +2101,83 @@ async def query_docs(methods: List[str], cls: Optional[str] = None) -> str:
 
 
 # =============================================================================
+# HTTP ROUTES & AUTH  (only used when MCP_TRANSPORT=http)
+# =============================================================================
+# These run on the same FastMCP app as the streamable-HTTP /mcp endpoint.
+# Auth model: a single shared secret (MCP_TOKEN). The web backend sends it as
+# a Bearer token; the browser never sees it. If MCP_TOKEN is unset (local/dev),
+# requests are allowed so stdio / local testing is unaffected.
+
+def _authorized(request) -> bool:
+    expected = os.environ.get("MCP_TOKEN")
+    if not expected:
+        return True
+    return request.headers.get("authorization") == f"Bearer {expected}"
+
+
+@mcp.custom_route("/health", methods=["GET"])
+async def _health(request):
+    from starlette.responses import JSONResponse
+    return JSONResponse({"status": "ok"})
+
+
+@mcp.custom_route("/export", methods=["GET"])
+async def _export(request):
+    """Export the current stored object so the web backend can serve it as a
+    download. Token-gated. ?fmt=step|stl|brep (default step)."""
+    from starlette.responses import JSONResponse, FileResponse
+    if not _authorized(request):
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+    fmt = request.query_params.get("fmt", "step").lower()
+    ext = {"step": "step", "stp": "step", "stl": "stl", "brep": "brep"}.get(fmt, "step")
+    try:
+        obj = _get(None)  # current object
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=404)
+    import tempfile
+    path = os.path.join(tempfile.gettempdir(), f"model.{ext}")
+    try:
+        cq.exporters.export(obj.val() if hasattr(obj, "val") else obj, path)
+    except Exception as e:
+        return JSONResponse({"error": f"export failed: {e}"}, status_code=500)
+    return FileResponse(path, filename=f"model.{ext}")
+
+
+# =============================================================================
 # ENTRY POINT
 # =============================================================================
+# Default transport is stdio (local use + CI unchanged). Set MCP_TRANSPORT=http
+# to serve the streamable-HTTP /mcp endpoint plus /health and /export.
+
+class _AuthASGI:
+    """Pure-ASGI auth wrapper. Gates only the /mcp endpoint; passes everything
+    else (incl. lifespan + streaming) straight through so it never buffers the
+    streamable-HTTP response."""
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope.get("type") == "http" and scope.get("path", "").startswith("/mcp"):
+            headers = dict(scope.get("headers") or [])
+            auth = headers.get(b"authorization", b"").decode()
+            expected = os.environ.get("MCP_TOKEN")
+            if expected and auth != f"Bearer {expected}":
+                from starlette.responses import JSONResponse
+                await JSONResponse({"error": "unauthorized"}, status_code=401)(scope, receive, send)
+                return
+        await self.app(scope, receive, send)
+
+
+def _run_http():
+    import uvicorn
+    mcp.settings.host = os.environ.get("MCP_HOST", "127.0.0.1")
+    mcp.settings.port = int(os.environ.get("MCP_PORT", "9000"))
+    app = _AuthASGI(mcp.streamable_http_app())
+    uvicorn.run(app, host=mcp.settings.host, port=mcp.settings.port)
+
 
 if __name__ == "__main__":
-    mcp.run(transport="stdio")
+    if os.environ.get("MCP_TRANSPORT", "stdio") == "http":
+        _run_http()
+    else:
+        mcp.run(transport="stdio")
