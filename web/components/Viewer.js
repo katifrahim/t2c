@@ -117,6 +117,7 @@ export default function Viewer() {
       const { TCV } = ref.current;
       const container = containerRef.current;
       if (!TCV || !container) return;
+      ref.current.payload = payload; // remember for re-fitting on resize
       if (ref.current.viewer) { try { ref.current.viewer.dispose(); } catch {} }
       container.innerHTML = "";
 
@@ -160,9 +161,39 @@ export default function Viewer() {
       timer = setInterval(poll, 1000);
     })();
 
+    // Re-fit the canvas to the container on window resize AND slider drags,
+    // preserving the camera/model (mirrors ocp_vscode's viewer.html — re-render
+    // is avoided so the user's view isn't reset).
+    function handleResize() {
+      const viewer = ref.current.viewer;
+      const container = containerRef.current;
+      if (!viewer || !container) return;
+      const config = (ref.current.payload && ref.current.payload.config) || {};
+      const w = container.clientWidth || 800;
+      const h = container.clientHeight || 600;
+      const d = getDisplayOptions(config, w, h);
+      try {
+        viewer.resizeCadView(d.cadWidth, d.treeWidth, d.height, d.glass);
+        if (viewer.gridHelper) {
+          viewer.gridHelper.clearCache();
+          viewer.gridHelper.update(viewer.getCameraZoom(), true);
+        }
+        viewer.update(true, true);
+      } catch { /* ignore */ }
+    }
+
+    let rafId = null;
+    const ro = new ResizeObserver(() => {
+      if (rafId) cancelAnimationFrame(rafId);
+      rafId = requestAnimationFrame(handleResize);
+    });
+    if (containerRef.current) ro.observe(containerRef.current);
+
     return () => {
       cancelled = true;
       if (timer) clearInterval(timer);
+      if (rafId) cancelAnimationFrame(rafId);
+      ro.disconnect();
       if (ref.current.viewer) { try { ref.current.viewer.dispose(); } catch {} }
     };
   }, []);

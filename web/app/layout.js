@@ -1,6 +1,6 @@
 import "./globals.css";
 
-export const metadata = { title: "t2c" };
+export const metadata = { title: "T2C" };
 
 export default function RootLayout({ children }) {
   return (

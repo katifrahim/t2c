@@ -343,6 +343,20 @@ def _show(obj: Any) -> None:
         pass
 
 
+def _build_placeholder() -> Any:
+    """A single Workplane vertex shown at startup and after /clear so the 3D
+    viewer is never blank — it still renders the grid, axes, and toolbar."""
+    return Workplane().newObject([Vertex.makeVertex(0, 0, 0)])
+
+
+def _init_viewer() -> None:
+    """Populate the viewer with the placeholder so /model has content from boot."""
+    try:
+        _show(_build_placeholder())
+    except Exception:
+        pass
+
+
 def _properties(obj: Any) -> dict:
     props = {}
 
@@ -2163,15 +2177,37 @@ async def _health(request):
     return JSONResponse({"status": "ok"})
 
 
+@mcp.custom_route("/clear", methods=["POST"])
+async def _clear(request):
+    """Reset the object store to a clean slate (new session) and re-show the
+    placeholder vertex so the viewer updates. Token-gated."""
+    from starlette.responses import JSONResponse
+    if not _authorized(request):
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+    global _current
+    _state.clear()
+    _counters.clear()
+    _current = None
+    _init_viewer()
+    return JSONResponse({"status": "ok"})
+
+
 @mcp.custom_route("/export", methods=["GET"])
 async def _export(request):
     """Export the current stored object so the web backend can serve it as a
-    download. Token-gated. ?fmt=step|stl|brep (default step)."""
+    download. Token-gated. ?fmt=stl|3mf|step|amf|brep (default step)."""
     from starlette.responses import JSONResponse, FileResponse
     if not _authorized(request):
         return JSONResponse({"error": "unauthorized"}, status_code=401)
     fmt = request.query_params.get("fmt", "step").lower()
-    ext = {"step": "step", "stp": "step", "stl": "stl", "brep": "brep"}.get(fmt, "step")
+    fmt_map = {
+        "step": ("step", "STEP"), "stp": ("step", "STEP"),
+        "stl":  ("stl",  "STL"),
+        "3mf":  ("3mf",  "3MF"),
+        "amf":  ("amf",  "AMF"),
+        "brep": ("brep", "BREP"),
+    }
+    ext, export_type = fmt_map.get(fmt, ("step", "STEP"))
     try:
         obj = _get(None)  # current object
     except Exception as e:
@@ -2179,7 +2215,7 @@ async def _export(request):
     import tempfile
     path = os.path.join(tempfile.gettempdir(), f"model.{ext}")
     try:
-        cq.exporters.export(obj.val() if hasattr(obj, "val") else obj, path)
+        cq.exporters.export(obj.val() if hasattr(obj, "val") else obj, path, exportType=export_type)
     except Exception as e:
         return JSONResponse({"error": f"export failed: {e}"}, status_code=500)
     return FileResponse(path, filename=f"model.{ext}")
@@ -2250,6 +2286,7 @@ def _run_http():
 
 
 if __name__ == "__main__":
+    _init_viewer()  # placeholder vertex so the viewer is never blank
     if os.environ.get("MCP_TRANSPORT", "stdio") == "http":
         _run_http()
     else:
