@@ -20,7 +20,19 @@ except ImportError:
     OCP_VIEWER_AVAILABLE = False
     show = None
 
+# Headless tessellation for the web viewer (CadQuery -> three-cad-viewer payload).
+# _convert returns the exact {data, config} payload three-cad-viewer renders.
+try:
+    from ocp_vscode.show import _convert as _ocp_convert
+    from ocp_vscode import standalone as _ocp_standalone
+    OCP_CONVERT_AVAILABLE = True
+except Exception:
+    OCP_CONVERT_AVAILABLE = False
+    _ocp_convert = None
+    _ocp_standalone = None
+
 from mcp.server.fastmcp import FastMCP
+from mcp.server.transport_security import TransportSecuritySettings
 
 import cadquery as cq
 from cadquery import (
@@ -60,6 +72,9 @@ mcp = FastMCP(
         "  3. assembly_api  → combine stored parts with constraints"
         "  4. query_docs    → fetch official detailed docs for specific methods causing error or confusion"
     ),
+    # Disable DNS-rebinding protection: the server is reached via a public host
+    # (tunnel / Render) and is protected by the MCP_TOKEN bearer check instead.
+    transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False),
 )
 
 DEBUG_MODE = True
@@ -282,23 +297,28 @@ def _error(msg: str, tb: str = None) -> str:
     return json.dumps(r)
 
 
+# Latest tessellated model for the web viewer. /model serves payload; /version
+# lets the browser poll for changes. Single global = fine for single-user.
+_viewer_state: Dict[str, Any] = {"payload": None, "version": 0}
+
+
 def _show(obj: Any) -> None:
-    if not OCP_VIEWER_AVAILABLE:
+    """Tessellate obj into the three-cad-viewer payload and store it for /model.
+    Replaces the old ocp_vscode websocket push (which can't work over HTTPS)."""
+    if not OCP_CONVERT_AVAILABLE:
         return
-    old, sys.stdout = sys.stdout, sys.stderr
     try:
-        if isinstance(obj, Assembly):
-            show((obj,))
-        elif isinstance(obj, Sketch):
-            show(Workplane().placeSketch(obj))
-        elif hasattr(obj, "wrapped"):
-            show(obj)
-        else:
-            show(obj)
+        if isinstance(obj, Sketch):
+            obj = Workplane().placeSketch(obj)
+        import contextlib, io
+        # _convert harmlessly tries to read config from a live viewer; mute that.
+        with contextlib.redirect_stderr(io.StringIO()):
+            payload, _ = _ocp_convert(obj)
+        payload["config"]["reset_camera"] = "iso"  # frame the part on each render
+        _viewer_state["payload"] = payload
+        _viewer_state["version"] += 1
     except Exception:
         pass
-    finally:
-        sys.stdout = old
 
 
 def _properties(obj: Any) -> dict:
@@ -2144,6 +2164,92 @@ async def _export(request):
 
 
 # =============================================================================
+# WEB VIEWER ROUTES  (three-cad-viewer fed by ocp_tessellate over HTTP)
+# =============================================================================
+# Reuses ocp_vscode's three-cad-viewer assets + template, but replaces the
+# hardcoded ws:// transport with an HTTP fetch+poll shim (HTTPS-safe). These
+# are open (no token): the rendered geometry is what the user is allowed to see;
+# the proprietary code and tool calls stay behind /mcp.
+
+_VIEWER_COMMS_SHIM = """
+    const vscode = { postMessage: (msg) => {} };
+    async function fetchAndRender() {
+        const resp = await fetch("/model");
+        if (resp.status !== 200) return;
+        window.postMessage(await resp.json(), window.location.origin);
+    }
+    window.showViewer = () => { fetchAndRender(); };
+    let lastVersion = -1;
+    setInterval(async () => {
+        try {
+            const v = (await (await fetch("/version")).json()).version;
+            if (v !== lastVersion) { lastVersion = v; fetchAndRender(); }
+        } catch (e) {}
+    }, 1000);
+"""
+
+_INDEX_HTML = """<!doctype html><html><head><title>t2c</title>
+<style>body{margin:0;font-family:sans-serif;display:flex;height:100vh}
+.left{flex:1;border-right:2px solid #ccc}.right{width:340px;padding:16px}
+iframe{width:100%;height:100%;border:0}</style></head><body>
+<div class="left"><iframe src="/viewer"></iframe></div>
+<div class="right"><h3>Chat (placeholder)</h3>
+<p>Left: three-cad-viewer fed by ocp_tessellate over HTTP. It updates live
+whenever an MCP tool builds a model.</p></div></body></html>"""
+
+
+def _render_viewer_html() -> str:
+    import jinja2
+    import pathlib
+    sa = _ocp_standalone
+    cfg = dict(sa.DEFAULTS)
+    cfg["glass"] = True
+    cfg["tools"] = True
+    env = jinja2.Environment(
+        loader=jinja2.FileSystemLoader(str(pathlib.Path(sa.__file__).parent / "templates")),
+        autoescape=True,
+    )
+    return env.get_template("viewer.html").render(
+        standalone_scripts=sa.SCRIPTS,
+        standalone_imports=sa.STATIC,
+        standalone_comms=_VIEWER_COMMS_SHIM,
+        standalone_init=sa.INIT,
+        styleSrc=sa.CSS,
+        scriptSrc=sa.JS,
+        treeWidth=cfg["tree_width"],
+        **cfg,
+    )
+
+
+@mcp.custom_route("/", methods=["GET"])
+async def _index(request):
+    from starlette.responses import HTMLResponse
+    return HTMLResponse(_INDEX_HTML)
+
+
+@mcp.custom_route("/viewer", methods=["GET"])
+async def _viewer(request):
+    from starlette.responses import HTMLResponse, PlainTextResponse
+    if not OCP_CONVERT_AVAILABLE:
+        return PlainTextResponse("viewer unavailable", status_code=503)
+    return HTMLResponse(_render_viewer_html())
+
+
+@mcp.custom_route("/model", methods=["GET"])
+async def _model(request):
+    from starlette.responses import JSONResponse, Response
+    if _viewer_state["payload"] is None:
+        return JSONResponse({"error": "no model yet"}, status_code=404)
+    return Response(json.dumps(_viewer_state["payload"]), media_type="application/json")
+
+
+@mcp.custom_route("/version", methods=["GET"])
+async def _version(request):
+    from starlette.responses import JSONResponse
+    return JSONResponse({"version": _viewer_state["version"]})
+
+
+# =============================================================================
 # ENTRY POINT
 # =============================================================================
 # Default transport is stdio (local use + CI unchanged). Set MCP_TRANSPORT=http
@@ -2170,9 +2276,19 @@ class _AuthASGI:
 
 def _run_http():
     import uvicorn
-    mcp.settings.host = os.environ.get("MCP_HOST", "127.0.0.1")
-    mcp.settings.port = int(os.environ.get("MCP_PORT", "9000"))
-    app = _AuthASGI(mcp.streamable_http_app())
+    import pathlib
+    from starlette.staticfiles import StaticFiles
+    from starlette.routing import Mount
+    # Render injects PORT; fall back to MCP_PORT for manual local runs.
+    mcp.settings.host = os.environ.get("MCP_HOST", "0.0.0.0")
+    mcp.settings.port = int(os.environ.get("PORT", os.environ.get("MCP_PORT", "9000")))
+    inner = mcp.streamable_http_app()
+    if OCP_CONVERT_AVAILABLE:
+        static_dir = pathlib.Path(_ocp_standalone.__file__).parent / "static"
+        inner.router.routes.append(
+            Mount("/static", app=StaticFiles(directory=str(static_dir)), name="static")
+        )
+    app = _AuthASGI(inner)
     uvicorn.run(app, host=mcp.settings.host, port=mcp.settings.port)
 
 
