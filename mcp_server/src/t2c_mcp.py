@@ -2318,11 +2318,23 @@ class _AuthASGI:
                 from starlette.responses import JSONResponse
                 await JSONResponse({"error": "unauthorized"}, status_code=401)(scope, receive, send)
                 return
+            # No server→client push; 405 the optional inbound SSE so clients skip it.
+            if scope.get("method") == "GET":
+                from starlette.responses import PlainTextResponse
+                await PlainTextResponse("Method Not Allowed", status_code=405)(scope, receive, send)
+                return
         await self.app(scope, receive, send)
 
 
 def _run_http():
-    import uvicorn
+    import uvicorn, logging
+    # Drop only the benign 405'd inbound-SSE GET /mcp probes; keep 401s etc.
+    class _DropMcpGet(logging.Filter):
+        def filter(self, record):
+            a = record.args
+            return not (a and len(a) >= 5 and a[1] == "GET"
+                        and str(a[2]).startswith("/mcp") and a[4] == 405)
+    logging.getLogger("uvicorn.access").addFilter(_DropMcpGet())
     # Render injects PORT; fall back to MCP_PORT for manual local runs.
     mcp.settings.host = os.environ.get("MCP_HOST", "0.0.0.0")
     mcp.settings.port = int(os.environ.get("PORT", os.environ.get("MCP_PORT", "9000")))
