@@ -1,7 +1,10 @@
-// Free, tool-capable OpenRouter models (every $0 model whose
-// supported_parameters include "tools"). Ordered best-first for reliable tool
-// calling; gpt-oss-120b is the verified default. Models marked `vision: true`
-// also accept image input. Refresh with:
+// Tool-capable OpenRouter models. The first four are paid, premium models
+// (top reasoning / tool-calling / vision) and require credits on the
+// OPENROUTER_API_KEY to run; the rest are free ($0) models. Models marked
+// `vision: true` also accept image input. A `reasoning` field, when set,
+// requests that reasoning effort from OpenRouter (applied in api/chat).
+//
+// Refresh the free list with:
 //   curl -s https://openrouter.ai/api/v1/models | jq -r '.data[]
 //     | select(.pricing.prompt=="0" and .pricing.completion=="0")
 //     | select(.supported_parameters|index("tools"))
@@ -11,6 +14,14 @@
 // from ALL free models on OpenRouter, not just this list. The chat route reports
 // back which model it actually used (shown under each reply).
 export const MODELS = [
+  // Premium (paid — need OpenRouter credits). IDs/capabilities verified against
+  // the live /api/v1/models endpoint: all support tools + reasoning + image.
+  { id: "anthropic/claude-sonnet-4.6", label: "Claude Sonnet 4.6 (High)", vision: true, reasoning: "high" },
+  { id: "anthropic/claude-opus-4.8", label: "Claude Opus 4.8 (High)", vision: true, reasoning: "high" },
+  { id: "openai/gpt-5.5", label: "GPT-5.5", vision: true },
+  { id: "google/gemini-3.1-pro-preview", label: "Gemini 3.1 Pro", vision: true },
+
+  // Free
   { id: "openai/gpt-oss-120b:free", label: "GPT-OSS 120B" },
   { id: "qwen/qwen3-coder:free", label: "Qwen3 Coder 480B" },
   { id: "meta-llama/llama-3.3-70b-instruct:free", label: "Llama 3.3 70B" },
@@ -31,5 +42,5 @@ export const MODELS = [
   { id: "openrouter/free", label: "Auto (free router)" },
 ];
 
-// gpt-oss-120b: best at the precise JSON / method-chaining the CAD tools expect.
+// Claude Sonnet 4.6: strong, reliable tool-calling for the CAD method chains.
 export const DEFAULT_MODEL = MODELS[0].id;

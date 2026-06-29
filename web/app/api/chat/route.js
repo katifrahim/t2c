@@ -2,7 +2,7 @@ import { frontendTools } from "@assistant-ui/react-ai-sdk";
 import { createMCPClient } from "@ai-sdk/mcp";
 import { createOpenRouter } from "@openrouter/ai-sdk-provider";
 import { streamText, convertToModelMessages, stepCountIs } from "ai";
-import { DEFAULT_MODEL } from "@/lib/models";
+import { MODELS, DEFAULT_MODEL } from "@/lib/models";
 
 // Agentic tool loops can run several round-trips; give them room.
 export const maxDuration = 120;
@@ -38,8 +38,16 @@ export async function POST(req) {
     apiKey: process.env.OPENROUTER_API_KEY,
   });
 
+  const selectedModel = model || DEFAULT_MODEL;
+  // Per-model reasoning effort (e.g. the premium "High" models). OpenRouter takes
+  // this as a request parameter, not part of the model id.
+  const reasoning = MODELS.find((m) => m.id === selectedModel)?.reasoning;
+
   const result = streamText({
-    model: openrouter(model || DEFAULT_MODEL),
+    model: openrouter(selectedModel),
+    ...(reasoning
+      ? { providerOptions: { openrouter: { reasoning: { effort: reasoning } } } }
+      : {}),
     system: [SYSTEM_PROMPT, system].filter(Boolean).join("\n\n"),
     messages: await convertToModelMessages(messages),
     tools: {
