@@ -314,10 +314,45 @@ def _error(msg: str, tb: str = None) -> str:
 # lets the browser poll for changes. Single global = fine for single-user.
 _viewer_state: Dict[str, Any] = {"payload": None, "version": 0}
 
+# Which viewer pipeline _show() uses, chosen by transport in __main__:
+#   "stdio" → push to the standalone ocp_vscode viewer on :3939 via show()
+#   "http"  → tessellate in-process and serve the payload over /model
+# Defaults to "http" so importing the module (tests, HTTP entrypoints) keeps the
+# tessellation pipeline; stdio runs flip it before any model is built.
+_VIEWER_MODE: str = "http"
+
 
 def _show(obj: Any) -> None:
-    """Tessellate obj into the three-cad-viewer payload and store it for /model.
-    Replaces the old ocp_vscode websocket push (which can't work over HTTPS)."""
+    """Render obj into the active viewer pipeline (see _VIEWER_MODE)."""
+    if _VIEWER_MODE == "stdio":
+        _show_push(obj)
+    else:
+        _show_tessellate(obj)
+
+
+def _show_push(obj: Any) -> None:
+    """stdio: push obj to the standalone ocp_vscode viewer on :3939 via show().
+    Mirrors the main-branch behavior; show() chatters on stdout, so mute it to
+    keep the stdio JSON-RPC stream clean."""
+    if not OCP_VIEWER_AVAILABLE:
+        return
+    import contextlib, io
+    try:
+        if isinstance(obj, Assembly):
+            target = (obj,)
+        elif isinstance(obj, Sketch):
+            target = Workplane().placeSketch(obj)
+        else:
+            target = obj
+        with contextlib.redirect_stderr(io.StringIO()), contextlib.redirect_stdout(io.StringIO()):
+            show(target)
+    except Exception:
+        pass
+
+
+def _show_tessellate(obj: Any) -> None:
+    """http: tessellate obj into the three-cad-viewer payload and store it for
+    /model. Replaces the ocp_vscode websocket push (which can't work over HTTPS)."""
     if not OCP_CONVERT_AVAILABLE:
         return
     try:
@@ -2287,8 +2322,12 @@ def _run_http():
 
 
 if __name__ == "__main__":
-    _init_viewer()  # placeholder vertex so the viewer is never blank
     if os.environ.get("MCP_TRANSPORT", "stdio") == "http":
+        _VIEWER_MODE = "http"
+        _init_viewer()  # placeholder vertex so the web viewer is never blank
         _run_http()
     else:
+        # stdio: push models to the standalone ocp_vscode viewer (run separately
+        # via `python -m ocp_vscode`) on :3939. No placeholder/init needed.
+        _VIEWER_MODE = "stdio"
         mcp.run(transport="stdio")
