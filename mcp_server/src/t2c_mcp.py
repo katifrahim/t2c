@@ -324,8 +324,9 @@ def _show(obj: Any) -> None:
         if isinstance(obj, Sketch):
             obj = Workplane().placeSketch(obj)
         import contextlib, io
-        # _convert harmlessly tries to read config from a live viewer; mute that.
-        with contextlib.redirect_stderr(io.StringIO()):
+        # _convert harmlessly tries to read config from a live viewer and prints
+        # progress to stdout; mute both so the stdio JSON-RPC stream stays clean.
+        with contextlib.redirect_stderr(io.StringIO()), contextlib.redirect_stdout(io.StringIO()):
             payload, mapping = _ocp_convert(obj)
         payload["config"]["reset_camera"] = "iso"  # frame the part on each render
         _viewer_state["payload"] = payload
@@ -335,7 +336,7 @@ def _show(obj: Any) -> None:
         if MEASURE_AVAILABLE:
             try:
                 model = json.loads(json.dumps(mapping, default=_ocp_default))
-                with contextlib.redirect_stderr(io.StringIO()):
+                with contextlib.redirect_stderr(io.StringIO()), contextlib.redirect_stdout(io.StringIO()):
                     _measure_backend.load_model(model)
             except Exception:
                 pass
