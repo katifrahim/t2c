@@ -12,13 +12,19 @@ import os
 import traceback
 import sys
 
+# Port of the standalone ocp_vscode viewer (`python -m ocp_vscode`) used by the
+# stdio viewer-push pipeline. NOTE: instantiating ViewerBackend(0) below calls
+# set_port(0) and clobbers this, so _show_push re-asserts it before every show().
+VIEWER_PORT = 3939
+
 try:
     from ocp_vscode import show, set_port
-    set_port(3939)
+    set_port(VIEWER_PORT)
     OCP_VIEWER_AVAILABLE = True
 except ImportError:
     OCP_VIEWER_AVAILABLE = False
     show = None
+    set_port = None
 
 # Headless tessellation: _convert returns the {data, config} payload that the
 # frontend's three-cad-viewer renders.
@@ -344,8 +350,11 @@ def _show_push(obj: Any) -> None:
             target = Workplane().placeSketch(obj)
         else:
             target = obj
+        # ViewerBackend(0) clobbered the comms port to 0 at import; re-assert the
+        # viewer port so show() reaches the standalone viewer instead of port 0.
+        set_port(VIEWER_PORT)
         with contextlib.redirect_stderr(io.StringIO()), contextlib.redirect_stdout(io.StringIO()):
-            show(target)
+            show(target, port=VIEWER_PORT)
     except Exception:
         pass
 
