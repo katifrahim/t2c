@@ -81,6 +81,7 @@ mcp = FastMCP(
         "  • workplane_api  — 3D modeling via cq.Workplane method chaining\n"
         "  • sketch_api     — 2D profiles via cq.Sketch (face or edge workflows)\n"
         "  • assembly_api   — multi-part assemblies via cq.Assembly add/constrain/solve\n"
+        "  • select_model   — re-activate an earlier model by name (shows it in the viewer and makes it exportable)\n"
         "  • query_docs     — fetch official detailed docs of specific methods and their parameters\n\n"
         "All tools share a persistent object store. Reference stored objects with "
         "{\"_ref\": \"name\"} and construct CadQuery types inline with "
@@ -317,8 +318,10 @@ def _error(msg: str, tb: str = None) -> str:
 
 
 # Latest tessellated model for the web viewer. /model serves payload; /version
-# lets the browser poll for changes. Single global = fine for single-user.
-_viewer_state: Dict[str, Any] = {"payload": None, "version": 0}
+# lets the browser poll for changes (and reports obj_type so the frontend can
+# offer 2D-only formats like DXF/SVG just for sketches). Single global = fine
+# for single-user.
+_viewer_state: Dict[str, Any] = {"payload": None, "version": 0, "obj_type": None}
 
 # Which viewer pipeline _show() uses, chosen by transport in __main__:
 #   "stdio" → push to the standalone ocp_vscode viewer on :3939 via show()
@@ -330,6 +333,7 @@ _VIEWER_MODE: str = "http"
 
 def _show(obj: Any) -> None:
     """Render obj into the active viewer pipeline (see _VIEWER_MODE)."""
+    _viewer_state["obj_type"] = _obj_type(obj)  # so /version can report it
     if _VIEWER_MODE == "stdio":
         _show_push(obj)
     else:
@@ -847,10 +851,6 @@ async def workplane_api(
         - Create a spline interpolated through the provided points (2D or 3D).
       workplaneFromTagged(name: str)
         - Copies the workplane from a tagged parent.
-      export(fname: str, tolerance: float=0.1, angularTolerance: float=0.1, opt: Optional[Dict[str, Any]]=None)
-		- Export Workplane to file.
-	  exportSvg(fileName: str)
-		- Exports the first item on the stack as an SVG file
 
     ── _ref / _type in params ──────────────────────────────────────────────────
       {"_ref": "name"}
@@ -1061,6 +1061,17 @@ async def sketch_api(
       {"method": "placeSketch", "args": [{"_ref": "sketch_1"}]}
     followed by extrude or cutBlind.
 
+    ── FLAT PARTS FOR LASER / PLASMA / WATERJET / CNC CUTTING ───────────────────
+    These processes cut a flat sheet, so the deliverable is a 2D vector profile,
+    NOT a 3D solid. When the user wants a part for laser cutting, a plasma/waterjet
+    table, CNC routing, vinyl cutting, etc.:
+      • Build the cut outline (and any internal holes) as a Sketch here, and leave
+        it as a Sketch — do NOT extrude it into a solid.
+      • select_model the sketch so it is the active model.
+      • The user can then download it as DXF or SVG (flat 2D vector formats).
+    DXF/SVG downloads are offered ONLY when the active model is a 2D Sketch; 3D
+    solids and assemblies cannot be exported to these formats.
+
     ── TWO WORKFLOWS ───────────────────────────────────────────────────────────
 
     WORKFLOW 1 — Face-based (recommended)
@@ -1235,8 +1246,6 @@ async def sketch_api(
 		- Finish sketch construction and return the parent.
 	importDXF(filename: str, tol: float=1e-06, exclude: List[str]=[], include: List[str]=[], angle: float=0, mode: Literal['a', 's', 'i', 'c', 'r']='a', tag: str | None=None)
 		- Import a DXF file and construct face(s)
-	export(fname: str, tolerance: float=0.1, angularTolerance: float=0.1, opt: Optional[Dict[str, Any]]=None)
-		- Export Sketch to file.
 
     ── RETURN ──────────────────────────────────────────────────────────────────
     {"status":"success", "name":str, "obj_type":"Sketch",
@@ -1299,11 +1308,9 @@ async def assembly_api(
                 - Fixed constraints (4) with param — pass it as the 3rd positional arg: {"method": "constrain", "args": ["query1", "Kind", param_value]}
             3. "solve" - calculates position and orientation based on the provided constraints
                 - solve()
-            4. "export" - exports the assembly to a file
-                - export(path: str, exportType: Literal['STEP','XML','XBF','GLTF','VTKJS','VRML','STL'] | None = None, mode: Literal['default','fused'] = 'default', tolerance: float = 0.1, angularTolerance: float = 0.1, unit: Literal['MM','CM','M','KM','INCH','FT','MI','UM','NM'] = 'MM', outputUnit: Literal['MM','CM','M','KM','INCH','FT','MI','UM','NM'] | None = None, **kwargs)
-                - DEFAULT export type: STEP — only change if the user explicitly requests another format
-            5. "toCompound" - converts the multi-part assembly to a single compound solid
+            4. "toCompound" - converts the multi-part assembly to a single compound solid
                 - toCompound()
+                - Note: this method is optional - not necessary!
 
     ── Adding objects section ─────────────────────────────────────────────────────────────────────
 
@@ -1314,7 +1321,7 @@ async def assembly_api(
             - "name": the name used to reference this assembly object in the "constrain" method (via its "query1" and "query2" positional args) later on to apply constraints on it
             - "color": {"_type": "Color", ...} - set the material color of the added object in the assembly
             - "material": Not supported right now, so set to "None"
-            - "metadata": Dict[str, Any] - any specific metadata/ context about the assembly part (do this if the user asks you to export the assembly to a STEP file)
+            - "metadata": Dict[str, Any] - any specific metadata/ context about the assembly part
 
     {"_type": "Location", ...} ("loc" param of the "add" method):
         method #1: {"_type": "Location", "x":0, "y":0, "z":0, "rx":0, "ry":0, "rz":0}
@@ -1984,27 +1991,6 @@ async def assembly_api(
         {"method": "solve", "params": {}}
         {"method": "solve", "params": {"verbosity": 1}}
 
-    export:
-        Signature: export(path, exportType=None, mode='default', tolerance=0.1, angularTolerance=0.1, unit='MM', outputUnit=None, **kwargs)
-
-        DEFAULT behaviour (use unless user explicitly requests otherwise):
-          - path: C:\\Users\\...\\<filename>.step
-          - exportType: "STEP"
-
-        Standard STEP export (default — use this unless told otherwise):
-        {"method": "export", "params": {"path": "C:\\Users\\...\\assy.step", "exportType": "STEP"}}
-
-        glTF / GLB (only if user asks for web/viewer format):
-        {"method": "export", "params": {"path": "C:\\Users\\...\\assy.gltf"}}
-        {"method": "export", "params": {"path": "C:\\Users\\...\\assy.glb"}}
-
-        Fused STEP (only if user asks for a single merged solid):
-        {"method": "export", "params": {"path": "C:\\Users\\...\\assy.step", "exportType": "STEP", "mode": "fused"}}
-        
-        Note: Whenever the user asks to export something, ask him/ her to provide you an absolute file path where you should export the files. Remember to include double backslahes (\\) in that path rather than single ones (\\)!
-
-        Supported exportType values: 'STEP', 'XML', 'XBF', 'GLTF', 'VTKJS', 'VRML', 'STL'
-
     toCompound:
          {"method": "toCompound", "params": {}}
         Converts the assembly to a single Compound; the result is re-stored.
@@ -2065,7 +2051,41 @@ async def assembly_api(
         return _error(str(e), traceback.format_exc())
 
 # =============================================================================
-# TOOL 4 — query_docs
+# TOOL 4 — select_model
+# =============================================================================
+
+@mcp.tool(name="select_model")
+async def select_model(name: str) -> str:
+    """
+    Make a previously built model the ACTIVE model.
+
+    Every model you build (via workplane_api / sketch_api / assembly_api) is stored
+    under a name and automatically becomes active. The 3D viewer always shows the
+    active model, and the active model is the one the user can download/ export.
+
+    Only ONE model/assembly/sketch can be active at a time: the viewer displays
+    exactly one active model, and only that one is downloadable. It cannot show
+    multiple stored models at once.
+
+    Use this tool to bring back an EARLIER model (by its stored name) WITHOUT
+    rebuilding it — e.g. when the user wants to view a previous model again, or wants
+    to download a previous model instead of the latest one.
+
+    name: stored name of a model created earlier (returned as "name" by the build
+          tools). Works with models from all three APIs.
+    """
+    global _current
+    try:
+        obj = _get(name)  # raises if name unknown
+        _current = name
+        _show(obj)
+        return json.dumps({"status": "success", "name": name,
+                           "obj_type": _obj_type(obj), "properties": _properties(obj)})
+    except Exception as e:
+        return _error(str(e), traceback.format_exc())
+
+# =============================================================================
+# TOOL 5 — query_docs
 # =============================================================================
 
 import cadquery.selectors as _cq_selectors
@@ -2240,7 +2260,8 @@ async def _clear(request):
 @mcp.custom_route("/export", methods=["GET"])
 async def _export(request):
     """Export the current stored object so the web backend can serve it as a
-    download. Token-gated. ?fmt=stl|3mf|step|amf|brep (default step)."""
+    download. Token-gated. ?fmt=stl|3mf|step|amf|brep (3D), or dxf|svg (2D, sketches
+    only — for laser cutting / plasma / CNC). Default step."""
     from starlette.responses import JSONResponse, FileResponse
     if not _authorized(request):
         return JSONResponse({"error": "unauthorized"}, status_code=401)
@@ -2251,16 +2272,36 @@ async def _export(request):
         "3mf":  ("3mf",  "3MF"),
         "amf":  ("amf",  "AMF"),
         "brep": ("brep", "BREP"),
+        "dxf":  ("dxf",  "DXF"),
+        "svg":  ("svg",  "SVG"),
     }
     ext, export_type = fmt_map.get(fmt, ("step", "STEP"))
     try:
         obj = _get(None)  # current object
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=404)
+    # DXF/SVG are flat 2D vector formats — only meaningful for a 2D Sketch. A 3D
+    # solid/assembly would just dump a messy projection of all edges, so refuse it.
+    if export_type in ("DXF", "SVG") and not isinstance(obj, Sketch):
+        return JSONResponse(
+            {"error": "DXF/SVG export is only available for 2D sketches"},
+            status_code=400,
+        )
     import tempfile
     path = os.path.join(tempfile.gettempdir(), f"model.{ext}")
     try:
-        cq.exporters.export(obj.val() if hasattr(obj, "val") else obj, path, exportType=export_type)
+        if isinstance(obj, Assembly):
+            if export_type == "STEP":
+                # STEP preserves the assembly: part names, colors, hierarchy.
+                obj.export(path, exportType="STEP")
+            else:
+                # Mesh/BREP formats can't hold hierarchy; flatten to a Compound
+                # (parts kept as separate solids, locations applied).
+                cq.exporters.export(obj.toCompound(), path, exportType=export_type)
+        else:
+            # Workplane/Shape/Sketch all expose .val(); Sketch.val() is a Compound.
+            shape = obj.val() if hasattr(obj, "val") else obj
+            cq.exporters.export(shape, path, exportType=export_type)
     except Exception as e:
         return JSONResponse({"error": f"export failed: {e}"}, status_code=500)
     return FileResponse(path, filename=f"model.{ext}")
@@ -2277,7 +2318,8 @@ async def _model(request):
 @mcp.custom_route("/version", methods=["GET"])
 async def _version(request):
     from starlette.responses import JSONResponse
-    return JSONResponse({"version": _viewer_state["version"]})
+    return JSONResponse({"version": _viewer_state["version"],
+                         "obj_type": _viewer_state.get("obj_type")})
 
 
 @mcp.custom_route("/backend", methods=["POST"])

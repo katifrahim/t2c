@@ -1,13 +1,23 @@
 // Proxies model downloads to the backend's token-gated /export endpoint,
 // injecting the Bearer token server-side and streaming the file back to the
 // browser with a download disposition.
-const EXT = { stl: "stl", "3mf": "3mf", step: "step", amf: "amf", brep: "brep" };
+const EXT = {
+  stl: "stl",
+  "3mf": "3mf",
+  step: "step",
+  amf: "amf",
+  brep: "brep",
+  dxf: "dxf",
+  svg: "svg",
+};
 const MIME = {
   stl: "model/stl",
   "3mf": "model/3mf",
   step: "application/step",
   amf: "application/octet-stream",
   brep: "application/octet-stream",
+  dxf: "application/dxf",
+  svg: "image/svg+xml",
 };
 
 export async function GET(req) {

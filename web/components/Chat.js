@@ -17,11 +17,23 @@ import { MODELS, DEFAULT_MODEL } from "@/lib/models";
 
 const AUTO_MODEL = "openrouter/free";
 
+// Formats offered for 3D models and assemblies.
 const EXPORT_FORMATS = [
   { fmt: "stl", label: "STL" },
   { fmt: "3mf", label: "3MF" },
   { fmt: "step", label: "STEP" },
   { fmt: "amf", label: "AMF" },
+  { fmt: "brep", label: "BREP" },
+];
+
+// Formats offered when the active model is a 2D sketch: the 2D vector formats for
+// laser/plasma/CNC (DXF, SVG) first, then the B-rep formats that can carry a 2D
+// profile (STEP, BREP). Mesh formats (STL/3MF/AMF) are omitted — a flat sketch
+// has no thickness, so they'd produce a degenerate, non-printable mesh.
+const SKETCH_FORMATS = [
+  { fmt: "dxf", label: "DXF" },
+  { fmt: "svg", label: "SVG" },
+  { fmt: "step", label: "STEP" },
   { fmt: "brep", label: "BREP" },
 ];
 
@@ -45,6 +57,20 @@ function Toolbar({ model, setModel, resolvedModel }) {
   const aui = useAui();
   const [busy, setBusy] = useState(false);
   const [menuOpen, setMenuOpen] = useState(false);
+  // Active model type (from /api/version) decides which export formats to offer.
+  const [isSketch, setIsSketch] = useState(false);
+
+  // Read the active model's type, then open the download menu so it shows the
+  // right format list (sketches get DXF/SVG; 3D models get the mesh formats).
+  async function openDownloadMenu() {
+    try {
+      const { obj_type } = await (await fetch("/api/version")).json();
+      setIsSketch(obj_type === "Sketch");
+    } catch {
+      setIsSketch(false);
+    }
+    setMenuOpen((o) => !o);
+  }
 
   // New session: clear backend CadQuery objects (viewer resets to the
   // placeholder via its poll) AND start a fresh chat thread.
@@ -128,7 +154,7 @@ function Toolbar({ model, setModel, resolvedModel }) {
       <div style={{ position: "relative" }}>
         <button
           type="button"
-          onClick={() => setMenuOpen((o) => !o)}
+          onClick={openDownloadMenu}
           title="Download model"
           aria-label="Download model"
           style={iconBtnStyle}
@@ -155,7 +181,7 @@ function Toolbar({ model, setModel, resolvedModel }) {
                 minWidth: 120,
               }}
             >
-              {EXPORT_FORMATS.map((f) => (
+              {(isSketch ? SKETCH_FORMATS : EXPORT_FORMATS).map((f) => (
                 <button
                   key={f.fmt}
                   type="button"
