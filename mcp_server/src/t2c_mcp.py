@@ -1,6 +1,6 @@
 """
-CadQuery Specialized MCP Server.
-Tools: workplane_api, sketch_api, assembly_api, query_docs
+Text2CAD MCP Server.
+Tools: workplane_api, sketch_api, assembly_api, query_docs, select_model
 """
 # MCP server entry point
 
@@ -75,16 +75,16 @@ from cadquery.selectors import (
 # =============================================================================
 
 mcp = FastMCP(
-    name="cadquery_specialized_mcp",
+    name="parametric_text2cad_mcp",
     instructions=(
-        "Three dedicated CadQuery tools:\n"
+        "Dedicated parametric CAD tools:\n"
         "  • workplane_api  — 3D modeling via cq.Workplane method chaining\n"
         "  • sketch_api     — 2D profiles via cq.Sketch (face or edge workflows)\n"
         "  • assembly_api   — multi-part assemblies via cq.Assembly add/constrain/solve\n"
         "  • select_model   — re-activate an earlier model by name (shows it in the viewer and makes it exportable)\n"
         "  • query_docs     — fetch official detailed docs of specific methods and their parameters\n\n"
         "All tools share a persistent object store. Reference stored objects with "
-        "{\"_ref\": \"name\"} and construct CadQuery types inline with "
+        "{\"_ref\": \"name\"} and construct types inline with "
         "{\"_type\": \"Vector\"|\"Plane\"|\"Location\"|\"Color\", ...}.\n\n"
         "Typical workflow:\n"
         "  1. workplane_api → create and store parts\n"
@@ -521,13 +521,13 @@ async def workplane_api(
     store_as: Optional[str] = None,
 ) -> str:
     """
-    Build 3D models using CadQuery's Workplane fluent API via method chaining.
+    Build 3D models using Workplane API via method chaining.
     
     Underlying 3D modelling engine/ kernel: Open CASCADE Technology (OCCT)
     Modelling method: Boundary Representation (BRep)
 
     ── COORDINATE SYSTEM & VIEWER ──────────────────────────────────────────────
-    CadQuery uses a right-handed XYZ coordinate system:
+    The CAD engine uses a right-handed XYZ coordinate system:
       X → points right                     (red axis in OCP viewer)
       Y → points into or out of the screen (green axis)
       Z → points up                        (blue axis)
@@ -917,7 +917,7 @@ async def workplane_api(
 
     ── Computed values (_attr / _call / _run_on) ───────────────────────────────
     Inside any "args" or "params" value, three additional dict keys let you
-    compute CadQuery objects at resolve-time without a separate tool call:
+    compute CAD objects at resolve-time without a separate tool call:
 
       {"_attr": {"obj": <resolvable>, "name": "plane"}}
         - Access an attribute on a resolved object.
@@ -1056,7 +1056,7 @@ async def sketch_api(
     store_as: Optional[str] = None,
 ) -> str:
     """
-    Build 2D profiles using CadQuery's Sketch API via method chaining.
+    Build 2D profiles using Sketch API via method chaining.
     The stored Sketch can be passed to workplane_api via:
       {"method": "placeSketch", "args": [{"_ref": "sketch_1"}]}
     followed by extrude or cutBlind.
@@ -1355,10 +1355,10 @@ async def assembly_api(
     ── Constraint section ─────────────────────────────────────────────────────────────────────────
 
     "constrain" method formats and info:
-        CRITICAL: "constrain" is an *args method in CadQuery. It does NOT accept keyword arguments. 
+        CRITICAL: "constrain" is an *args method. It does NOT accept keyword arguments. 
         ALWAYS use the positional "args" form in MCP tool calls. NEVER use the "params" (keyword) form.
 
-        Positional dispatch rules (CadQuery detects the form from the number and types of args):
+        Positional dispatch rules (the CAD engine detects the form from the number and types of args):
             Relative constraints (5 total — 2 query strings + kind string):
                 {"method": "constrain", "args": ["query1", "query2", "Kind"]}
                 With a non-default param (e.g. Axis at 90°, PointInPlane with offset):
@@ -1947,7 +1947,7 @@ async def assembly_api(
         Each operation: {"method": str, "params": dict} or {"method": str, "args": list}
 
     add:
-        First param key is "arg" (the CadQuery object to add).
+        First param key is "arg" (the CAD object to add).
 
         {"method": "add", "params": {
             "arg":   {"_ref": "box_1"},
@@ -2100,7 +2100,7 @@ def _resolve_cls(name: str):
         obj = getattr(module, name, None)
         if isinstance(obj, type):
             return obj
-    raise ValueError(f"Unknown CadQuery class: '{name}'")
+    raise ValueError(f"Unknown class: '{name}'")
 
 
 def _doc_type(ann) -> str:
