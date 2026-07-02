@@ -1,8 +1,9 @@
+// Not tested. Only LLM judge is successfully tested.
+// 
 // Human-judge mode. Run with:  npx promptfoo@latest eval --grader file://humanjudge.mjs
 // npx promptfoo@latest view
 //
-// This replaces the LLM judge for every llm-rubric assertion (--grader overrides the
-// judge globally). It makes no API call — it just defaults each capability cell to
+// This replaces the LLM judge. It just defaults each capability cell to
 // FAIL / score 0 and shows that task's success criteria, so you can read the transcript
 // in `promptfoo view` and manually flip each cell's pass/fail + score yourself.
 export default class {

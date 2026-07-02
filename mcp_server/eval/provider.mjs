@@ -1,16 +1,11 @@
-// Promptfoo provider that drives one OpenRouter model through the t2c MCP server
-// using the SAME stack/architecture as production (web/app/api/chat/route.js):
-//   @ai-sdk/mcp createMCPClient -> mcpClient.tools()  (tools fed straight from MCP)
-//   @openrouter/ai-sdk-provider createOpenRouter
-//   ai generateText + stepCountIs   (generateText = non-streaming streamText)
+// This uses the same tech-stack + architecture as production (web/app/api/chat/route.js):
 //
-// It returns a transcript the LLM judge grades — the model's REASONING (for
-// reasoning models), its prose, and every tool CALL + result — plus one flag:
-// did any tool return status:"error" (the only deterministic check we keep).
+// It returns a transcript that our tests grade: the agent's REASONING (for reasoning models), 
+// its prose, and every tool CALL + result)
 //
-// Everything you'll tweak is config in promptfooconfig.yaml: model, system,
-// maxSteps, reasoning. Run the server first (HTTP transport):
+// Run the server first (HTTP transport):
 //   MCP_TRANSPORT=http PORT=9000 ../.venv/bin/python ../src/t2c_mcp.py
+
 import { createMCPClient } from "@ai-sdk/mcp";
 import { createOpenRouter } from "@openrouter/ai-sdk-provider";
 import { generateText, stepCountIs } from "ai";
@@ -119,7 +114,7 @@ export default class T2CProvider {
       }
       // Agent-only cost + tokens (the LLM-judge's usage is billed separately, not here).
       // Returned at the TOP LEVEL below so promptfoo shows them in its native cost/token
-      // columns (real numbers), not as score-vs-1.0 percentage metrics.
+      // columns (real numbers), not as score/1.0 percentage metrics.
       const u = result.totalUsage ?? {};
       const tokenUsage = { total: u.totalTokens ?? 0, prompt: u.inputTokens ?? 0, completion: u.outputTokens ?? 0 };
       let cost = 0;

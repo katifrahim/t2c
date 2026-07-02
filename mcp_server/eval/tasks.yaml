@@ -1,27 +1,16 @@
-# Benchmark tasks for the t2c MCP server.
-#
-# ── HOW TO RUN (start the MCP server first; see GUIDE.md) ─────────────────────
-#   deterministic + LLM-judge : npx promptfoo@latest eval -j 1
-#   deterministic + human-judge: npx promptfoo@latest eval -j 1 --grader file://humanjudge.mjs
-#                                npx promptfoo@latest view   # ← launch the GUI to read/grade
-#   -j 1        : concurrency 1, i.e. run tasks one at a time (serial). Required — the
-#                 MCP server has ONE shared object store that's reset per task, so
-#                 parallel runs would clobber each other's state.
-#   -o file.json: also write the full results (transcripts, scores, metadata) to a file.
-# ─────────────────────────────────────────────────────────────────────────────
-#
-# Each task = a plain-user prompt (WHAT to make + how it should LOOK, never HOW to
-# build it — no modeling jargon) + an llm-rubric that is a numbered list of SUCCESS
-# CRITERIA. The judge scores each criterion 1/0 and the task score = their average
-# (the scoring instructions live once in promptfooconfig.yaml -> rubricPrompt).
-# Keep each criterion a single, independently checkable visible feature.
-#
-# `id` names the STEP file the provider saves (artifacts/<model>/<id>.step).
-# `metric` is the capability tested (a leaderboard column), not the API used.
-# Every task also gets the global NoToolErrors deterministic check.
-#
+# deterministic + LLM-judge : npx promptfoo@latest eval -j 1 --no-cache
+# deterministic + human-judge (not tested): npx promptfoo@latest eval -j 1 --grader file://humanjudge.mjs --no-cache
+# viewer: npx promptfoo@latest view
+# -j 1: run tasks one at a time (serial)
+# -o file.json: also write the full results (transcripts, scores, metadata) to a file
+# use "--filter-pattern "<desc quote>" " to run the tests on specific tasks only
+# # `id` names the saved STEP files (artifacts/<model>/<id>.step).
+# `metric` is the capability tested (a leaderboard column)
+
+# Each task = a plain-user prompt (what to make + how it should LOOK) + an rubric for LLM judge
+
 # CONSISTENCY: no separate task — re-run one task a few times and watch the spread:
-#   npx promptfoo@latest eval --repeat 3 --filter-pattern "Pipe tee"
+#   npx promptfoo@latest eval --repeat 3 --filter-pattern "Pipe tee" -> the filter comes from task description
 
 # 2D sketching & pattern
 - description: Gear — flat 2D profile for laser cutting

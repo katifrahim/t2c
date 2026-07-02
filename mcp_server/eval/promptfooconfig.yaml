@@ -1,7 +1,7 @@
 # yaml-language-server: $schema=https://promptfoo.dev/config-schema.json
 # t2c MCP server — LLM capability benchmark. See GUIDE.md.
-# Run (server must be up on :9000):  npx promptfoo@latest eval -j 1 && npx promptfoo@latest view
-description: t2c MCP — how well does each model use the server
+# To run this, the mcp server must be up on :9000
+description: how well does each llm use the t2c mcp server
 
 # The prompt handed to each model = the `instruction` var of the current task
 # (pulled from tasks.yaml). This is the bridge between tasks.yaml and provider.mjs.
@@ -9,10 +9,7 @@ prompts:
   - "{{instruction}}"
 
 # Each provider = one model, all routed through provider.mjs (same stack as web/).
-# Add/remove freely; IDs live in web/lib/models.js. `reasoning` is optional.
-# TRIAL: testing ONE model for now — uncomment the others to compare more.
-# Using the PAID gpt-oss-120b (no :free) — reliable + ~$0.01/task. The :free variant
-# rate-limits and hangs; verified paid runs the gear task in ~45s.
+# Add/remove freely; IDs live in https://openrouter.ai/models. `reasoning` is optional.
 providers:
   - id: file://provider.mjs
     label: gpt-oss-120b
@@ -20,32 +17,16 @@ providers:
   - id: file://provider.mjs
     label: deepseek-v4-flash
     config: { model: deepseek/deepseek-v4-flash, maxSteps: 12 }
-  # - id: file://provider.mjs
-  #   label: claude-sonnet-4.6
-  #   config: { model: anthropic/claude-sonnet-4.6, reasoning: high, maxSteps: 12 }
-  # - id: file://provider.mjs
-  #   label: gpt-5.5
-  #   config: { model: openai/gpt-5.5, maxSteps: 12 }
-  # - id: file://provider.mjs
-  #   label: qwen3-coder-free
-  #   config: { model: qwen/qwen3-coder:free, maxSteps: 12 }
-  # - id: file://provider.mjs
-  #   label: llama-3.3-70b-free
-  #   config: { model: meta-llama/llama-3.3-70b-instruct:free, maxSteps: 12 }
 
 # defaultTest = settings applied to EVERY task in the tests list below.
-#   - options.provider: the judge model used by every llm-rubric in tasks.yaml
+#   - options.provider: llm judge for every llm-rubric in tasks.yaml
 #   - assert: deterministic checks that run on every task (in addition to each
 #     task's own llm-rubric)
 defaultTest:
   options:
-    # LLM judge for every llm-rubric in tasks.yaml. Open-source gpt-oss-120b.
-    # We use promptfoo's DEFAULT rubric grading (NO custom rubricPrompt on purpose):
-    # it reliably parses the judge's output and stores the real criteria-by-criteria
-    # reasoning into each capability assertion's result (visible in the viewer). A custom
-    # rubricPrompt made gpt-oss emit output promptfoo couldn't parse, so it fell back to
-    # storing a useless "Grading passed". Each task's llm-rubric `value` (its numbered
-    # criteria in tasks.yaml) IS the rubric the judge grades against.
+    # using promptfoo's DEFAULT rubric grading (no custom rubricPrompt):
+    # Each task's llm-rubric `value` (the success criteria in tasks.yaml) 
+    # is the rubric the judge grades against.
     provider: openrouter:openai/gpt-oss-120b
   assert:
     # The ONLY pass/fail deterministic check: did any tool call return status:"error"?
@@ -62,6 +43,7 @@ defaultTest:
     #    "return {...}" is evaluated as an expression and throws SyntaxError.
     # Each returns pass:true so it never fails a test — only NoToolErrors and the
     # capability judge (metric per task in tasks.yaml) drive the green/red pass mark.
+    
     # 0a. CAD tool calls = times workplane/sketch/assembly were invoked (NOT select_model).
     - type: javascript
       weight: 1
