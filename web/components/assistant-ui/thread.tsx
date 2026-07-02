@@ -287,6 +287,17 @@ const AssistantMessage: FC = () => {
           })}
         >
           {({ part, children }) => {
+            // Confidential: never render tool calls, tool results, or reasoning to the
+            // user (reasoning also isn't streamed to the client — see sendReasoning:false
+            // in app/api/chat/route.js). The switch cases below stay intact but are
+            // unreachable for these part types; remove this guard to restore them.
+            // (.includes avoids narrowing part.type, keeping the switch cases well-typed.)
+            if (
+              ["group-tool", "group-reasoning", "reasoning", "tool-call"].includes(
+                part.type,
+              )
+            )
+              return null;
             switch (part.type) {
               case "group-chainOfThought":
                 return <div data-slot="aui_chain-of-thought">{children}</div>;

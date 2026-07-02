@@ -9,6 +9,7 @@ import inspect
 import json
 import math
 import os
+import re
 import traceback
 import sys
 
@@ -78,9 +79,9 @@ mcp = FastMCP(
     name="parametric_text2cad_mcp",
     instructions=(
         "Dedicated parametric CAD tools:\n"
-        "  • workplane_api  — 3D modeling via cq.Workplane method chaining\n"
-        "  • sketch_api     — 2D profiles via cq.Sketch (face or edge workflows)\n"
-        "  • assembly_api   — multi-part assemblies via cq.Assembly add/constrain/solve\n"
+        "  • workplane_api  — 3D modeling via Workplane API method chaining\n"
+        "  • sketch_api     — 2D profiles via Sketch API (face or edge workflows)\n"
+        "  • assembly_api   — multi-part assemblies via Assembly API add/constrain/solve\n"
         "  • select_model   — re-activate an earlier model by name (shows it in the viewer and makes it exportable)\n"
         "  • query_docs     — fetch official detailed docs of specific methods and their parameters\n\n"
         "All tools share a persistent object store. Reference stored objects with "
@@ -96,8 +97,6 @@ mcp = FastMCP(
     # (tunnel / Render) and is protected by the MCP_TOKEN bearer check instead.
     transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False),
 )
-
-DEBUG_MODE = True
 
 # =============================================================================
 # STATE  (name → CadQuery object)
@@ -310,11 +309,27 @@ def _construct_type(spec: dict) -> Any:
 # HELPERS
 # =============================================================================
 
+# Strip tech-stack proper nouns from anything the LLM/client sees (BRep kept — it's
+# a geometry method the model needs, not a stack name).
+_BRAND_RE = re.compile(
+    r"open\s*cascade(\s*technology)?|\bocct\b|\bocp[_\s-]?vscode\b|\bocp\b"
+    r"|\bcadquery\b|\bcq\b|\bfast\s*mcp\b|\bfastmcp\b|\bpython\b",
+    re.IGNORECASE)
+
+
+def _scrub(t: str) -> str:
+    return _BRAND_RE.sub("", t or "")
+
+
+def _log_err(msg: str, tb: str = None) -> None:
+    # stderr: safe under stdio (stdout is the JSON-RPC pipe) and captured by the host over HTTP.
+    print(f"[t2c] {msg}\n{tb or ''}", file=sys.stderr, flush=True)
+
+
 def _error(msg: str, tb: str = None) -> str:
-    r = {"status": "error", "error": msg}
-    if DEBUG_MODE and tb:
-        r["traceback"] = tb
-    return json.dumps(r)
+    if tb:
+        _log_err(msg, tb)
+    return json.dumps({"status": "error", "error": _scrub(msg)})
 
 
 # Latest tessellated model for the web viewer. /model serves payload; /version
@@ -668,7 +683,7 @@ async def workplane_api(
             - Important for polyline(), lineTo(), threePointArc() and tangentArcPoint(). Also, methods like extrude can be performed on closed wire but not on opened one.
             - Cannot use the "move" or "moveTo" methods after "close".
         wire(forConstruction: bool=False)
-	        - Returns a CQ object with all pending edges connected into a wire.
+	        - Returns a model object with all pending edges connected into a wire.
         move(xDist: float=0, yDist: float=0)
 	        - Move the specified distance from the current point, without drawing.
             - Must read docs of this before use.
@@ -750,8 +765,8 @@ async def workplane_api(
         split(args, kwargs)
 	        - Splits a solid on the stack into two parts, optionally keeping the separate parts.
         mirror(mirrorPlane: Union[Literal['XY', 'YX', 'XZ', 'ZX', 'YZ', 'ZY'], Tuple[float, float], Tuple[float, float, float], Vector, Face, ForwardRef('Workplane')]='XY', basePointVector: Union[Tuple[float, float], Tuple[float, float, float], Vector, NoneType]=None, union: bool=False)
-	        - Mirror a single CQ object.
-            - Moves a single CQ object about a specific plane, but on the current workplane. Kinda like moving the object to a different quadrant in the current workplane
+	        - Mirror a single model object.
+            - Moves a single model object about a specific plane, but on the current workplane. Kinda like moving the object to a different quadrant in the current workplane
         clean()
 	        - Cleans the current solid by removing unwanted edges from the faces.
             - Essential after operations like boolean. Helps with accurate wire selection later on.
@@ -794,18 +809,18 @@ async def workplane_api(
       add(obj)
 	        - Adds an object or a list of objects to the stack
       tag(name: str)
-	        - Tags the current CQ object for later reference.
+	        - Tags the current model object for later reference.
             - Never use hyphens in tag names! It is not supported. Use underscores instead.
             - Example: Tag a solid, then select it's features later using selectors like solids, faces, edges, etc via the "tag" param.
       end(n: int=1)
-	        - Return the nth parent of this CQ element
+	        - Return the nth parent of this model element
             - Can be used to iterate over items on the current stack and move a specific item to the current selection.
             - If you use "end" 2x on a stack, then the N of your 2nd end cannot go before the position of the 1st end.
       pushPoints(pntList: Iterable[Union[Tuple[float, float], Tuple[float, float, float], Vector, Location]])
 	        - Pushes a list of 2D points onto the stack as vertices.
             - Creates an array of custom 2D points and pushed them onto the stack (similar to "rarray" or "polarArray")
       each(callback: Callable[[Union[Vector, Location, Shape, Sketch]], Shape], useLocalCoordinates: bool=False, combine: Union[bool, Literal['cut', 'a', 's']]=True, clean: bool=True)
-	        - Runs the provided function on each value in the stack, and collects the return values into a new CQ object. 
+	        - Runs the provided function on each value in the stack, and collects the return values into a new model object. 
             - lambda function [not supported]
       eachpoint(arg: Union[Shape, ForwardRef('Workplane'), Callable[[Location], Shape]], useLocalCoordinates: bool=False, combine: Union[bool, Literal['cut', 'a', 's']]=False, clean: bool=True)
 	        - Same as each(), except arg is translated by the positions on the stack. 
@@ -837,9 +852,9 @@ async def workplane_api(
         - Attempt to consolidate wires on the stack into a single.
       copyWorkplane(obj: ~T)
         - Copies the workplane from obj.
-        - Parameters: obj (a CQ object) – an object to copy the workplane from
-        - Returns: a CQ object with obj’s workplane
-        - Example: Workplane("front").circle(1).extrude(10).copyWorkplane(cq.Workplane("right", origin=(-5, 0, 0)) ).circle(1).extrude(10) # This creates two perpendicular cylinders
+        - Parameters: obj (a model object) – an object to copy the workplane from
+        - Returns: a model object with obj’s workplane
+        - Example: Workplane("front").circle(1).extrude(10).copyWorkplane(Workplane("right", origin=(-5, 0, 0)) ).circle(1).extrude(10) # This creates two perpendicular cylinders
       findSolid(searchStack: bool=True, searchParents: bool=True)
         - Finds the first solid object in the chain, searching from the current node backwards through parents until one is found.
       section(height: float=0.0)
@@ -2167,7 +2182,7 @@ def _doc_render(cls_name, name, method, sig) -> str:
     if raw:
         out.append(f"\n  Full docstring:\n{raw}")
     out.append("\n---")
-    return "\n".join(out)
+    return _scrub("\n".join(out))
 
 
 @mcp.tool(name="query_docs")
@@ -2278,7 +2293,8 @@ async def _export(request):
     try:
         obj = _get(None)  # current object
     except Exception as e:
-        return JSONResponse({"error": str(e)}, status_code=404)
+        _log_err(str(e), traceback.format_exc())
+        return JSONResponse({"error": _scrub(str(e))}, status_code=404)
     # DXF/SVG are flat 2D vector formats — only meaningful for a 2D Sketch. A 3D
     # solid/assembly would just dump a messy projection of all edges, so refuse it.
     if export_type in ("DXF", "SVG") and not isinstance(obj, Sketch):
@@ -2302,7 +2318,8 @@ async def _export(request):
             shape = obj.val() if hasattr(obj, "val") else obj
             cq.exporters.export(shape, path, exportType=export_type)
     except Exception as e:
-        return JSONResponse({"error": f"export failed: {e}"}, status_code=500)
+        _log_err(str(e), traceback.format_exc())
+        return JSONResponse({"error": _scrub(f"export failed: {e}")}, status_code=500)
     return FileResponse(path, filename=f"model.{ext}")
 
 
@@ -2333,7 +2350,8 @@ async def _backend(request):
         changes = await request.json()
         resp = _measure_backend.handle_event(changes, _MessageType.UPDATES)
     except Exception as e:
-        return JSONResponse({"error": str(e)}, status_code=500)
+        _log_err(str(e), traceback.format_exc())
+        return JSONResponse({"error": _scrub(str(e))}, status_code=500)
     return JSONResponse(resp or {})
 
 
