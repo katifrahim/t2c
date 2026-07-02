@@ -23,12 +23,14 @@ const MIME = {
 export async function GET(req) {
   const backendUrl = process.env.BACKEND_URL ?? "http://localhost:8080";
   const token = process.env.MCP_TOKEN;
-  const fmt = (new URL(req.url).searchParams.get("fmt") || "step").toLowerCase();
+  const params = new URL(req.url).searchParams;
+  const fmt = (params.get("fmt") || "step").toLowerCase();
+  const session = params.get("session") || "";
   const ext = EXT[fmt] || "step";
 
   try {
     const resp = await fetch(
-      `${backendUrl}/export?fmt=${encodeURIComponent(fmt)}`,
+      `${backendUrl}/export?fmt=${encodeURIComponent(fmt)}&session=${encodeURIComponent(session)}`,
       { headers: token ? { Authorization: `Bearer ${token}` } : {} },
     );
     if (!resp.ok) {

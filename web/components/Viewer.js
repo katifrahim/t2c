@@ -1,5 +1,6 @@
 "use client";
 import { useEffect, useRef } from "react";
+import { useSessionStore } from "@/lib/session-store";
 
 // Ported verbatim from ocp_vscode's viewer.html so the look/toolbar (studio
 // background, zebra/measure/explode tools, etc.) match the standalone viewer.
@@ -80,7 +81,17 @@ function loadTCV() {
 
 export default function Viewer() {
   const containerRef = useRef(null);
-  const ref = useRef({ TCV: null, viewer: null, lastVersion: -1 });
+  const ref = useRef({ TCV: null, viewer: null, lastVersion: -1, payload: null });
+  const sessionId = useSessionStore((s) => s.sessionId);
+  const sidRef = useRef(sessionId);
+
+  // On chat/session switch: keep the current scene on screen (no blanking) and
+  // force the next poll to re-render this session's model — or its placeholder
+  // (grid + tools + empty scene), so the viewer widget is NEVER torn down.
+  useEffect(() => {
+    sidRef.current = sessionId;
+    ref.current.lastVersion = -1;
+  }, [sessionId]);
 
   useEffect(() => {
     let cancelled = false;
@@ -100,7 +111,7 @@ export default function Viewer() {
           try { await navigator.clipboard.writeText([].concat(flat.selected).join(",")); } catch {}
         }
         if (!("activeTool" in flat) && !("selectedShapeIDs" in flat)) return;
-        const resp = await fetch("/api/backend", {
+        const resp = await fetch(`/api/backend?session=${sidRef.current}`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify(flat),
@@ -142,13 +153,15 @@ export default function Viewer() {
     }
 
     async function poll() {
+      const sid = sidRef.current;
       try {
-        const v = (await (await fetch("/api/version")).json()).version;
-        if (v === ref.current.lastVersion) return;
-        const resp = await fetch("/api/model");
-        if (resp.status !== 200) return;
-        const payload = await resp.json();
+        const v = (await (await fetch(`/api/version?session=${sid}`)).json()).version;
+        if (sid !== sidRef.current || v === ref.current.lastVersion) return;
+        const resp = await fetch(`/api/model?session=${sid}`);
+        if (sid !== sidRef.current) return; // session switched mid-poll
+        if (resp.status !== 200) return; // no payload yet — keep the current scene
         ref.current.lastVersion = v;
+        const payload = await resp.json();
         if (!cancelled) renderModel(payload);
       } catch { /* backend not reachable yet */ }
     }

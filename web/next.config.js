@@ -10,6 +10,9 @@ const nextConfig = {
   // so don't let those third-party type/lint errors block the production build.
   typescript: { ignoreBuildErrors: true },
   eslint: { ignoreDuringBuilds: true },
+  // Allow the dev server to be reached over the LAN (Next 15 blocks cross-origin
+  // dev requests otherwise). Add any other host/IP you serve from here.
+  allowedDevOrigins: ["10.18.198.6"],
   async rewrites() {
     const backend = process.env.BACKEND_URL || "http://localhost:8080";
     return [

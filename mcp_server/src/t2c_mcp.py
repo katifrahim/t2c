@@ -5,13 +5,20 @@ Tools: workplane_api, sketch_api, assembly_api, query_docs, select_model
 # MCP server entry point
 
 from typing import Any, Dict, List, Optional
+from contextvars import ContextVar
+from dataclasses import dataclass, field
 import inspect
 import json
 import math
 import os
+import pickle
 import re
+import time
 import traceback
 import sys
+import zlib
+
+import anyio
 
 # Port of the standalone ocp_vscode viewer (`python -m ocp_vscode`) used by the
 # stdio viewer-push pipeline. NOTE: instantiating ViewerBackend(0) below calls
@@ -38,20 +45,25 @@ except Exception:
 
 # Measurement backend (distance / properties tools). Forcing is_jupyter_cadquery
 # makes its handlers RETURN responses instead of websocket-sending them, so we
-# can expose them over HTTP via /backend.
+# can expose them over HTTP via /backend. One backend is created PER SESSION
+# (lazily) so each user's measurements act on their own model — see Session.
 try:
     import ocp_vscode.backend as _ocp_backend_mod
     _ocp_backend_mod.is_jupyter_cadquery = True
     from ocp_vscode.comms import MessageType as _MessageType, default as _ocp_default
-    _measure_backend = _ocp_backend_mod.ViewerBackend(0)
     MEASURE_AVAILABLE = True
 except Exception:
-    _measure_backend = None
+    _ocp_backend_mod = None
     _MessageType = None
     _ocp_default = None
     MEASURE_AVAILABLE = False
 
-from mcp.server.fastmcp import FastMCP
+
+def _new_measure_backend():
+    """A fresh measurement backend for one session (None if unavailable)."""
+    return _ocp_backend_mod.ViewerBackend(0) if MEASURE_AVAILABLE else None
+
+from mcp.server.fastmcp import FastMCP, Context
 from mcp.server.transport_security import TransportSecuritySettings
 
 import cadquery as cq
@@ -99,32 +111,201 @@ mcp = FastMCP(
 )
 
 # =============================================================================
-# STATE  (name → CadQuery object)
+# STATE  —  one isolated Session per user/chat (multi-user)
 # =============================================================================
+# Every request carries a session id (the `X-Session-Id` header on /mcp, or the
+# `?session=` query param on the viewer routes). All CAD objects, the tessellated
+# viewer payload, and the measurement backend live on that session — never in
+# module globals — so concurrent users never see each other's models. Requests
+# without an id (stdio / local dev) fall back to a single shared "local" session.
 
-_state: Dict[str, Any] = {}
-_counters: Dict[str, int] = {}
-_current: Optional[str] = None
+_LOCAL_SID = "local"
+_SESSION_TTL = float(os.environ.get("SESSION_TTL_SECONDS", 3600))  # evict idle sessions
+
+
+@dataclass
+class Session:
+    state: Dict[str, Any] = field(default_factory=dict)       # name → CadQuery object
+    counters: Dict[str, int] = field(default_factory=dict)    # auto-naming counters
+    current: Optional[str] = None                             # active object name
+    # Latest tessellated model the browser polls (/model serves payload; /version
+    # lets it detect changes and reports obj_type for 2D-only export formats).
+    viewer: Dict[str, Any] = field(
+        default_factory=lambda: {"payload": None, "version": 0, "obj_type": None})
+    _measure: Any = None                                      # lazy measurement backend
+    last_used: float = field(default_factory=time.monotonic)
+
+    @property
+    def measure_backend(self):
+        if self._measure is None:
+            self._measure = _new_measure_backend()
+        return self._measure
+
+
+_sessions: Dict[str, Session] = {}
+# The session bound to the current request; set at each tool/route entry. anyio
+# copies it into the worker thread, so offloaded CAD work sees the right session.
+_cur_session: ContextVar[Optional[Session]] = ContextVar("cur_session", default=None)
+
+
+def _evict_idle() -> None:
+    now = time.monotonic()
+    stale = [sid for sid, s in _sessions.items() if s.last_used < now - _SESSION_TTL]
+    for sid in stale:
+        _sessions.pop(sid, None)
+
+
+def _get_session(sid: Optional[str]) -> Session:
+    sid = sid or _LOCAL_SID
+    _evict_idle()
+    sess = _sessions.get(sid)
+    if sess is None:
+        sess = _sessions[sid] = Session()
+        # Seed the placeholder so the viewer (grid + tools + empty scene) is always
+        # visible for every session, even before the LLM builds a model.
+        _init_viewer(sess)
+    sess.last_used = time.monotonic()
+    return sess
+
+
+def _sess() -> Session:
+    """The session for the current request (creating the local one if unbound)."""
+    sess = _cur_session.get()
+    if sess is None:
+        sess = _get_session(_LOCAL_SID)
+        _cur_session.set(sess)
+    return sess
+
+
+def _bind(sid: Optional[str]) -> Session:
+    """Bind the request's session so _store/_get/_show operate on it."""
+    sess = _get_session(sid)
+    _cur_session.set(sess)
+    return sess
+
+
+def _sid_from_ctx(ctx) -> Optional[str]:
+    """The X-Session-Id header from the live HTTP request (None over stdio)."""
+    try:
+        return ctx.request_context.request.headers.get("x-session-id")
+    except Exception:
+        return None
 
 
 def _store(name: str, obj: Any) -> None:
-    global _current
-    _state[name] = obj
-    _current = name
+    sess = _sess()
+    sess.state[name] = obj
+    sess.current = name
 
 
 def _get(name: Optional[str]) -> Any:
-    target = name or _current
+    sess = _sess()
+    target = name or sess.current
     if not target:
         raise ValueError("No object name given and no current object set")
-    if target not in _state:
+    if target not in sess.state:
         raise ValueError(f"Object '{target}' not found")
-    return _state[target]
+    return sess.state[target]
 
 
 def _auto_name(prefix: str) -> str:
-    _counters[prefix] = _counters.get(prefix, 0) + 1
-    return f"{prefix}_{_counters[prefix]}"
+    c = _sess().counters
+    c[prefix] = c.get(prefix, 0) + 1
+    return f"{prefix}_{c[prefix]}"
+
+
+# --- Durable snapshots ---------------------------------------------------------
+# A session's whole object store pickles with full fidelity: CadQuery shapes
+# serialize via OCCT BinTools, and Workplane/Sketch/Assembly (with colors,
+# locations, hierarchy) all round-trip. So a chat's CAD state can be saved to the
+# DB and restored after a server restart. The blob is produced AND consumed only
+# by this backend, so unpickling is trusted (never fed arbitrary user input).
+def _iter_assemblies(obj: Any):
+    """Yield an Assembly and all its nested Assembly children."""
+    if isinstance(obj, Assembly):
+        yield obj
+        for c in getattr(obj, "children", []) or []:
+            yield from _iter_assemblies(c)
+
+
+def _snapshot(sess: "Session") -> bytes:
+    # A solved Assembly caches an OCCT solver result (`_solve_result`) holding a
+    # non-picklable SwigPyObject. It's just solver metadata — solve() regenerates
+    # it and the solved child locations are already baked in — so strip it for the
+    # dump and restore it on the live objects afterward. Constraints (picklable)
+    # are kept, so a restored assembly can still be re-solved.
+    stripped = []
+    for obj in sess.state.values():
+        for a in _iter_assemblies(obj):
+            sr = getattr(a, "_solve_result", None)
+            if sr is not None:
+                a._solve_result = None
+                stripped.append((a, sr))
+    try:
+        raw = pickle.dumps(
+            {"counters": dict(sess.counters), "current": sess.current, "objects": sess.state},
+            protocol=pickle.HIGHEST_PROTOCOL,
+        )
+        # Deflate: BREP/pickle geometry is highly redundant, so this shrinks the
+        # stored blob several-fold (keeps DB rows small on the free tier).
+        return zlib.compress(raw, 9)
+    finally:
+        for a, sr in stripped:
+            a._solve_result = sr
+
+
+def _recast_shape(s: Any) -> Any:
+    """Downcast a restored shape: OCCT BinTools.Read returns a generic TopoDS_Shape
+    (not TopoDS_Solid/Compound/…), which the tessellator's type check rejects.
+    cq.Shape.cast reads the real ShapeType and re-wraps it correctly."""
+    if isinstance(s, cq.Shape) and s.wrapped is not None:
+        try:
+            return cq.Shape.cast(s.wrapped)
+        except Exception:
+            return s
+    return s
+
+
+def _normalize(obj: Any) -> Any:
+    """Make a restored object display-ready by recasting its shapes (see above).
+    Geometry/modeling already work on the raw restored object; this fixes the
+    viewer tessellation for Workplanes and Assemblies (Sketches are unaffected)."""
+    if isinstance(obj, Workplane):
+        shapes = [_recast_shape(o) for o in obj.objects if isinstance(o, cq.Shape)]
+        if not shapes:
+            return obj
+        plane = getattr(obj, "plane", None)
+        return (Workplane(plane) if plane is not None else Workplane()).newObject(shapes)
+    if isinstance(obj, Sketch):
+        f = getattr(obj, "_faces", None)
+        if isinstance(f, cq.Shape) and f.wrapped is not None:
+            obj._faces = _recast_shape(f)
+        return obj
+    if isinstance(obj, Assembly):
+        def _rec(a):
+            if getattr(a, "obj", None) is not None:
+                a.obj = _normalize(a.obj)
+            for c in getattr(a, "children", []) or []:
+                _rec(c)
+        _rec(obj)
+        return obj
+    if isinstance(obj, cq.Shape):
+        return _recast_shape(obj)
+    return obj
+
+
+def _restore_into(sess: "Session", data: bytes) -> int:
+    # New snapshots are zlib-compressed; fall back to raw for any legacy blob.
+    try:
+        data = zlib.decompress(data)
+    except zlib.error:
+        pass
+    d = pickle.loads(data)
+    objs = d.get("objects", {}) or {}
+    sess.state = {name: _normalize(o) for name, o in objs.items()}
+    sess.counters = d.get("counters", {}) or {}
+    sess.current = d.get("current")
+    return len(sess.state)
 
 # =============================================================================
 # REFERENCE & TYPE RESOLUTION
@@ -332,11 +513,8 @@ def _error(msg: str, tb: str = None) -> str:
     return json.dumps({"status": "error", "error": _scrub(msg)})
 
 
-# Latest tessellated model for the web viewer. /model serves payload; /version
-# lets the browser poll for changes (and reports obj_type so the frontend can
-# offer 2D-only formats like DXF/SVG just for sketches). Single global = fine
-# for single-user.
-_viewer_state: Dict[str, Any] = {"payload": None, "version": 0, "obj_type": None}
+# The tessellated model for the web viewer now lives on each Session (Session.viewer);
+# /model + /version serve it per session so users never see each other's models.
 
 # Which viewer pipeline _show() uses, chosen by transport in __main__:
 #   "stdio" → push to the standalone ocp_vscode viewer on :3939 via show()
@@ -347,8 +525,8 @@ _VIEWER_MODE: str = "http"
 
 
 def _show(obj: Any) -> None:
-    """Render obj into the active viewer pipeline (see _VIEWER_MODE)."""
-    _viewer_state["obj_type"] = _obj_type(obj)  # so /version can report it
+    """Render obj into the current session's viewer pipeline (see _VIEWER_MODE)."""
+    _sess().viewer["obj_type"] = _obj_type(obj)  # so /version can report it
     if _VIEWER_MODE == "stdio":
         _show_push(obj)
     else:
@@ -392,15 +570,17 @@ def _show_tessellate(obj: Any) -> None:
         with contextlib.redirect_stderr(io.StringIO()), contextlib.redirect_stdout(io.StringIO()):
             payload, mapping = _ocp_convert(obj)
         payload["config"]["reset_camera"] = "iso"  # frame the part on each render
-        _viewer_state["payload"] = payload
-        _viewer_state["version"] += 1
-        # Load the BRep model into the measurement backend (serialize the live
-        # OCCT mapping the same way send_backend would).
-        if MEASURE_AVAILABLE:
+        sess = _sess()
+        sess.viewer["payload"] = payload
+        sess.viewer["version"] += 1
+        # Load the BRep model into this session's measurement backend (serialize the
+        # live OCCT mapping the same way send_backend would).
+        mb = sess.measure_backend
+        if mb is not None:
             try:
                 model = json.loads(json.dumps(mapping, default=_ocp_default))
                 with contextlib.redirect_stderr(io.StringIO()), contextlib.redirect_stdout(io.StringIO()):
-                    _measure_backend.load_model(model)
+                    mb.load_model(model)
             except Exception:
                 pass
     except Exception:
@@ -413,12 +593,18 @@ def _build_placeholder() -> Any:
     return Workplane().newObject([Vertex.makeVertex(0, 0, 0)])
 
 
-def _init_viewer() -> None:
-    """Populate the viewer with the placeholder so /model has content from boot."""
+def _init_viewer(sess: "Session") -> None:
+    """Seed a new session's viewer with the placeholder so /model is never blank.
+    Only meaningful for the http pipeline; stdio pushes to the standalone viewer."""
+    if _VIEWER_MODE != "http":
+        return
+    token = _cur_session.set(sess)
     try:
         _show(_build_placeholder())
     except Exception:
         pass
+    finally:
+        _cur_session.reset(token)
 
 
 def _properties(obj: Any) -> dict:
@@ -534,6 +720,7 @@ async def workplane_api(
     init_params: Optional[dict] = None,
     start_from: Optional[str] = None,
     store_as: Optional[str] = None,
+    ctx: Context = None,
 ) -> str:
     """
     Build 3D models using Workplane API via method chaining.
@@ -1024,6 +1211,7 @@ async def workplane_api(
     {"status":"success", "name":str, "obj_type":str,
      "properties": {"volume":float, "area":float, "center":[x,y,z], "bounding_box":{...}}}
     """
+    _bind(_sid_from_ctx(ctx))
     try:
         if start_from:
             obj = _get(start_from)
@@ -1038,7 +1226,7 @@ async def workplane_api(
             else:
                 obj = Workplane(plane)
 
-        obj = _run(obj, operations)
+        obj = await anyio.to_thread.run_sync(_run, obj, operations)
 
         # tag() chains via newObject([Vertex]) leave only a Vertex on the stack.
         # Storing that would break assembly selectors (partName@faces@...) on the part.
@@ -1051,7 +1239,7 @@ async def workplane_api(
 
         name = store_as or _auto_name("workplane")
         _store(name, obj)
-        _show(obj)
+        await anyio.to_thread.run_sync(_show, obj)
 
         return json.dumps({"status": "success", "name": name,
                            "obj_type": _obj_type(obj), "properties": _properties(obj)})
@@ -1068,6 +1256,7 @@ async def sketch_api(
     init_params: Optional[dict] = None,
     start_from: Optional[str] = None,
     store_as: Optional[str] = None,
+    ctx: Context = None,
 ) -> str:
     """
     Build 2D profiles using Sketch API via method chaining.
@@ -1265,16 +1454,17 @@ async def sketch_api(
     {"status":"success", "name":str, "obj_type":"Sketch",
      "properties": {"face_count":int, "total_area":float, "edge_count":int}}
     """
+    _bind(_sid_from_ctx(ctx))
     try:
         if start_from:
             obj = _get(start_from)
         else:
             obj = Sketch()
 
-        obj = _run(obj, operations)
+        obj = await anyio.to_thread.run_sync(_run, obj, operations)
         name = store_as or _auto_name("sketch")
         _store(name, obj)
-        _show(obj)
+        await anyio.to_thread.run_sync(_show, obj)
 
         return json.dumps({"status": "success", "name": name,
                            "obj_type": _obj_type(obj), "properties": _properties(obj)})
@@ -1291,6 +1481,7 @@ async def assembly_api(
     init_params: Optional[dict] = None,
     start_from: Optional[str] = None,
     store_as: Optional[str] = None,
+    ctx: Context = None,
 ) -> str:
     """
     Assembly API fundamentals: 
@@ -2042,6 +2233,7 @@ async def assembly_api(
         {"status":"success", "name":str, "obj_type":"Assembly",
          "properties": {"children":[str,...], "object_count":int, "volume":float, "center":[x,y,z]}}
     """
+    _bind(_sid_from_ctx(ctx))
     try:
         if start_from:
             obj = _get(start_from)
@@ -2054,10 +2246,10 @@ async def assembly_api(
                 color=resolved.get("color"),
             )
 
-        obj = _run(obj, operations)
+        obj = await anyio.to_thread.run_sync(_run, obj, operations)
         name = store_as or _auto_name("assembly")
         _store(name, obj)
-        _show(obj)
+        await anyio.to_thread.run_sync(_show, obj)
 
         return json.dumps({"status": "success", "name": name,
                            "obj_type": _obj_type(obj), "properties": _properties(obj)})
@@ -2069,7 +2261,7 @@ async def assembly_api(
 # =============================================================================
 
 @mcp.tool(name="select_model")
-async def select_model(name: str) -> str:
+async def select_model(name: str, ctx: Context = None) -> str:
     """
     Make a previously built model the ACTIVE model.
 
@@ -2088,11 +2280,11 @@ async def select_model(name: str) -> str:
     name: stored name of a model created earlier (returned as "name" by the build
           tools). Works with models from all three APIs.
     """
-    global _current
+    sess = _bind(_sid_from_ctx(ctx))
     try:
         obj = _get(name)  # raises if name unknown
-        _current = name
-        _show(obj)
+        sess.current = name
+        await anyio.to_thread.run_sync(_show, obj)
         return json.dumps({"status": "success", "name": name,
                            "obj_type": _obj_type(obj), "properties": _properties(obj)})
     except Exception as e:
@@ -2258,17 +2450,64 @@ async def _health(request):
 
 @mcp.custom_route("/clear", methods=["POST"])
 async def _clear(request):
-    """Reset the object store to a clean slate (new session) and re-show the
-    placeholder vertex so the viewer updates. Token-gated."""
+    """Reset ONE session's object store to a clean slate and re-show the
+    placeholder vertex so its viewer updates. Token-gated. ?session=<id>."""
     from starlette.responses import JSONResponse
     if not _authorized(request):
         return JSONResponse({"error": "unauthorized"}, status_code=401)
-    global _current
-    _state.clear()
-    _counters.clear()
-    _current = None
-    _init_viewer()
+    sess = _get_session(request.query_params.get("session"))
+    sess.state.clear()
+    sess.counters.clear()
+    sess.current = None
+    _init_viewer(sess)  # re-show the placeholder (grid + tools) so the viewer stays visible
     return JSONResponse({"status": "ok"})
+
+
+@mcp.custom_route("/session/export", methods=["GET"])
+async def _session_export(request):
+    """Serialize a session's CAD objects for durable storage. Token-gated.
+    404 when the session has nothing to save."""
+    from starlette.responses import JSONResponse, Response
+    if not _authorized(request):
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+    sess = _get_session(request.query_params.get("session"))
+    if not sess.state:
+        return JSONResponse({"error": "empty"}, status_code=404)
+    try:
+        data = _snapshot(sess)
+    except Exception as e:
+        _log_err(str(e), traceback.format_exc())
+        return JSONResponse({"error": "snapshot failed"}, status_code=500)
+    return Response(data, media_type="application/octet-stream")
+
+
+@mcp.custom_route("/session/import", methods=["POST"])
+async def _session_import(request):
+    """Restore a previously-saved snapshot into a session so the LLM can keep
+    working on models built in an earlier run. Token-gated. Skips if the session
+    already has objects (never clobbers live work)."""
+    from starlette.responses import JSONResponse
+    if not _authorized(request):
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+    sess = _get_session(request.query_params.get("session"))
+    if sess.state:
+        return JSONResponse({"status": "already-loaded"})
+    body = await request.body()
+    if not body:
+        return JSONResponse({"status": "empty"})
+    try:
+        n = _restore_into(sess, body)
+        # Re-tessellate the active model so the viewer shows it immediately.
+        if sess.current and sess.current in sess.state:
+            token = _cur_session.set(sess)
+            try:
+                _show(sess.state[sess.current])
+            finally:
+                _cur_session.reset(token)
+    except Exception as e:
+        _log_err(str(e), traceback.format_exc())
+        return JSONResponse({"error": "restore failed"}, status_code=500)
+    return JSONResponse({"status": "ok", "objects": n})
 
 
 @mcp.custom_route("/export", methods=["GET"])
@@ -2279,6 +2518,7 @@ async def _export(request):
     from starlette.responses import JSONResponse, FileResponse
     if not _authorized(request):
         return JSONResponse({"error": "unauthorized"}, status_code=401)
+    _bind(request.query_params.get("session"))
     fmt = request.query_params.get("fmt", "step").lower()
     fmt_map = {
         "step": ("step", "STEP"), "stp": ("step", "STEP"),
@@ -2326,29 +2566,32 @@ async def _export(request):
 @mcp.custom_route("/model", methods=["GET"])
 async def _model(request):
     from starlette.responses import JSONResponse, Response
-    if _viewer_state["payload"] is None:
+    sess = _get_session(request.query_params.get("session"))
+    if sess.viewer["payload"] is None:
         return JSONResponse({"error": "no model yet"}, status_code=404)
-    return Response(json.dumps(_viewer_state["payload"]), media_type="application/json")
+    return Response(json.dumps(sess.viewer["payload"]), media_type="application/json")
 
 
 @mcp.custom_route("/version", methods=["GET"])
 async def _version(request):
     from starlette.responses import JSONResponse
-    return JSONResponse({"version": _viewer_state["version"],
-                         "obj_type": _viewer_state.get("obj_type")})
+    sess = _get_session(request.query_params.get("session"))
+    return JSONResponse({"version": sess.viewer["version"],
+                         "obj_type": sess.viewer.get("obj_type")})
 
 
 @mcp.custom_route("/backend", methods=["POST"])
 async def _backend(request):
     """Measurement tools (distance/properties). The frontend posts viewer
     state changes (activeTool + selectedShapeIDs); we return the computed
-    backend_response for viewer.handleBackendResponse()."""
+    backend_response for viewer.handleBackendResponse(). ?session=<id>."""
     from starlette.responses import JSONResponse
-    if not MEASURE_AVAILABLE:
+    mb = _get_session(request.query_params.get("session")).measure_backend
+    if mb is None:
         return JSONResponse({}, status_code=503)
     try:
         changes = await request.json()
-        resp = _measure_backend.handle_event(changes, _MessageType.UPDATES)
+        resp = mb.handle_event(changes, _MessageType.UPDATES)
     except Exception as e:
         _log_err(str(e), traceback.format_exc())
         return JSONResponse({"error": _scrub(str(e))}, status_code=500)
@@ -2404,7 +2647,8 @@ def _run_http():
 if __name__ == "__main__":
     if os.environ.get("MCP_TRANSPORT", "stdio") == "http":
         _VIEWER_MODE = "http"
-        _init_viewer()  # placeholder vertex so the web viewer is never blank
+        # Each session seeds its own placeholder lazily (see _get_session), so the
+        # viewer is never blank without a global boot-time model.
         _run_http()
     else:
         # stdio: push models to the standalone ocp_vscode viewer (run separately

@@ -2,7 +2,32 @@ import { frontendTools } from "@assistant-ui/react-ai-sdk";
 import { createMCPClient } from "@ai-sdk/mcp";
 import { createOpenRouter } from "@openrouter/ai-sdk-provider";
 import { streamText, convertToModelMessages, stepCountIs } from "ai";
+import { after } from "next/server";
 import { MODELS, DEFAULT_MODEL } from "@/lib/models";
+import { createClient } from "@/lib/supabase/server";
+
+const SUPABASE_ON = !!process.env.NEXT_PUBLIC_SUPABASE_URL;
+
+// After a turn, snapshot the backend session's CAD objects to Supabase so they
+// survive restarts. Skips when nothing was built (backend returns 404).
+async function saveSnapshot({ supabase, uid, session, backendUrl, token }) {
+  if (!supabase || !uid || !session || session.startsWith("__LOCALID")) return;
+  try {
+    const resp = await fetch(`${backendUrl}/session/export?session=${encodeURIComponent(session)}`, {
+      headers: token ? { Authorization: `Bearer ${token}` } : {},
+    });
+    if (!resp.ok) return; // 404 → empty session, nothing to save
+    const b64 = Buffer.from(await resp.arrayBuffer()).toString("base64");
+    await supabase.from("session_snapshots").upsert({
+      chat_id: session,
+      user_id: uid,
+      data: b64,
+      updated_at: new Date().toISOString(),
+    });
+  } catch (e) {
+    console.error("snapshot save failed:", e);
+  }
+}
 
 // Agentic tool loops can run several round-trips; give them room.
 export const maxDuration = 120;
@@ -26,19 +51,44 @@ The models you build are for real fabrication:
 - 3D printing is supported end-to-end: the export drops straight into a slicer that generates the G-code.
 - 3D CNC milling and 2D laser, plasma, water-jet, CNC cutting are design-only — you can make the CAD model, but can't do CAM or the G-code part yet.`;
 
+// Pull a human-readable message out of whatever shape the error arrives in.
+function errorMessage(e) {
+  if (!e) return "Unknown error";
+  if (typeof e === "string") return e;
+  if (e instanceof Error) return e.message;
+  return e.error?.message ?? e.message ?? JSON.stringify(e);
+}
+
 export async function POST(req) {
-  const { messages, system, tools, model } = await req.json();
+  const { messages, system, tools, model, id, sessionId } = await req.json();
+  // assistant-ui's transport sends the thread's remoteId as `id`; that IS the
+  // chat's persistent session id. Fall back to sessionId for older callers.
+  const session = id ?? sessionId;
 
   const backendUrl = process.env.BACKEND_URL ?? "http://localhost:8080";
   const token = process.env.MCP_TOKEN;
 
+  // Capture the user now (cookies are available here) so onFinish can persist the
+  // session snapshot for this chat.
+  let supabase = null;
+  let uid = null;
+  if (SUPABASE_ON) {
+    supabase = await createClient();
+    const { data: claims } = await supabase.auth.getClaims();
+    uid = claims?.claims?.sub ?? null;
+  }
+
   // One MCP client per request, connected to the t2c FastMCP server over
   // streamable HTTP. Closed when the response finishes (see onFinish/onError).
+  // X-Session-Id scopes all CAD state to this chat so users never collide.
   const mcpClient = await createMCPClient({
     transport: {
       type: "http",
       url: `${backendUrl}/mcp`,
-      ...(token ? { headers: { Authorization: `Bearer ${token}` } } : {}),
+      headers: {
+        ...(token ? { Authorization: `Bearer ${token}` } : {}),
+        ...(session ? { "X-Session-Id": session } : {}),
+      },
     },
   });
   const mcpTools = await mcpClient.tools();
@@ -53,7 +103,10 @@ export async function POST(req) {
   const reasoning = MODELS.find((m) => m.id === selectedModel)?.reasoning;
 
   const result = streamText({
-    model: openrouter(selectedModel),
+    // Skip Groq: its strict function-calling validator rewrites our tools'
+    // `additionalProperties: true` to false and then rejects valid tool calls
+    // (our CAD ops take freeform args), returning a 502 that aborts the turn.
+    model: openrouter(selectedModel, { provider: { ignore: ["Groq", "groq"] } }),
     ...(reasoning
       ? { providerOptions: { openrouter: { reasoning: { effort: reasoning } } } }
       : {}),
@@ -66,7 +119,11 @@ export async function POST(req) {
     // Multi-step agentic loop: CAD tools naturally chain
     // (workplane -> sketch -> extrude -> assembly).
     stopWhen: stepCountIs(12),
-    onFinish: () => mcpClient.close(),
+    onFinish: () => {
+      mcpClient.close();
+      // Persist the snapshot after the response closes (survives Vercel cutoff).
+      after(() => saveSnapshot({ supabase, uid, session, backendUrl, token }));
+    },
     onError: (e) => {
       console.error("chat streamText error:", e); // server-side (Vercel logs) only
       mcpClient.close();
@@ -77,11 +134,12 @@ export async function POST(req) {
     // Reasoning is confidential (can reveal planned tool calls) — never send it to
     // the browser. The model still reasons server-side; only the stream omits it.
     sendReasoning: false,
-    // Surface the real error instead of AI SDK's generic "An error occurred".
-    // Free OpenRouter models are rate-limited, so you want to see the 429.
+    // Surface the real error instead of AI SDK's generic "An error occurred" (or a
+    // useless "[object Object]"). OpenRouter/provider errors arrive as plain objects
+    // like { error: { message } } or { code, message }, not Error instances.
     onError: (error) => {
       console.error("chat stream error:", error); // server-side (Vercel logs) only
-      return error instanceof Error ? error.message : String(error);
+      return errorMessage(error);
     },
     // Report which model actually answered. For "openrouter/free" (the auto
     // router) this is the resolved model OpenRouter picked, not the router id.
