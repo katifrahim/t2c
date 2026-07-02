@@ -16,13 +16,14 @@
 export const MODELS = [
   // Premium (paid — need OpenRouter credits). IDs/capabilities verified against
   // the live /api/v1/models endpoint: all support tools + reasoning + image.
+  { id: "openai/gpt-oss-120b", label: "Paid GPT-OSS 120B" },
   { id: "anthropic/claude-sonnet-4.6", label: "Claude Sonnet 4.6 (High)", vision: true, reasoning: "high" },
   { id: "anthropic/claude-opus-4.8", label: "Claude Opus 4.8 (High)", vision: true, reasoning: "high" },
   { id: "openai/gpt-5.5", label: "GPT-5.5", vision: true },
   { id: "google/gemini-3.1-pro-preview", label: "Gemini 3.1 Pro", vision: true },
 
   // Free
-  { id: "openai/gpt-oss-120b:free", label: "GPT-OSS 120B" },
+  { id: "openai/gpt-oss-120b:free", label: "Free GPT-OSS 120B" },
   { id: "qwen/qwen3-coder:free", label: "Qwen3 Coder 480B" },
   { id: "meta-llama/llama-3.3-70b-instruct:free", label: "Llama 3.3 70B" },
   { id: "nvidia/nemotron-3-super-120b-a12b:free", label: "Nemotron 3 Super 120B" },
