@@ -54,10 +54,12 @@ import {
 import {
   createContext,
   useContext,
+  useEffect,
   type ComponentType,
   type FC,
   type PropsWithChildren,
 } from "react";
+import { useCreditStore } from "@/lib/credit-store";
 
 export type ThreadGroupPart = MessagePrimitive.GroupedParts.GroupPart;
 
@@ -221,10 +223,32 @@ const Composer: FC = () => {
   );
 };
 
+// Remaining-credit chip shown next to the composer "+". Refreshes on mount and
+// every 5s, so the count updates shortly after each turn is charged server-side.
+const CreditPill: FC = () => {
+  const credits = useCreditStore((s) => s.credits);
+  const refresh = useCreditStore((s) => s.refresh);
+  useEffect(() => {
+    refresh();
+    const t = setInterval(refresh, 5000);
+    return () => clearInterval(t);
+  }, [refresh]);
+  if (credits == null) return null;
+  return (
+    <div
+      title="Credits remaining"
+      className="absolute top-1/2 left-1/2 flex h-7 -translate-x-1/2 -translate-y-1/2 items-center rounded-full border border-neutral-300 bg-white px-2.5 text-xs font-medium whitespace-nowrap text-neutral-500"
+    >
+      {credits.toLocaleString()} Credits
+    </div>
+  );
+};
+
 const ComposerAction: FC = () => {
   return (
     <div className="aui-composer-action-wrapper relative flex items-center justify-between">
       <ComposerAddAttachment />
+      <CreditPill />
       <div className="flex items-center gap-1.5">
         <AuiIf condition={(s) => s.thread.capabilities.dictation}>
           <AuiIf condition={(s) => s.composer.dictation == null}>

@@ -1,12 +1,50 @@
 import { frontendTools } from "@assistant-ui/react-ai-sdk";
 import { createMCPClient } from "@ai-sdk/mcp";
 import { createOpenRouter } from "@openrouter/ai-sdk-provider";
-import { streamText, convertToModelMessages, stepCountIs } from "ai";
+import {
+  streamText,
+  convertToModelMessages,
+  stepCountIs,
+  createUIMessageStream,
+  createUIMessageStreamResponse,
+} from "ai";
 import { after } from "next/server";
-import { MODELS, DEFAULT_MODEL } from "@/lib/models";
+import { MODELS, DEFAULT_MODEL, MODEL_PRICING, CREDITS_PER_USD } from "@/lib/models";
 import { createClient } from "@/lib/supabase/server";
 
 const SUPABASE_ON = !!process.env.NEXT_PUBLIC_SUPABASE_URL;
+
+// Refuse a new turn once the balance can't cover roughly one more turn, so we
+// never go negative (hard block). ~5 credits ≈ $0.005 ≈ a few messages of margin.
+const MIN_RESERVE = 5;
+
+// Real $ cost of a finished turn. Prefer OpenRouter's reported cost (cache-aware,
+// summed across every agentic step); fall back to token math only if it's missing.
+function turnCost({ steps, totalUsage, model }) {
+  let cost = 0;
+  let hasReal = false;
+  for (const s of steps ?? []) {
+    const c = s.providerMetadata?.openrouter?.usage?.cost ?? s.providerMetadata?.openrouter?.cost;
+    if (typeof c === "number") { cost += c; hasReal = true; }
+  }
+  if (hasReal) return cost;
+  const p = MODEL_PRICING[model];
+  if (p && totalUsage) return (totalUsage.inputTokens ?? 0) * p.input + (totalUsage.outputTokens ?? 0) * p.output;
+  return 0;
+}
+
+// A one-shot assistant message stream — used to refuse a turn (out of credits)
+// without calling the model, so the user reliably sees the reason in the chat.
+function noticeResponse(text) {
+  const stream = createUIMessageStream({
+    execute: ({ writer }) => {
+      writer.write({ type: "text-start", id: "notice" });
+      writer.write({ type: "text-delta", id: "notice", delta: text });
+      writer.write({ type: "text-end", id: "notice" });
+    },
+  });
+  return createUIMessageStreamResponse({ stream });
+}
 
 // After a turn, snapshot the backend session's CAD objects to Supabase so they
 // survive restarts. Skips when nothing was built (backend returns 404).
@@ -26,6 +64,28 @@ async function saveSnapshot({ supabase, uid, session, backendUrl, token }) {
     });
   } catch (e) {
     console.error("snapshot save failed:", e);
+  }
+}
+
+// Log this turn's real token usage + cost and atomically deduct credits. Runs via
+// after() so it never blocks the response. charge_usage is a SECURITY DEFINER RPC
+// that keys off auth.uid(), so it only ever charges the signed-in user.
+async function chargeUsage({ supabase, uid, session, model, totalUsage, steps }) {
+  if (!supabase || !uid) return;
+  const chatId = session && !session.startsWith("__LOCALID") ? session : null;
+  try {
+    const cost = turnCost({ steps, totalUsage, model });
+    const credits = Math.max(1, Math.ceil(cost * CREDITS_PER_USD));
+    await supabase.rpc("charge_usage", {
+      p_chat_id: chatId,
+      p_model: model,
+      p_input: totalUsage?.inputTokens ?? 0,
+      p_output: totalUsage?.outputTokens ?? 0,
+      p_cost: cost,
+      p_credits: credits,
+    });
+  } catch (e) {
+    console.error("charge_usage failed:", e);
   }
 }
 
@@ -78,6 +138,21 @@ export async function POST(req) {
     uid = claims?.claims?.sub ?? null;
   }
 
+  // Hard credit block: the ONLY limit is the $2.50 (2500-credit) balance — no cap
+  // on messages or chats. Refuse a new turn if the user can't cover ~one more.
+  if (supabase && uid) {
+    const { data: bal } = await supabase
+      .from("user_credits")
+      .select("credits_remaining")
+      .eq("user_id", uid)
+      .maybeSingle();
+    if (bal && bal.credits_remaining < MIN_RESERVE) {
+      return noticeResponse(
+        "You're out of credits. Your free beta credits have run out — reach out to get more to keep designing.",
+      );
+    }
+  }
+
   // One MCP client per request, connected to the t2c FastMCP server over
   // streamable HTTP. Closed when the response finishes (see onFinish/onError).
   // X-Session-Id scopes all CAD state to this chat so users never collide.
@@ -101,28 +176,35 @@ export async function POST(req) {
   // Per-model reasoning effort (e.g. the premium "High" models). OpenRouter takes
   // this as a request parameter, not part of the model id.
   const reasoning = MODELS.find((m) => m.id === selectedModel)?.reasoning;
+  // usage.include → OpenRouter returns real (cache-aware) cost per step for metering.
+  const providerOptions = {
+    openrouter: {
+      usage: { include: true },
+      ...(reasoning ? { reasoning: { effort: reasoning } } : {}),
+    },
+  };
 
   const result = streamText({
     // Skip Groq: its strict function-calling validator rewrites our tools'
     // `additionalProperties: true` to false and then rejects valid tool calls
     // (our CAD ops take freeform args), returning a 502 that aborts the turn.
     model: openrouter(selectedModel, { provider: { ignore: ["Groq", "groq"] } }),
-    ...(reasoning
-      ? { providerOptions: { openrouter: { reasoning: { effort: reasoning } } } }
-      : {}),
+    providerOptions,
     system: [SYSTEM_PROMPT, system].filter(Boolean).join("\n\n"),
     messages: await convertToModelMessages(messages),
     tools: {
       ...mcpTools, // server-side t2c tools (executed here via the MCP client)
       ...frontendTools(tools ?? {}), // any client-side tools assistant-ui forwards
     },
-    // Multi-step agentic loop: CAD tools naturally chain
-    // (workplane -> sketch -> extrude -> assembly).
-    stopWhen: stepCountIs(12),
-    onFinish: () => {
+    // Multi-step agentic loop: CAD tools naturally chain (workplane -> sketch ->
+    // extrude -> assembly). High cap so complex assemblies never get cut off; the
+    // $2.50 credit ceiling bounds runaway cost.
+    stopWhen: stepCountIs(50),
+    onFinish: ({ totalUsage, steps }) => {
       mcpClient.close();
-      // Persist the snapshot after the response closes (survives Vercel cutoff).
+      // Persist snapshot + meter usage after the response closes (survives Vercel cutoff).
       after(() => saveSnapshot({ supabase, uid, session, backendUrl, token }));
+      after(() => chargeUsage({ supabase, uid, session, model: selectedModel, totalUsage, steps }));
     },
     onError: (e) => {
       console.error("chat streamText error:", e); // server-side (Vercel logs) only

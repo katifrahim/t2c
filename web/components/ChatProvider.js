@@ -11,6 +11,7 @@ import { useChat } from "@ai-sdk/react";
 import { lastAssistantMessageIsCompleteWithToolCalls } from "ai";
 import { useSupabaseThreadListAdapter } from "@/lib/thread-list-adapter";
 import { useModelStore } from "@/lib/model-store";
+import { useCreditStore } from "@/lib/credit-store";
 import { useSessionStore } from "@/lib/session-store";
 
 // Keep a stable transport reference while its config (model) changes underneath,
@@ -36,7 +37,6 @@ function useDynamicTransport(transport) {
 // that auto-injects the thread's remoteId as `id` in the request body.
 function useThreadRuntime() {
   const model = useModelStore((s) => s.model);
-  const setResolvedModel = useModelStore((s) => s.setResolvedModel);
 
   const transport = useDynamicTransport(
     useMemo(() => new AssistantChatTransport({ api: "/api/chat", body: { model } }), [model]),
@@ -48,9 +48,11 @@ function useThreadRuntime() {
 
   const runtime = useAISDKRuntime(chat, {
     sendAutomaticallyWhen: lastAssistantMessageIsCompleteWithToolCalls,
-    onFinish: ({ message }) => {
-      const served = message?.metadata?.model;
-      if (served) setResolvedModel(served);
+    onFinish: () => {
+      // A turn just completed. The charge runs server-side in after() (a beat after
+      // the stream closes), so refresh shortly after to catch the new balance; the
+      // 5s poll in CreditPill is the backstop.
+      setTimeout(() => useCreditStore.getState().refresh(), 1500);
     },
   });
 

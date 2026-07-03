@@ -16,32 +16,22 @@
 export const MODELS = [
   // Premium (paid — need OpenRouter credits). IDs/capabilities verified against
   // the live /api/v1/models endpoint: all support tools + reasoning + image.
-  { id: "openai/gpt-oss-120b", label: "Paid GPT-OSS 120B" },
-  { id: "anthropic/claude-sonnet-4.6", label: "Claude Sonnet 4.6 (High)", vision: true, reasoning: "high" },
-  { id: "anthropic/claude-opus-4.8", label: "Claude Opus 4.8 (High)", vision: true, reasoning: "high" },
-  { id: "openai/gpt-5.5", label: "GPT-5.5", vision: true },
-  { id: "google/gemini-3.1-pro-preview", label: "Gemini 3.1 Pro", vision: true },
-
-  // Free
-  { id: "openai/gpt-oss-120b:free", label: "Free GPT-OSS 120B" },
-  { id: "qwen/qwen3-coder:free", label: "Qwen3 Coder 480B" },
-  { id: "meta-llama/llama-3.3-70b-instruct:free", label: "Llama 3.3 70B" },
-  { id: "nvidia/nemotron-3-super-120b-a12b:free", label: "Nemotron 3 Super 120B" },
-  { id: "nvidia/nemotron-3-ultra-550b-a55b:free", label: "Nemotron 3 Ultra 550B" },
-  { id: "qwen/qwen3-next-80b-a3b-instruct:free", label: "Qwen3 Next 80B" },
-  { id: "openai/gpt-oss-20b:free", label: "GPT-OSS 20B" },
-  { id: "google/gemma-4-31b-it:free", label: "Gemma 4 31B", vision: true },
-  { id: "google/gemma-4-26b-a4b-it:free", label: "Gemma 4 26B", vision: true },
-  { id: "nvidia/nemotron-nano-12b-v2-vl:free", label: "Nemotron Nano 12B VL", vision: true },
-  { id: "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free", label: "Nemotron 3 Nano Omni", vision: true },
-  { id: "nvidia/nemotron-3-nano-30b-a3b:free", label: "Nemotron 3 Nano 30B" },
-  { id: "nvidia/nemotron-nano-9b-v2:free", label: "Nemotron Nano 9B" },
-  { id: "cohere/north-mini-code:free", label: "Cohere North Mini Code" },
-  { id: "liquid/lfm-2.5-1.2b-thinking:free", label: "LFM 2.5 1.2B Thinking" },
-  { id: "poolside/laguna-m.1:free", label: "Laguna M.1" },
-  { id: "poolside/laguna-xs.2:free", label: "Laguna XS.2" },
-  { id: "openrouter/free", label: "Auto (free router)" },
+  { id: "deepseek/deepseek-v4-flash", label: "DeepSeek V4 Flash (Best)", context: 1048576 }, // Ctx window: 1m toks
+  { id: "openai/gpt-oss-120b", label: "GPT-OSS 120B (Good)", context: 131072 }, // Ctx window: 131k toks
+  { id: "xiaomi/mimo-v2.5", label: "Xiaomi Mimo V2.5 (Decent)", context: 1048576 }, // Ctx window: 1m toks
 ];
 
-// Claude Sonnet 4.6: strong, reliable tool-calling for the CAD method chains.
+// Default: DeepSeek V4 Flash — cheap and a 1M-token context so long/complex
+// sessions don't hit a wall. Users can switch models from the dropdown.
 export const DEFAULT_MODEL = MODELS[0].id;
+
+// Per-token prices ($/token) from OpenRouter, used only as a cost fallback when
+// OpenRouter doesn't return the real cost (we prefer usage.cost from the response).
+export const MODEL_PRICING = {
+  "openai/gpt-oss-120b": { input: 0.03e-6, output: 0.15e-6 },
+  "deepseek/deepseek-v4-flash": { input: 0.09e-6, output: 0.18e-6 },
+  "xiaomi/mimo-v2.5": { input: 0.105e-6, output: 0.28e-6 },
+};
+
+// 1 credit = $0.001, so $2.50 of usage → 2500 credits.
+export const CREDITS_PER_USD = 1000;

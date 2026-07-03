@@ -16,8 +16,6 @@ import { useModelStore } from "@/lib/model-store";
 import { useSessionStore } from "@/lib/session-store";
 import { createClient, SUPABASE_CONFIGURED } from "@/lib/supabase/client";
 
-const AUTO_MODEL = "openrouter/free";
-
 const EXPORT_FORMATS = [
   { fmt: "stl", label: "STL" },
   { fmt: "3mf", label: "3MF" },
@@ -49,7 +47,6 @@ const iconBtnStyle = {
 function TopBar({ onToggleHistory, historyOpen }) {
   const model = useModelStore((s) => s.model);
   const setModel = useModelStore((s) => s.setModel);
-  const resolvedModel = useModelStore((s) => s.resolvedModel);
   const sessionId = useSessionStore((s) => s.sessionId);
   const runtime = useAssistantRuntime();
   const aui = useAui();
@@ -107,10 +104,9 @@ function TopBar({ onToggleHistory, historyOpen }) {
         onChange={(e) => setModel(e.target.value)}
         style={{ flex: 1, minWidth: 0, fontSize: 13, padding: "5px 8px", border: "1px solid #e0e0e0", borderRadius: 6, background: "#fff", color: "#333", cursor: "pointer" }}
       >
-        {MODELS.map((m) => {
-          const label = m.id === AUTO_MODEL && resolvedModel ? `${m.label} → ${resolvedModel}` : m.label;
-          return <option key={m.id} value={m.id}>{label}</option>;
-        })}
+        {MODELS.map((m) => (
+          <option key={m.id} value={m.id}>{m.label}</option>
+        ))}
       </select>
 
       <button type="button" onClick={newChat} title="New chat" aria-label="New chat" style={iconBtnStyle}>
