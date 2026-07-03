@@ -237,9 +237,9 @@ const CreditPill: FC = () => {
   return (
     <div
       title="Credits remaining"
-      className="absolute top-1/2 left-1/2 flex h-7 -translate-x-1/2 -translate-y-1/2 items-center rounded-full border border-neutral-300 bg-white px-2.5 text-xs font-medium whitespace-nowrap text-neutral-500"
+      className="text-muted-foreground absolute top-1/2 left-1/2 flex h-7 -translate-x-1/2 -translate-y-1/2 items-center gap-1.5 text-xs font-medium whitespace-nowrap"
     >
-      {credits.toLocaleString()} Credits
+      ☆&nbsp;&nbsp;{credits.toLocaleString()} Credits&nbsp;&nbsp;☆
     </div>
   );
 };
