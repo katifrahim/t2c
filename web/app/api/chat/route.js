@@ -9,10 +9,15 @@ import {
   createUIMessageStreamResponse,
 } from "ai";
 import { after } from "next/server";
+import { startActiveObservation, LangfuseOtelSpanAttributes as LF } from "@langfuse/tracing";
 import { MODELS, DEFAULT_MODEL, MODEL_PRICING, CREDITS_PER_USD } from "@/lib/models";
 import { createClient } from "@/lib/supabase/server";
+import { langfuseSpanProcessor } from "@/instrumentation";
+import { langfuse } from "@/lib/langfuse";
 
 const SUPABASE_ON = !!process.env.NEXT_PUBLIC_SUPABASE_URL;
+const LANGFUSE_ON = !!process.env.LANGFUSE_PUBLIC_KEY;
+const ENVIRONMENT = process.env.VERCEL_ENV || process.env.NODE_ENV || "development";
 
 // Refuse a new turn once the balance can't cover roughly one more turn, so we
 // never go negative (hard block). ~5 credits ≈ $0.005 ≈ a few messages of margin.
@@ -70,7 +75,7 @@ async function saveSnapshot({ supabase, uid, session, backendUrl, token }) {
 // Log this turn's real token usage + cost and atomically deduct credits. Runs via
 // after() so it never blocks the response. charge_usage is a SECURITY DEFINER RPC
 // that keys off auth.uid(), so it only ever charges the signed-in user.
-async function chargeUsage({ supabase, uid, session, model, totalUsage, steps }) {
+async function chargeUsage({ supabase, uid, session, model, totalUsage, steps, traceId }) {
   if (!supabase || !uid) return;
   const chatId = session && !session.startsWith("__LOCALID") ? session : null;
   try {
@@ -83,10 +88,52 @@ async function chargeUsage({ supabase, uid, session, model, totalUsage, steps })
       p_output: totalUsage?.outputTokens ?? 0,
       p_cost: cost,
       p_credits: credits,
+      p_trace_id: traceId ?? null,
     });
   } catch (e) {
     console.error("charge_usage failed:", e);
   }
+}
+
+// Plain text of the newest user message — used as the trace's top-level input so
+// the Langfuse trace list is readable at a glance.
+function lastUserText(messages) {
+  const m = [...(messages ?? [])].reverse().find((x) => x.role === "user");
+  return (m?.parts ?? [])
+    .filter((p) => p.type === "text")
+    .map((p) => p.text)
+    .join("\n") || undefined;
+}
+
+// Real cost + credits as numeric scores so they aggregate in Langfuse dashboards.
+// A score attaches to exactly ONE subject: traceId here. (Passing sessionId too is a
+// 400 — they're mutually exclusive.) Per-user/session grouping still works via the
+// trace join. environment must match the trace's, else env-filtered widgets drop them.
+function recordScores({ traceId, environment, cost, credits }) {
+  if (!langfuse || !traceId) return;
+  langfuse.score.create({ traceId, environment, name: "cost_usd", value: cost });
+  langfuse.score.create({ traceId, environment, name: "credits", value: credits });
+}
+
+// Stamp trace-level attributes directly on the turn's root span. Set on the span
+// (not via propagateAttributes/context) because onFinish runs after the streaming
+// Response is returned — the active context is gone by then, but the span ref lives on.
+function setTraceAttributes(span, { userId, sessionId, tags, environment }) {
+  span.otelSpan.setAttributes({
+    [LF.TRACE_NAME]: "chat-turn",
+    ...(userId ? { [LF.TRACE_USER_ID]: userId } : {}),
+    ...(sessionId ? { [LF.TRACE_SESSION_ID]: sessionId } : {}),
+    [LF.TRACE_TAGS]: tags,
+    [LF.ENVIRONMENT]: environment,
+  });
+}
+
+// One Langfuse trace per turn. startActiveObservation gives us the root span (its
+// traceId + a handle to set trace IO/attrs). endOnExit:false so we close it in
+// onFinish, not when the stream Response returns. No-op passthrough when tracing off.
+function withTrace(fn) {
+  if (!LANGFUSE_ON) return fn(null);
+  return startActiveObservation("chat-turn", fn, { endOnExit: false });
 }
 
 // Agentic tool loops can run several round-trips; give them room.
@@ -184,51 +231,100 @@ export async function POST(req) {
     },
   };
 
-  const result = streamText({
-    // Skip Groq: its strict function-calling validator rewrites our tools'
-    // `additionalProperties: true` to false and then rejects valid tool calls
-    // (our CAD ops take freeform args), returning a 502 that aborts the turn.
-    model: openrouter(selectedModel, { provider: { ignore: ["Groq", "groq"] } }),
-    providerOptions,
-    system: [SYSTEM_PROMPT, system].filter(Boolean).join("\n\n"),
-    messages: await convertToModelMessages(messages),
-    tools: {
-      ...mcpTools, // server-side t2c tools (executed here via the MCP client)
-      ...frontendTools(tools ?? {}), // any client-side tools assistant-ui forwards
-    },
-    // Multi-step agentic loop: CAD tools naturally chain (workplane -> sketch ->
-    // extrude -> assembly). High cap so complex assemblies never get cut off; the
-    // $2.50 credit ceiling bounds runaway cost.
-    stopWhen: stepCountIs(50),
-    onFinish: ({ totalUsage, steps }) => {
-      mcpClient.close();
-      // Persist snapshot + meter usage after the response closes (survives Vercel cutoff).
-      after(() => saveSnapshot({ supabase, uid, session, backendUrl, token }));
-      after(() => chargeUsage({ supabase, uid, session, model: selectedModel, totalUsage, steps }));
-    },
-    onError: (e) => {
-      console.error("chat streamText error:", e); // server-side (Vercel logs) only
-      mcpClient.close();
-    },
-  });
+  // One Langfuse trace per turn: userId/sessionId (thread) drive the Users &
+  // Sessions views; the AI SDK auto-nests one span per LLM call + tool call under it.
+  const modelMessages = await convertToModelMessages(messages);
+  return withTrace((rootSpan) => {
+    const traceId = rootSpan?.traceId ?? null;
+    if (rootSpan) {
+      setTraceAttributes(rootSpan, {
+        userId: uid,
+        sessionId: session,
+        tags: [ENVIRONMENT, selectedModel],
+        environment: ENVIRONMENT,
+      });
+      // Set IO twice: update() fills the chat-turn node's OWN Input tab (shown when
+      // you click it in the tree); setTraceIO() fills the trace-level input (shown in
+      // the Traces list & session preview). Both = just the user's latest message.
+      const userMsg = lastUserText(messages);
+      rootSpan.update({ input: userMsg });
+      rootSpan.setTraceIO({ input: userMsg });
+    }
 
-  return result.toUIMessageStreamResponse({
-    // Reasoning is confidential (can reveal planned tool calls) — never send it to
-    // the browser. The model still reasons server-side; only the stream omits it.
-    sendReasoning: false,
-    // Surface the real error instead of AI SDK's generic "An error occurred" (or a
-    // useless "[object Object]"). OpenRouter/provider errors arrive as plain objects
-    // like { error: { message } } or { code, message }, not Error instances.
-    onError: (error) => {
-      console.error("chat stream error:", error); // server-side (Vercel logs) only
-      return errorMessage(error);
-    },
-    // Report which model actually answered. For "openrouter/free" (the auto
-    // router) this is the resolved model OpenRouter picked, not the router id.
-    messageMetadata: ({ part }) => {
-      if (part.type === "finish") {
-        return { model: part.response?.modelId };
-      }
-    },
+    const result = streamText({
+      // Skip Groq: its strict function-calling validator rewrites our tools'
+      // `additionalProperties: true` to false and then rejects valid tool calls
+      // (our CAD ops take freeform args), returning a 502 that aborts the turn.
+      model: openrouter(selectedModel, { provider: { ignore: ["Groq", "groq"] } }),
+      providerOptions,
+      system: [SYSTEM_PROMPT, system].filter(Boolean).join("\n\n"),
+      messages: modelMessages,
+      tools: {
+        ...mcpTools, // server-side t2c tools (executed here via the MCP client)
+        ...frontendTools(tools ?? {}), // any client-side tools assistant-ui forwards
+      },
+      // Multi-step agentic loop: CAD tools naturally chain (workplane -> sketch ->
+      // extrude -> assembly). High cap so complex assemblies never get cut off; the
+      // $2.50 credit ceiling bounds runaway cost.
+      stopWhen: stepCountIs(50),
+      // AI SDK auto-emits a generation span per LLM call + a span per tool call,
+      // nested under our root span. No functionId → clean span names (no prefix).
+      experimental_telemetry: { isEnabled: LANGFUSE_ON },
+      onFinish: ({ text, totalUsage, steps }) => {
+        mcpClient.close();
+        const cost = turnCost({ steps, totalUsage, model: selectedModel });
+        const credits = Math.max(1, Math.ceil(cost * CREDITS_PER_USD));
+        if (rootSpan) {
+          // output on the node's OWN tab (update) + trace level (setTraceIO); metadata too.
+          rootSpan.update({
+            output: text,
+            metadata: {
+              cost_usd: cost,
+              credits,
+              total_tokens: totalUsage?.totalTokens ?? 0,
+              steps: steps?.length ?? 0,
+            },
+          });
+          rootSpan.setTraceIO({ output: text });
+          rootSpan.end();
+        }
+        // Persist snapshot + meter usage after the response closes (survives Vercel cutoff).
+        after(() => saveSnapshot({ supabase, uid, session, backendUrl, token }));
+        after(() => chargeUsage({ supabase, uid, session, model: selectedModel, totalUsage, steps, traceId }));
+        after(() => recordScores({ traceId, environment: ENVIRONMENT, cost, credits }));
+        // Flush both paths (spans + scores) before the serverless function exits.
+        if (langfuse) after(() => langfuse.flush());
+        if (langfuseSpanProcessor) after(() => langfuseSpanProcessor.forceFlush());
+      },
+      onError: (e) => {
+        console.error("chat streamText error:", e); // server-side (Vercel logs) only
+        mcpClient.close();
+        if (rootSpan) {
+          rootSpan.update({ level: "ERROR", statusMessage: errorMessage(e) });
+          rootSpan.end();
+        }
+        if (langfuseSpanProcessor) after(() => langfuseSpanProcessor.forceFlush());
+      },
+    });
+
+    return result.toUIMessageStreamResponse({
+      // Reasoning is confidential (can reveal planned tool calls) — never send it to
+      // the browser. The model still reasons server-side; only the stream omits it.
+      sendReasoning: false,
+      // Surface the real error instead of AI SDK's generic "An error occurred" (or a
+      // useless "[object Object]"). OpenRouter/provider errors arrive as plain objects
+      // like { error: { message } } or { code, message }, not Error instances.
+      onError: (error) => {
+        console.error("chat stream error:", error); // server-side (Vercel logs) only
+        return errorMessage(error);
+      },
+      // Report which model actually answered. For "openrouter/free" (the auto
+      // router) this is the resolved model OpenRouter picked, not the router id.
+      messageMetadata: ({ part }) => {
+        if (part.type === "finish") {
+          return { model: part.response?.modelId };
+        }
+      },
+    });
   });
 }
