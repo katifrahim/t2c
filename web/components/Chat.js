@@ -8,7 +8,22 @@ import {
   useAuiState,
 } from "@assistant-ui/react";
 import { MenuIcon, PlusIcon, DownloadIcon, LogOutIcon, Trash2Icon } from "lucide-react";
-import { TooltipProvider } from "@/components/ui/tooltip";
+import {
+  TooltipProvider,
+  Tooltip,
+  TooltipTrigger,
+  TooltipContent,
+} from "@/components/ui/tooltip";
+import {
+  AlertDialog,
+  AlertDialogContent,
+  AlertDialogHeader,
+  AlertDialogTitle,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogCancel,
+  AlertDialogAction,
+} from "@/components/ui/alert-dialog";
 import { Thread } from "@/components/assistant-ui/thread";
 import ChatProvider from "@/components/ChatProvider";
 import { MODELS } from "@/lib/models";
@@ -44,6 +59,44 @@ const iconBtnStyle = {
   flexShrink: 0,
 };
 
+// Icon button for the top bar: instant tooltip (same primitive as the composer's
+// + button) plus a grey hover, or a red hover for the `danger` (sign-out) button.
+function TopBarButton({ tooltip, onClick, active, danger, children }) {
+  return (
+    <Tooltip>
+      <TooltipTrigger
+        render={
+          <button
+            type="button"
+            onClick={onClick}
+            aria-label={tooltip}
+            style={{ ...iconBtnStyle, ...(active ? { background: "#f1f1f1" } : {}) }}
+            onMouseEnter={(e) => {
+              const el = e.currentTarget;
+              if (danger) {
+                el.style.background = "#fef2f2";
+                el.style.borderColor = "#fca5a5";
+                el.style.color = "#dc2626";
+              } else {
+                el.style.background = "#f1f1f1";
+              }
+            }}
+            onMouseLeave={(e) => {
+              const el = e.currentTarget;
+              el.style.background = active ? "#f1f1f1" : "#fff";
+              el.style.borderColor = "#e5e5e5";
+              el.style.color = "#333";
+            }}
+          />
+        }
+      >
+        {children}
+      </TooltipTrigger>
+      <TooltipContent side="bottom" sideOffset={10}>{tooltip}</TooltipContent>
+    </Tooltip>
+  );
+}
+
 function TopBar({ onToggleHistory, historyOpen }) {
   const model = useModelStore((s) => s.model);
   const setModel = useModelStore((s) => s.setModel);
@@ -53,6 +106,7 @@ function TopBar({ onToggleHistory, historyOpen }) {
 
   const [menuOpen, setMenuOpen] = useState(false);
   const [isSketch, setIsSketch] = useState(false);
+  const [confirmSignOut, setConfirmSignOut] = useState(false);
 
   function newChat() {
     try {
@@ -84,39 +138,43 @@ function TopBar({ onToggleHistory, historyOpen }) {
 
   async function signOut() {
     await createClient().auth.signOut();
-    window.location.href = "/login";
+    window.location.href = "/";
   }
 
   return (
     <div style={{ display: "flex", alignItems: "center", gap: 8, padding: "8px 12px", borderBottom: "1px solid #eee", background: "#fff" }}>
-      <button
-        type="button"
-        onClick={onToggleHistory}
-        title="Chat history"
-        aria-label="Chat history"
-        style={{ ...iconBtnStyle, ...(historyOpen ? { background: "#f1f1f1" } : {}) }}
-      >
+      <TopBarButton tooltip="Chat history" onClick={onToggleHistory} active={historyOpen}>
         <MenuIcon size={16} />
-      </button>
+      </TopBarButton>
 
-      <select
-        value={model}
-        onChange={(e) => setModel(e.target.value)}
-        style={{ flex: 1, minWidth: 0, fontSize: 13, padding: "5px 8px", border: "1px solid #e0e0e0", borderRadius: 6, background: "#fff", color: "#333", cursor: "pointer" }}
-      >
-        {MODELS.map((m) => (
-          <option key={m.id} value={m.id}>{m.label}</option>
-        ))}
-      </select>
+      <Tooltip>
+        <TooltipTrigger
+          render={
+            <select
+              value={model}
+              onChange={(e) => setModel(e.target.value)}
+              aria-label="Model"
+              style={{ flex: 1, minWidth: 0, fontSize: 13, padding: "5px 8px", border: "1px solid #e0e0e0", borderRadius: 6, background: "#fff", color: "#333", cursor: "pointer" }}
+              onMouseEnter={(e) => (e.currentTarget.style.borderColor = "#a3a3a3")}
+              onMouseLeave={(e) => (e.currentTarget.style.borderColor = "#e0e0e0")}
+            >
+              {MODELS.map((m) => (
+                <option key={m.id} value={m.id}>{m.label}</option>
+              ))}
+            </select>
+          }
+        />
+        <TooltipContent side="bottom" sideOffset={10}>Select LLM</TooltipContent>
+      </Tooltip>
 
-      <button type="button" onClick={newChat} title="New chat" aria-label="New chat" style={iconBtnStyle}>
+      <TopBarButton tooltip="New chat" onClick={newChat}>
         <PlusIcon size={16} />
-      </button>
+      </TopBarButton>
 
       <div style={{ position: "relative" }}>
-        <button type="button" onClick={openDownloadMenu} title="Download model" aria-label="Download model" style={iconBtnStyle}>
+        <TopBarButton tooltip="Download model" onClick={openDownloadMenu} active={menuOpen}>
           <DownloadIcon size={16} />
-        </button>
+        </TopBarButton>
         {menuOpen && (
           <>
             <div onClick={() => setMenuOpen(false)} style={{ position: "fixed", inset: 0, zIndex: 10 }} />
@@ -139,10 +197,31 @@ function TopBar({ onToggleHistory, historyOpen }) {
       </div>
 
       {SUPABASE_CONFIGURED && (
-        <button type="button" onClick={signOut} title="Sign out" aria-label="Sign out" style={iconBtnStyle}>
+        <TopBarButton tooltip="Sign out" onClick={() => setConfirmSignOut(true)} danger>
           <LogOutIcon size={16} />
-        </button>
+        </TopBarButton>
       )}
+
+      <AlertDialog open={confirmSignOut} onOpenChange={setConfirmSignOut}>
+        <AlertDialogContent size="sm" className="gap-3">
+          <AlertDialogHeader className="gap-3">
+            <AlertDialogTitle>Sign out?</AlertDialogTitle>
+            <AlertDialogDescription>
+              You&apos;ll need to sign in again to access your chats and models.
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel className="cursor-pointer">Cancel</AlertDialogCancel>
+            <AlertDialogAction
+              variant="outline"
+              onClick={signOut}
+              className="cursor-pointer hover:border-destructive/40 hover:bg-destructive/10 hover:text-destructive"
+            >
+              Sign out
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
     </div>
   );
 }
@@ -150,7 +229,9 @@ function TopBar({ onToggleHistory, historyOpen }) {
 function ThreadListItem() {
   return (
     <ThreadListItemPrimitive.Root
-      style={{ display: "flex", alignItems: "center", gap: 6, padding: "2px 8px", borderBottom: "1px solid #f2f2f2" }}
+      style={{ display: "flex", alignItems: "center", gap: 6, padding: "2px 8px", borderBottom: "1px solid #f2f2f2", background: "transparent" }}
+      onMouseEnter={(e) => (e.currentTarget.style.background = "#f5f5f5")}
+      onMouseLeave={(e) => (e.currentTarget.style.background = "transparent")}
     >
       <ThreadListItemPrimitive.Trigger
         style={{ flex: 1, minWidth: 0, textAlign: "left", padding: "8px 6px", border: "none", background: "transparent", cursor: "pointer", fontSize: 13, color: "#222", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}
@@ -160,7 +241,9 @@ function ThreadListItem() {
       <ThreadListItemPrimitive.Delete
         title="Delete chat"
         aria-label="Delete chat"
-        style={{ border: "none", background: "none", cursor: "pointer", color: "#bbb", padding: 4, display: "inline-flex" }}
+        style={{ border: "none", background: "none", cursor: "pointer", color: "#bbb", padding: 4, borderRadius: 6, display: "inline-flex" }}
+        onMouseEnter={(e) => { e.currentTarget.style.color = "#dc2626"; e.currentTarget.style.background = "#fef2f2"; }}
+        onMouseLeave={(e) => { e.currentTarget.style.color = "#bbb"; e.currentTarget.style.background = "none"; }}
       >
         <Trash2Icon size={15} />
       </ThreadListItemPrimitive.Delete>

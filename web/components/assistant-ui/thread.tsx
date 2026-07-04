@@ -236,7 +236,6 @@ const CreditPill: FC = () => {
   if (credits == null) return null;
   return (
     <div
-      title="Credits remaining"
       className="text-muted-foreground absolute top-1/2 left-1/2 flex h-7 -translate-x-1/2 -translate-y-1/2 items-center gap-1.5 text-xs font-medium whitespace-nowrap"
     >
       ☆&nbsp;&nbsp;{credits.toLocaleString()} Credits&nbsp;&nbsp;☆

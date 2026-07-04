@@ -1,5 +1,6 @@
 "use client";
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, useState } from "react";
+import { LoaderIcon } from "lucide-react";
 import { useSessionStore } from "@/lib/session-store";
 
 // Ported verbatim from ocp_vscode's viewer.html so the look/toolbar (studio
@@ -84,6 +85,9 @@ export default function Viewer() {
   const ref = useRef({ TCV: null, viewer: null, lastVersion: -1, payload: null });
   const sessionId = useSessionStore((s) => s.sessionId);
   const sidRef = useRef(sessionId);
+  // Blank white until the backend/MCP server delivers the first model; show a
+  // loader in the viewer area until then.
+  const [hasModel, setHasModel] = useState(false);
 
   // On chat/session switch: keep the current scene on screen (no blanking) and
   // force the next poll to re-render this session's model — or its placeholder
@@ -92,6 +96,18 @@ export default function Viewer() {
     sidRef.current = sessionId;
     ref.current.lastVersion = -1;
   }, [sessionId]);
+
+  // Load the viewer stylesheet only when the viewer mounts (it's scoped under
+  // .tcv-scope, so it never leaks into the rest of the app).
+  useEffect(() => {
+    const HREF = "/tcv/three-cad-viewer.scoped.css";
+    if (!document.querySelector(`link[href="${HREF}"]`)) {
+      const link = document.createElement("link");
+      link.rel = "stylesheet";
+      link.href = HREF;
+      document.head.appendChild(link);
+    }
+  }, []);
 
   useEffect(() => {
     let cancelled = false;
@@ -150,6 +166,7 @@ export default function Viewer() {
         try { viewer.setView(rc); } catch {}
       }
       ref.current.viewer = viewer;
+      setHasModel(true);
     }
 
     async function poll() {
@@ -211,5 +228,27 @@ export default function Viewer() {
     };
   }, []);
 
-  return <div ref={containerRef} style={{ width: "100%", height: "100%" }} />;
+  return (
+    <div style={{ position: "relative", width: "100%", height: "100%" }}>
+      <div
+        ref={containerRef}
+        className="tcv-scope"
+        style={{
+          width: "100%", height: "100%", overflow: "hidden", userSelect: "none",
+          // Fills the gap around the TCV widget — was the global `body` bg before scoping.
+          background: "var(--tcv-bg-color)",
+        }}
+      />
+      {!hasModel && (
+        <div
+          style={{
+            position: "absolute", inset: 0, display: "flex",
+            alignItems: "center", justifyContent: "center", pointerEvents: "none",
+          }}
+        >
+          <LoaderIcon className="animate-spin text-muted-foreground" size={28} />
+        </div>
+      )}
+    </div>
+  );
 }
