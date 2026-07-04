@@ -270,7 +270,7 @@ export async function POST(req) {
       // AI SDK auto-emits a generation span per LLM call + a span per tool call,
       // nested under our root span. No functionId → clean span names (no prefix).
       experimental_telemetry: { isEnabled: LANGFUSE_ON },
-      onFinish: ({ text, totalUsage, steps }) => {
+      onFinish: async ({ text, totalUsage, steps }) => {
         mcpClient.close();
         const cost = turnCost({ steps, totalUsage, model: selectedModel });
         const credits = Math.max(1, Math.ceil(cost * CREDITS_PER_USD));
@@ -288,22 +288,29 @@ export async function POST(req) {
           rootSpan.setTraceIO({ output: text });
           rootSpan.end();
         }
-        // Persist snapshot + meter usage after the response closes (survives Vercel cutoff).
+        // Persist snapshot + meter usage via after() — direct awaited writes with no batch
+        // buffer, so they complete reliably in the post-response window (verified: the last
+        // turn's snapshot/credits land even when the user leaves right after).
         after(() => saveSnapshot({ supabase, uid, session, backendUrl, token }));
         after(() => chargeUsage({ supabase, uid, session, model: selectedModel, totalUsage, steps, traceId }));
-        after(() => recordScores({ traceId, environment: ENVIRONMENT, cost, credits }));
-        // Flush both paths (spans + scores) before the serverless function exits.
-        if (langfuse) after(() => langfuse.flush());
-        if (langfuseSpanProcessor) after(() => langfuseSpanProcessor.forceFlush());
+        // Tracing is different: spans go through the processor, which batched them. Awaiting
+        // the flush here inside onFinish (streamText awaits it while the function is alive),
+        // together with exportMode:"immediate" (instrumentation.js), ships each turn's spans
+        // within that turn. Previously the batch lagged one turn behind — the globally-latest
+        // turn stayed buffered until the next turn's flush. recordScores before the score flush.
+        recordScores({ traceId, environment: ENVIRONMENT, cost, credits });
+        if (langfuse) await langfuse.flush();
+        if (langfuseSpanProcessor) await langfuseSpanProcessor.forceFlush();
       },
-      onError: (e) => {
+      onError: async (e) => {
         console.error("chat streamText error:", e); // server-side (Vercel logs) only
         mcpClient.close();
         if (rootSpan) {
           rootSpan.update({ level: "ERROR", statusMessage: errorMessage(e) });
           rootSpan.end();
         }
-        if (langfuseSpanProcessor) after(() => langfuseSpanProcessor.forceFlush());
+        // Await (not after()) so the errored turn's spans ship before the instance suspends.
+        if (langfuseSpanProcessor) await langfuseSpanProcessor.forceFlush();
       },
     });
 

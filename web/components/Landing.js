@@ -17,9 +17,8 @@ export default function Landing() {
           Turn plain text into 3D CAD models
         </h1>
 
-        <p className="max-w-md text-base text-pretty text-muted-foreground">
+        <p className="max-w-[24rem] text-base text-pretty text-muted-foreground">
           Describe a part in words and watch it come to life.
-          <br />
           Ready for 3D printing, CNC, laser cutting & more.
           <br />
           <br/>
@@ -34,7 +33,7 @@ export default function Landing() {
           <ArrowRightIcon className="size-4" />
         </Link>
 
-        <p className="font-mono text-xs text-muted-foreground/70">
+        <p className="font-mono text-xs text-muted-foreground/90">
           You get 2,500 free credits
         </p>
       </main>
