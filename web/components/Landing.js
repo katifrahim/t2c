@@ -23,6 +23,9 @@ export default function Landing() {
           <br />
           <br/>
           No modelling knowledge required.
+          <br />
+          <br />
+          100% Free!
         </p>
 
         <Link
@@ -32,10 +35,6 @@ export default function Landing() {
           Get started
           <ArrowRightIcon className="size-4" />
         </Link>
-
-        <p className="font-mono text-xs text-muted-foreground/90">
-          You get 2,500 free credits
-        </p>
       </main>
 
       <section className="mx-auto w-full max-w-5xl px-6 pt-8 pb-24">
