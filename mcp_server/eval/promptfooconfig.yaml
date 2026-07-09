@@ -12,11 +12,17 @@ prompts:
 # Add/remove freely; IDs live in https://openrouter.ai/models. `reasoning` is optional.
 providers:
   - id: file://provider.mjs
-    label: gpt-oss-120b
-    config: { model: openai/gpt-oss-120b, maxSteps: 12 }
-  - id: file://provider.mjs
     label: deepseek-v4-flash
-    config: { model: deepseek/deepseek-v4-flash, maxSteps: 12 }
+    config: { model: deepseek/deepseek-v4-flash, maxSteps: 50 }
+  - id: file://provider.mjs
+    label: glm-5.2
+    config: { model: z-ai/glm-5.2, maxSteps: 50 }
+  - id: file://provider.mjs
+    label: gpt-oss-120b
+    config: { model: openai/gpt-oss-120b, maxSteps: 50 }
+  - id: file://provider.mjs
+    label: xiaomi-mimo-v2.5
+    config: { model: xiaomi/mimo-v2.5, maxSteps: 50 }
 
 # defaultTest = settings applied to EVERY task in the tests list below.
 #   - options.provider: llm judge for every llm-rubric in tasks.yaml
@@ -27,7 +33,7 @@ defaultTest:
     # using promptfoo's DEFAULT rubric grading (no custom rubricPrompt):
     # Each task's llm-rubric `value` (the success criteria in tasks.yaml) 
     # is the rubric the judge grades against.
-    provider: openrouter:openai/gpt-oss-120b
+    provider: openrouter:z-ai/glm-5.2
   assert:
     # The ONLY pass/fail deterministic check: did any tool call return status:"error"?
     - type: javascript
