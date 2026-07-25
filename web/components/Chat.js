@@ -211,12 +211,8 @@ function TopBar({ onToggleHistory, historyOpen }) {
             </AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter>
-            <AlertDialogCancel className="cursor-pointer">Cancel</AlertDialogCancel>
-            <AlertDialogAction
-              variant="outline"
-              onClick={signOut}
-              className="cursor-pointer hover:border-destructive/40 hover:bg-destructive/10 hover:text-destructive"
-            >
+            <AlertDialogCancel className="h-10">Cancel</AlertDialogCancel>
+            <AlertDialogAction onClick={signOut} className="h-10">
               Sign out
             </AlertDialogAction>
           </AlertDialogFooter>

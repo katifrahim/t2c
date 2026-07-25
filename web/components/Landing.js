@@ -1,6 +1,17 @@
 import Link from "next/link";
 import { ArrowRightIcon, ImageIcon } from "lucide-react";
 
+// Blueprint grid that frames the edges/corners and fades out toward the center,
+// so it never sits under the hero text. The radial mask does the fading.
+const BLUEPRINT = {
+  backgroundImage:
+    "linear-gradient(to right, color-mix(in oklch, var(--foreground) 9%, transparent) 1px, transparent 1px)," +
+    "linear-gradient(to bottom, color-mix(in oklch, var(--foreground) 9%, transparent) 1px, transparent 1px)",
+  backgroundSize: "34px 34px",
+  WebkitMaskImage: "radial-gradient(75% 55% at 50% 40%, transparent 0%, transparent 45%, #000 100%)",
+  maskImage: "radial-gradient(75% 55% at 50% 40%, transparent 0%, transparent 45%, #000 100%)",
+};
+
 const EXAMPLES = [
   { title: "Twisted Hexagonal Vase", desc: "LLM: Sonnet 4.6 High", img: "/examples/twisted-hexa-vase.jpeg" },
   { title: "Deriaz Turbine Runner", desc: "LLM: Sonnet 4.6 High", img: "/examples/deriaz-turbine-runner.jpeg" },
@@ -11,8 +22,11 @@ const EXAMPLES = [
 // sets `body { overflow: hidden; user-select: none }`, which we override here.
 export default function Landing() {
   return (
-    <div className="flex h-screen flex-col overflow-y-auto bg-background text-foreground select-text">
-      <main className="flex flex-col items-center gap-6 px-6 pt-28 pb-16 text-center">
+    <div className="relative flex h-screen flex-col overflow-y-auto bg-background text-foreground select-text">
+      {/* Blueprint field framing the edges, fading out behind the text */}
+      <div aria-hidden className="pointer-events-none fixed inset-0 z-0" style={BLUEPRINT} />
+
+      <main className="relative z-10 flex flex-col items-center gap-6 px-6 pt-28 pb-16 text-center">
         <h1 className="max-w-2xl text-4xl font-semibold tracking-tight text-balance sm:text-5xl">
           Turn plain text into 3D CAD models
         </h1>
@@ -30,14 +44,14 @@ export default function Landing() {
 
         <Link
           href="/login"
-          className="inline-flex h-11 items-center justify-center gap-2 rounded-lg border border-foreground bg-background px-6 text-base font-medium text-foreground transition-colors hover:bg-foreground hover:text-background"
+          className="inline-flex h-11 cursor-pointer items-center justify-center gap-2 rounded-lg bg-primary px-6 text-base font-medium text-primary-foreground outline-none transition-all hover:bg-primary/80 focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50 active:translate-y-px"
         >
           Get started
           <ArrowRightIcon className="size-4" />
         </Link>
       </main>
 
-      <section className="mx-auto w-full max-w-5xl px-6 pt-8 pb-24">
+      <section className="relative z-10 mx-auto w-full max-w-5xl px-6 pt-8 pb-24">
         <div className="mb-8 flex items-center gap-4">
           <div className="h-px flex-1 bg-border" />
           <h2 className="text-lg font-semibold tracking-tight whitespace-nowrap">

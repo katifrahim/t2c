@@ -2,7 +2,7 @@
 import { useState } from "react";
 import { useRouter } from "next/navigation";
 import Link from "next/link";
-import { BoxIcon, EyeIcon, EyeOffIcon, Loader2Icon, ArrowLeftIcon } from "lucide-react";
+import { EyeIcon, EyeOffIcon, Loader2Icon, ArrowLeftIcon } from "lucide-react";
 import { createClient, SUPABASE_CONFIGURED } from "@/lib/supabase/client";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -90,11 +90,8 @@ export default function LoginPage() {
 
       <div className="relative w-full max-w-sm rounded-xl border border-border bg-card p-8 shadow-lg">
         <div className="flex flex-col items-center text-center">
-          <Link href="/" className="inline-flex items-center gap-2 text-foreground">
-            <span className="grid size-7 place-items-center rounded-md border border-foreground">
-              <BoxIcon className="size-4" />
-            </span>
-            <span className="text-sm font-semibold tracking-tight">Text2CAD AI</span>
+          <Link href="/" className="inline-flex items-center text-foreground">
+            <span className="text-base font-semibold tracking-tight">Text2CAD AI</span>
           </Link>
           <h1 className="mt-6 text-2xl font-semibold tracking-tight">{copy.heading}</h1>
           <p className="mt-1 text-sm text-muted-foreground">{copy.sub}</p>
