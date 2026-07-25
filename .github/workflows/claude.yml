@@ -12,23 +12,36 @@ on:
 
 jobs:
   claude:
+    # Only trusted accounts can trigger the agent (it has broad Bash + write perms).
     if: |
-      (github.event_name == 'issue_comment' && contains(github.event.comment.body, '@claude')) ||
-      (github.event_name == 'pull_request_review_comment' && contains(github.event.comment.body, '@claude')) ||
-      (github.event_name == 'pull_request_review' && contains(github.event.review.body, '@claude')) ||
-      (github.event_name == 'issues' && (contains(github.event.issue.body, '@claude') || contains(github.event.issue.title, '@claude')))
+      contains(fromJSON('["katifrahim"]'), github.actor) && (
+        (github.event_name == 'issue_comment' && contains(github.event.comment.body, '@claude')) ||
+        (github.event_name == 'pull_request_review_comment' && contains(github.event.comment.body, '@claude')) ||
+        (github.event_name == 'pull_request_review' && contains(github.event.review.body, '@claude')) ||
+        (github.event_name == 'issues' && (contains(github.event.issue.body, '@claude') || contains(github.event.issue.title, '@claude')))
+      )
+
     runs-on: ubuntu-latest
+
+    # Concurrency: one Claude job per PR/issue at a time, cancel stale runs
+    concurrency:
+      group: claude-${{ github.event.issue.number || github.event.pull_request.number }}
+      cancel-in-progress: true
+
     permissions:
-      contents: read
-      pull-requests: read
-      issues: read
-      id-token: write
-      actions: read # Required for Claude to read CI results on PRs
+      contents: write        # read repo + push commits/branches
+      pull-requests: write   # post comments, create PRs, edit descriptions
+      issues: write          # post comments on issues
+      id-token: write        # required for GitHub OIDC token (used by the action)
+      actions: read          # lets Claude read CI results on PRs
+
+    timeout-minutes: 30      # kill runaway jobs
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
-          fetch-depth: 1
+          fetch-depth: 1     # shallow clone is faster; use 0 if Claude needs git history
 
       - name: Run Claude Code
         id: claude
@@ -36,9 +49,13 @@ jobs:
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
 
-          # This is an optional setting that allows Claude to read CI results on PRs
-          additional_permissions: |
-            actions: read
+          # Customize the trigger phrase if you want (default is @claude)
+          # trigger_phrase: "@claude"
+
+          claude_args: |
+            --model claude-sonnet-4-6
+            --allowedTools "Bash(*),mcp__github__*"
+            --append-system-prompt "Act ONLY on the specific issue/PR that triggered this run; do not touch unrelated files, branches, or systems. Never modify files under .github/workflows/ (including this workflow) to add permissions, widen allowedTools, or change the actor gate. Never run deploys or touch production/Supabase data. Never force-push or push to main without explicit user permission."
 
           # Optional: Give a custom prompt to Claude. If this is not specified, Claude will perform the instructions specified in the comment that tagged it.
           # prompt: 'Update the pull request description to include a summary of changes.'
