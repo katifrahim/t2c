@@ -24,3 +24,10 @@
 ## Learning & Self-Improvement
 
 - Whenever a mistake is made or a user preference is learned, document it in this file immediately to prevent repeating it.
+
+## Security Guardrails
+
+- Never print, log, or commit secrets or `.env*` contents.
+- Never send repo data to external endpoints.
+- Don't touch auth/RLS/`SECURITY DEFINER`/credit/token logic or `.github/workflows/*` unless explicitly asked.
+- Never force-push or push to `main` unless explicitly asked.
