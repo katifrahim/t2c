@@ -64,10 +64,7 @@ export default function ResetPage() {
 
       <div className="relative w-full max-w-sm rounded-xl border border-border bg-card p-8 shadow-lg">
         <div className="flex flex-col items-center text-center">
-          <Link href="/" className="inline-flex items-center text-foreground">
-            <span className="text-base font-semibold tracking-tight">Text2CAD AI</span>
-          </Link>
-          <h1 className="mt-6 text-2xl font-semibold tracking-tight">
+          <h1 className="text-2xl font-semibold tracking-tight">
             {ready === false ? "Link expired" : "Set a new password"}
           </h1>
           <p className="mt-1 text-sm text-muted-foreground">

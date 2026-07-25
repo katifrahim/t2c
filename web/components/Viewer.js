@@ -1,6 +1,6 @@
 "use client";
 import { useEffect, useRef, useState } from "react";
-import { LoaderIcon } from "lucide-react";
+import { LoaderIcon, MoonIcon, SunIcon } from "lucide-react";
 import { useSessionStore } from "@/lib/session-store";
 
 // Ported verbatim from ocp_vscode's viewer.html so the look/toolbar (studio
@@ -34,7 +34,7 @@ const minWidth = 450;
 const renderOptionKeys = ["ambient_intensity", "direct_intensity", "metalness", "roughness", "default_edgecolor", "default_opacity", "normal_len"];
 const viewerOptionKeys = ["axes", "axes0", "black_edges", "grid", "collapse", "ortho", "ticks", "center_grid", "grid_font_size", "timeit", "tools", "glass", "up", "transparent", "control", "pan_speed", "zoom_speed", "rotate_speed", "clip_slider_0", "clip_slider_1", "clip_slider_2", "clip_normal_0", "clip_normal_1", "clip_normal_2", "clip_intersection", "clip_planes", "clip_object_colors", "zebra_count", "zebra_opacity", "zebra_direction", "zebra_color_scheme", "zebra_mapping_mode", "studio_environment", "studio_env_intensity", "studio_env_rotation", "studio_background", "studio_tone_mapping", "studio_exposure", "studio_shadow_intensity", "studio_shadow_softness", "studio_ao_intensity", "studio_texture_mapping", "studio_4k_env_maps"];
 
-function getDisplayOptions(config, w, h) {
+function getDisplayOptions(config, w, h, theme) {
   const glass = preset(config, "glass", displayDefaultOptions.glass);
   const tools = preset(config, "tools", displayDefaultOptions.tools);
   const treeWidth = preset(config, "tree_width", displayDefaultOptions.treeWidth);
@@ -43,7 +43,7 @@ function getDisplayOptions(config, w, h) {
     glass, treeWidth, tools,
     cadWidth: Math.max(minWidth - tw, w - tw - 20),
     height: h - 65,
-    theme: config?.theme || displayDefaultOptions.theme,
+    theme: theme || config?.theme || displayDefaultOptions.theme,
     keymap: preset(config, "modifier_keys", displayDefaultOptions.keymap),
     newTreeBehavior: preset(config, "new_tree_behavior", viewerDefaultOptions.newTreeBehavior),
     measureTools: displayDefaultOptions.measureTools,
@@ -88,6 +88,22 @@ export default function Viewer() {
   // Blank white until the backend/MCP server delivers the first model; show a
   // loader in the viewer area until then.
   const [hasModel, setHasModel] = useState(false);
+  // Light/dark background of the 3D scene (three-cad-viewer's own theme).
+  const [theme, setThemeState] = useState("light");
+  const themeRef = useRef("light");
+
+  useEffect(() => {
+    const saved = localStorage.getItem("tcv-theme");
+    if (saved === "dark" || saved === "light") { themeRef.current = saved; setThemeState(saved); }
+  }, []);
+
+  function toggleTheme() {
+    const next = themeRef.current === "dark" ? "light" : "dark";
+    themeRef.current = next;
+    setThemeState(next);
+    try { localStorage.setItem("tcv-theme", next); } catch {}
+    try { ref.current.viewer?.setTheme(next); } catch {}
+  }
 
   // On chat/session switch: keep the current scene on screen (no blanking) and
   // force the next poll to re-render this session's model — or its placeholder
@@ -151,7 +167,7 @@ export default function Viewer() {
       const config = payload.config || {};
       const w = container.clientWidth || 800;
       const h = container.clientHeight || 600;
-      const displayOptions = getDisplayOptions(config, w, h);
+      const displayOptions = getDisplayOptions(config, w, h, themeRef.current);
       const renderOptions = buildOptions(renderOptionKeys, config, renderDefaultOptions);
       const viewerOptions = buildOptions(viewerOptionKeys, config, viewerDefaultOptions);
 
@@ -201,7 +217,7 @@ export default function Viewer() {
       const config = (ref.current.payload && ref.current.payload.config) || {};
       const w = container.clientWidth || 800;
       const h = container.clientHeight || 600;
-      const d = getDisplayOptions(config, w, h);
+      const d = getDisplayOptions(config, w, h, themeRef.current);
       try {
         viewer.resizeCadView(d.cadWidth, d.treeWidth, d.height, d.glass);
         if (viewer.gridHelper) {
@@ -239,6 +255,16 @@ export default function Viewer() {
           background: "var(--tcv-bg-color)",
         }}
       />
+      <button
+        type="button"
+        onClick={toggleTheme}
+        aria-label={theme === "dark" ? "Use light background" : "Use dark background"}
+        title={theme === "dark" ? "Light background" : "Dark background"}
+        className="absolute right-3 bottom-3 z-20 grid size-8 cursor-pointer place-items-center rounded-md border border-border bg-background/90 text-foreground shadow-sm backdrop-blur transition-colors hover:bg-muted"
+      >
+        {theme === "dark" ? <SunIcon size={16} /> : <MoonIcon size={16} />}
+      </button>
+
       {!hasModel && (
         <div
           style={{

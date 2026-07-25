@@ -1,15 +1,12 @@
 import Link from "next/link";
 import { ArrowRightIcon, ImageIcon } from "lucide-react";
 
-// Blueprint grid that frames the edges/corners and fades out toward the center,
-// so it never sits under the hero text. The radial mask does the fading.
+// Full-page blueprint grid — no fade.
 const BLUEPRINT = {
   backgroundImage:
-    "linear-gradient(to right, color-mix(in oklch, var(--foreground) 9%, transparent) 1px, transparent 1px)," +
-    "linear-gradient(to bottom, color-mix(in oklch, var(--foreground) 9%, transparent) 1px, transparent 1px)",
+    "linear-gradient(to right, color-mix(in oklch, var(--foreground) 7%, transparent) 1px, transparent 1px)," +
+    "linear-gradient(to bottom, color-mix(in oklch, var(--foreground) 7%, transparent) 1px, transparent 1px)",
   backgroundSize: "34px 34px",
-  WebkitMaskImage: "radial-gradient(75% 55% at 50% 40%, transparent 0%, transparent 45%, #000 100%)",
-  maskImage: "radial-gradient(75% 55% at 50% 40%, transparent 0%, transparent 45%, #000 100%)",
 };
 
 const EXAMPLES = [
@@ -31,7 +28,7 @@ export default function Landing() {
           Turn plain text into 3D CAD models
         </h1>
 
-        <p className="max-w-[24rem] text-base text-pretty text-muted-foreground">
+        <p className="max-w-[24rem] text-base text-pretty text-foreground/65">
           Describe a part in words and watch it come to life.
           Ready for 3D printing, CNC, laser cutting & more.
           <br />
@@ -53,18 +50,18 @@ export default function Landing() {
 
       <section className="relative z-10 mx-auto w-full max-w-5xl px-6 pt-8 pb-24">
         <div className="mb-8 flex items-center gap-4">
-          <div className="h-px flex-1 bg-border" />
+          <div className="h-px flex-1 bg-foreground/20" />
           <h2 className="text-lg font-semibold tracking-tight whitespace-nowrap">
             Built with Text2CAD AI
           </h2>
-          <div className="h-px flex-1 bg-border" />
+          <div className="h-px flex-1 bg-foreground/20" />
         </div>
 
         <div className="grid grid-cols-1 gap-5 sm:grid-cols-2 lg:grid-cols-3">
           {EXAMPLES.map((ex) => (
             <div
               key={ex.title}
-              className="overflow-hidden border border-border transition-colors hover:border-foreground/30"
+              className="overflow-hidden border border-foreground/15 bg-card transition-colors hover:border-foreground/30"
             >
               <div className="flex aspect-[4/3] items-center justify-center bg-muted text-muted-foreground">
                 {ex.img ? (
