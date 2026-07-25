@@ -1,16 +1,44 @@
 "use client";
 import { useState } from "react";
 import { useRouter } from "next/navigation";
+import Link from "next/link";
+import { BoxIcon, EyeIcon, EyeOffIcon, Loader2Icon, ArrowLeftIcon } from "lucide-react";
 import { createClient, SUPABASE_CONFIGURED } from "@/lib/supabase/client";
+import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
+
+const COPY = {
+  signin: { heading: "Welcome back", sub: "Sign in to keep building.", action: "Sign in", busy: "Signing in…" },
+  signup: { heading: "Create your account", sub: "Start turning text into CAD — it's free.", action: "Create account", busy: "Creating account…" },
+  forgot: { heading: "Reset your password", sub: "We'll email you a link to set a new one.", action: "Send reset link", busy: "Sending link…" },
+};
+
+// color-mix keeps the blueprint grid subtle in both light and dark without a new token.
+const GRID = {
+  backgroundImage:
+    "linear-gradient(to right, color-mix(in oklch, var(--foreground) 10%, transparent) 1px, transparent 1px)," +
+    "linear-gradient(to bottom, color-mix(in oklch, var(--foreground) 10%, transparent) 1px, transparent 1px)",
+  backgroundSize: "34px 34px",
+};
 
 export default function LoginPage() {
   const router = useRouter();
-  const [mode, setMode] = useState("signin"); // "signin" | "signup"
+  const [mode, setMode] = useState("signin"); // "signin" | "signup" | "forgot"
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
+  const [showPassword, setShowPassword] = useState(false);
   const [notice, setNotice] = useState(null);
   const [error, setError] = useState(null);
   const [busy, setBusy] = useState(false);
+
+  const copy = COPY[mode];
+
+  function switchMode(next) {
+    setMode(next);
+    setError(null);
+    setNotice(null);
+  }
 
   async function submit(e) {
     e.preventDefault();
@@ -24,7 +52,7 @@ export default function LoginPage() {
         if (error) return setError(error.message);
         router.push("/");
         router.refresh();
-      } else {
+      } else if (mode === "signup") {
         const { data, error } = await supabase.auth.signUp({ email, password });
         if (error) return setError(error.message);
         if (!data.session) {
@@ -34,6 +62,12 @@ export default function LoginPage() {
           router.push("/");
           router.refresh();
         }
+      } else {
+        const { error } = await supabase.auth.resetPasswordForEmail(email, {
+          redirectTo: `${window.location.origin}/reset`,
+        });
+        if (error) return setError(error.message);
+        setNotice("Check your email for a link to reset your password.");
       }
     } finally {
       setBusy(false);
@@ -50,94 +84,186 @@ export default function LoginPage() {
   }
 
   return (
-    <div style={styles.page}>
-      <div style={styles.card}>
-        <div style={styles.brand}>Text2CAD AI</div>
-        <div style={styles.subtitle}>
-          {mode === "signin" ? "Sign in to continue" : "Create your account"}
-        </div>
-
-        {!SUPABASE_CONFIGURED && (
-          <div style={styles.warn}>
-            Auth is not configured yet. Add your Supabase keys to{" "}
-            <code>web/.env.local</code> and restart.
+    <div className="grid min-h-screen grid-cols-1 lg:grid-cols-2">
+      {/* Showcase — a blueprint field, hidden on small screens */}
+      <aside className="relative hidden overflow-hidden bg-background lg:block">
+        <div aria-hidden className="absolute inset-0" style={GRID} />
+        <div className="relative flex h-full flex-col justify-between p-10">
+          <span className="font-mono text-xs tracking-[0.2em] text-muted-foreground">TEXT → 3D CAD</span>
+          <div className="space-y-3">
+            <p className="max-w-sm text-3xl font-semibold tracking-tight text-balance">
+              Turn plain text into 3D CAD models.
+            </p>
+            <p className="font-mono text-xs text-muted-foreground">// describe a part — we build the geometry.</p>
           </div>
-        )}
-
-        <form onSubmit={submit} style={styles.form}>
-          <input
-            type="email"
-            required
-            placeholder="you@example.com"
-            value={email}
-            onChange={(e) => setEmail(e.target.value)}
-            style={styles.input}
-          />
-          <input
-            type="password"
-            required
-            minLength={6}
-            placeholder="Password"
-            value={password}
-            onChange={(e) => setPassword(e.target.value)}
-            style={styles.input}
-          />
-          {error && <div style={styles.error}>{error}</div>}
-          {notice && <div style={styles.notice}>{notice}</div>}
-          <button
-            type="submit"
-            disabled={busy}
-            style={styles.primary}
-            onMouseEnter={(e) => { if (!busy) e.currentTarget.style.background = "#333"; }}
-            onMouseLeave={(e) => (e.currentTarget.style.background = "#111")}
-          >
-            {busy ? "…" : mode === "signin" ? "Sign in" : "Sign up"}
-          </button>
-        </form>
-
-        <div style={styles.divider}><span style={styles.dividerText}>or</span></div>
-
-        <button
-          type="button"
-          onClick={google}
-          style={styles.google}
-          onMouseEnter={(e) => { e.currentTarget.style.background = "#f7f7f7"; e.currentTarget.style.borderColor = "#d5d5d5"; }}
-          onMouseLeave={(e) => { e.currentTarget.style.background = "#fff"; e.currentTarget.style.borderColor = "#e2e2e2"; }}
-        >
-          Continue with Google
-        </button>
-
-        <div style={styles.switch}>
-          {mode === "signin" ? "No account?" : "Already have an account?"}{" "}
-          <button
-            type="button"
-            onClick={() => { setMode(mode === "signin" ? "signup" : "signin"); setError(null); setNotice(null); }}
-            style={styles.link}
-            onMouseEnter={(e) => (e.currentTarget.style.textDecoration = "underline")}
-            onMouseLeave={(e) => (e.currentTarget.style.textDecoration = "none")}
-          >
-            {mode === "signin" ? "Sign up" : "Sign in"}
-          </button>
         </div>
-      </div>
+      </aside>
+
+      {/* Form */}
+      <main className="flex flex-col justify-center px-6 py-12 sm:px-12">
+        <div className="mx-auto w-full max-w-sm">
+          <Link href="/" className="inline-flex items-center gap-2 text-foreground">
+            <span className="grid size-7 place-items-center rounded-md border border-foreground">
+              <BoxIcon className="size-4" />
+            </span>
+            <span className="text-sm font-semibold tracking-tight">Text2CAD AI</span>
+          </Link>
+
+          <div className="mt-10">
+            <h1 className="text-2xl font-semibold tracking-tight">{copy.heading}</h1>
+            <p className="mt-1 text-sm text-muted-foreground">{copy.sub}</p>
+          </div>
+
+          {!SUPABASE_CONFIGURED && (
+            <div className="mt-6 rounded-lg border border-border bg-muted px-3 py-2.5 text-xs text-muted-foreground">
+              Auth isn’t configured yet. Add your Supabase keys to{" "}
+              <code className="font-mono">web/.env.local</code> and restart.
+            </div>
+          )}
+
+          {mode !== "forgot" && (
+            <>
+              <Button
+                type="button"
+                variant="outline"
+                onClick={google}
+                className="mt-6 h-11 w-full gap-2.5 text-sm font-medium"
+              >
+                <GoogleG />
+                Continue with Google
+              </Button>
+              <div className="my-6 flex items-center gap-3 text-xs text-muted-foreground">
+                <div className="h-px flex-1 bg-border" />
+                or
+                <div className="h-px flex-1 bg-border" />
+              </div>
+            </>
+          )}
+
+          <form onSubmit={submit} className="space-y-4">
+            <div className="space-y-1.5">
+              <Label htmlFor="email">Email</Label>
+              <Input
+                id="email"
+                type="email"
+                required
+                autoComplete="email"
+                placeholder="you@example.com"
+                className="h-11"
+                value={email}
+                onChange={(e) => setEmail(e.target.value)}
+              />
+            </div>
+
+            {mode !== "forgot" && (
+              <div className="space-y-1.5">
+                <div className="flex items-center justify-between">
+                  <Label htmlFor="password">Password</Label>
+                  {mode === "signin" && (
+                    <button
+                      type="button"
+                      onClick={() => switchMode("forgot")}
+                      className="text-xs text-muted-foreground transition-colors hover:text-foreground"
+                    >
+                      Forgot password?
+                    </button>
+                  )}
+                </div>
+                <div className="relative">
+                  <Input
+                    id="password"
+                    type={showPassword ? "text" : "password"}
+                    required
+                    minLength={6}
+                    autoComplete={mode === "signin" ? "current-password" : "new-password"}
+                    placeholder="••••••••"
+                    className="h-11 pr-10"
+                    value={password}
+                    onChange={(e) => setPassword(e.target.value)}
+                  />
+                  <button
+                    type="button"
+                    onClick={() => setShowPassword((s) => !s)}
+                    aria-label={showPassword ? "Hide password" : "Show password"}
+                    className="absolute inset-y-0 right-0 grid w-10 place-items-center text-muted-foreground transition-colors hover:text-foreground"
+                  >
+                    {showPassword ? <EyeOffIcon className="size-4" /> : <EyeIcon className="size-4" />}
+                  </button>
+                </div>
+              </div>
+            )}
+
+            {error && (
+              <p role="alert" className="text-sm text-destructive">
+                {error}
+              </p>
+            )}
+            {notice && (
+              <p aria-live="polite" className="text-sm text-foreground">
+                {notice}
+              </p>
+            )}
+
+            <Button type="submit" disabled={busy} className="h-11 w-full">
+              {busy ? (
+                <>
+                  <Loader2Icon className="size-4 animate-spin" />
+                  {copy.busy}
+                </>
+              ) : (
+                copy.action
+              )}
+            </Button>
+          </form>
+
+          <div className="mt-6 text-sm text-muted-foreground">
+            {mode === "forgot" ? (
+              <button
+                type="button"
+                onClick={() => switchMode("signin")}
+                className="inline-flex items-center gap-1 font-medium text-foreground hover:underline"
+              >
+                <ArrowLeftIcon className="size-3.5" />
+                Back to sign in
+              </button>
+            ) : mode === "signin" ? (
+              <>
+                No account?{" "}
+                <button
+                  type="button"
+                  onClick={() => switchMode("signup")}
+                  className="font-medium text-foreground hover:underline"
+                >
+                  Sign up
+                </button>
+              </>
+            ) : (
+              <>
+                Already have an account?{" "}
+                <button
+                  type="button"
+                  onClick={() => switchMode("signin")}
+                  className="font-medium text-foreground hover:underline"
+                >
+                  Sign in
+                </button>
+              </>
+            )}
+          </div>
+        </div>
+      </main>
     </div>
   );
 }
 
-const styles = {
-  page: { minHeight: "100vh", display: "flex", alignItems: "center", justifyContent: "center", background: "#fafafa", padding: 24 },
-  card: { width: "100%", maxWidth: 380, background: "#fff", border: "1px solid #ececec", borderRadius: 14, padding: 32, boxShadow: "0 8px 30px -12px rgba(0,0,0,0.12)" },
-  brand: { fontSize: 22, fontWeight: 600, letterSpacing: "-0.02em", color: "#111", textAlign: "center" },
-  subtitle: { fontSize: 14, color: "#666", marginTop: 4, marginBottom: 22, textAlign: "center" },
-  warn: { fontSize: 12.5, color: "#8a6d00", background: "#fff8e1", border: "1px solid #f2e3a8", borderRadius: 8, padding: "8px 10px", marginBottom: 16 },
-  form: { display: "flex", flexDirection: "column", gap: 10 },
-  input: { fontSize: 14, padding: "10px 12px", border: "1px solid #e2e2e2", borderRadius: 8, outline: "none", color: "#111" },
-  primary: { marginTop: 4, fontSize: 14, fontWeight: 500, padding: "10px 12px", border: "none", borderRadius: 8, background: "#111", color: "#fff", cursor: "pointer", transition: "background 0.15s" },
-  google: { width: "100%", fontSize: 14, fontWeight: 500, padding: "10px 12px", border: "1px solid #e2e2e2", borderRadius: 8, background: "#fff", color: "#333", cursor: "pointer", transition: "background 0.15s, border-color 0.15s" },
-  divider: { position: "relative", textAlign: "center", margin: "18px 0", borderTop: "1px solid #eee" },
-  dividerText: { position: "relative", top: -10, background: "#fff", padding: "0 10px", fontSize: 12, color: "#999" },
-  error: { fontSize: 13, color: "#c02626" },
-  notice: { fontSize: 13, color: "#1a7f37" },
-  switch: { marginTop: 18, fontSize: 13, color: "#666", textAlign: "center" },
-  link: { border: "none", background: "none", color: "#111", fontWeight: 500, cursor: "pointer", padding: 0, fontSize: 13 },
-};
+// Google's brand mark keeps its own colors per the Sign-In button guidelines.
+function GoogleG() {
+  return (
+    <svg viewBox="0 0 24 24" className="size-4" aria-hidden focusable="false">
+      <path fill="#4285F4" d="M23.52 12.27c0-.79-.07-1.54-.2-2.27H12v4.51h6.47a5.53 5.53 0 0 1-2.4 3.63v3h3.88c2.27-2.09 3.57-5.17 3.57-8.87Z" />
+      <path fill="#34A853" d="M12 24c3.24 0 5.96-1.08 7.95-2.91l-3.88-3c-1.08.72-2.45 1.16-4.07 1.16-3.13 0-5.78-2.11-6.73-4.96H1.29v3.09A12 12 0 0 0 12 24Z" />
+      <path fill="#FBBC05" d="M5.27 14.29a7.21 7.21 0 0 1 0-4.58V6.62H1.29a12 12 0 0 0 0 10.76l3.98-3.09Z" />
+      <path fill="#EA4335" d="M12 4.75c1.77 0 3.35.61 4.6 1.8l3.44-3.44A11.98 11.98 0 0 0 12 0 12 12 0 0 0 1.29 6.62l3.98 3.09C6.22 6.86 8.87 4.75 12 4.75Z" />
+    </svg>
+  );
+}

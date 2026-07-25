@@ -37,10 +37,11 @@ export async function updateSession(request) {
   const path = request.nextUrl.pathname;
   const onLogin = path.startsWith("/login");
   const onAuth = path.startsWith("/auth");
+  const onReset = path.startsWith("/reset"); // recovery link lands here before a session exists
   const onRoot = path === "/"; // public landing page for logged-out visitors
 
-  // Unauthenticated → gate everything except the landing, login + auth routes.
-  if (!loggedIn && !onLogin && !onAuth && !onRoot) {
+  // Unauthenticated → gate everything except the landing, login, auth + reset routes.
+  if (!loggedIn && !onLogin && !onAuth && !onReset && !onRoot) {
     const url = request.nextUrl.clone();
     url.pathname = "/login";
     return NextResponse.redirect(url);
