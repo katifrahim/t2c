@@ -17,18 +17,30 @@ const GRID = {
 };
 
 // Reached from the password-reset email. The browser client reads the recovery
-// token out of the URL on load and turns it into a session, which updateUser needs.
+// token out of the URL and turns it into a session; without one, the page is
+// useless, so we gate the form on that session existing.
 export default function ResetPage() {
   const router = useRouter();
   const supabase = useMemo(() => createClient(), []);
+  const [ready, setReady] = useState(null); // null = checking, true = valid link, false = no session
   const [password, setPassword] = useState("");
   const [showPassword, setShowPassword] = useState(false);
   const [error, setError] = useState(null);
   const [busy, setBusy] = useState(false);
 
-  // Touching the client on mount triggers it to process the recovery token in the URL.
   useEffect(() => {
-    supabase.auth.getSession();
+    let active = true;
+    const { data: sub } = supabase.auth.onAuthStateChange((_event, session) => {
+      if (active && session) setReady(true);
+    });
+    // getSession() finishes processing the recovery token in the URL first.
+    supabase.auth.getSession().then(({ data }) => {
+      if (active) setReady((r) => (r === true ? r : !!data.session));
+    });
+    return () => {
+      active = false;
+      sub.subscription.unsubscribe();
+    };
   }, [supabase]);
 
   async function submit(e) {
@@ -58,59 +70,84 @@ export default function ResetPage() {
             </span>
             <span className="text-sm font-semibold tracking-tight">Text2CAD AI</span>
           </Link>
-          <h1 className="mt-6 text-2xl font-semibold tracking-tight">Set a new password</h1>
-          <p className="mt-1 text-sm text-muted-foreground">Choose a password to finish signing in.</p>
+          <h1 className="mt-6 text-2xl font-semibold tracking-tight">
+            {ready === false ? "Link expired" : "Set a new password"}
+          </h1>
+          <p className="mt-1 text-sm text-muted-foreground">
+            {ready === false
+              ? "This reset link is invalid or has expired. Request a new one to continue."
+              : "Choose a password to finish signing in."}
+          </p>
         </div>
 
-        <form onSubmit={submit} className="mt-6 space-y-4">
-          <div className="space-y-1.5">
-            <Label htmlFor="password">New password</Label>
-            <div className="relative">
-              <Input
-                id="password"
-                type={showPassword ? "text" : "password"}
-                required
-                minLength={6}
-                autoComplete="new-password"
-                placeholder="••••••••"
-                className="h-11 pr-10"
-                value={password}
-                onChange={(e) => setPassword(e.target.value)}
-              />
-              <button
-                type="button"
-                onClick={() => setShowPassword((s) => !s)}
-                aria-label={showPassword ? "Hide password" : "Show password"}
-                className="absolute inset-y-0 right-0 grid w-10 place-items-center text-muted-foreground transition-colors hover:text-foreground"
-              >
-                {showPassword ? <EyeOffIcon className="size-4" /> : <EyeIcon className="size-4" />}
-              </button>
-            </div>
+        {ready === null && (
+          <div className="mt-8 flex justify-center text-muted-foreground">
+            <Loader2Icon className="size-5 animate-spin" />
           </div>
+        )}
 
-          {error && (
-            <p role="alert" className="text-sm text-destructive">
-              {error}
-            </p>
-          )}
-
-          <Button type="submit" disabled={busy} className="h-11 w-full">
-            {busy ? (
-              <>
-                <Loader2Icon className="size-4 animate-spin" />
-                Saving…
-              </>
-            ) : (
-              "Save password"
-            )}
-          </Button>
-        </form>
-
-        <p className="mt-6 text-center text-sm text-muted-foreground">
-          <Link href="/login" className="font-medium text-foreground hover:underline">
+        {ready === false && (
+          <Link
+            href="/login"
+            className="mt-6 flex h-11 w-full items-center justify-center rounded-lg bg-primary text-sm font-medium text-primary-foreground transition-colors hover:bg-primary/80"
+          >
             Back to sign in
           </Link>
-        </p>
+        )}
+
+        {ready === true && (
+          <>
+            <form onSubmit={submit} className="mt-6 space-y-4">
+              <div className="space-y-1.5">
+                <Label htmlFor="password">New password</Label>
+                <div className="relative">
+                  <Input
+                    id="password"
+                    type={showPassword ? "text" : "password"}
+                    required
+                    minLength={6}
+                    autoComplete="new-password"
+                    placeholder="••••••••"
+                    className="h-11 pr-10"
+                    value={password}
+                    onChange={(e) => setPassword(e.target.value)}
+                  />
+                  <button
+                    type="button"
+                    onClick={() => setShowPassword((s) => !s)}
+                    aria-label={showPassword ? "Hide password" : "Show password"}
+                    className="absolute inset-y-0 right-0 grid w-10 cursor-pointer place-items-center text-muted-foreground transition-colors hover:text-foreground"
+                  >
+                    {showPassword ? <EyeOffIcon className="size-4" /> : <EyeIcon className="size-4" />}
+                  </button>
+                </div>
+              </div>
+
+              {error && (
+                <p role="alert" className="text-sm text-destructive">
+                  {error}
+                </p>
+              )}
+
+              <Button type="submit" disabled={busy} className="h-11 w-full">
+                {busy ? (
+                  <>
+                    <Loader2Icon className="size-4 animate-spin" />
+                    Saving…
+                  </>
+                ) : (
+                  "Save password"
+                )}
+              </Button>
+            </form>
+
+            <p className="mt-6 text-center text-sm text-muted-foreground">
+              <Link href="/login" className="font-medium text-foreground hover:underline">
+                Back to sign in
+              </Link>
+            </p>
+          </>
+        )}
       </div>
     </div>
   );

@@ -126,7 +126,7 @@ export default function LoginPage() {
             </>
           )}
 
-          <form onSubmit={submit} className="space-y-4">
+          <form onSubmit={submit} className="mt-6 space-y-4">
             <div className="space-y-1.5">
               <Label htmlFor="email">Email</Label>
               <Input
@@ -149,7 +149,7 @@ export default function LoginPage() {
                     <button
                       type="button"
                       onClick={() => switchMode("forgot")}
-                      className="text-xs text-muted-foreground transition-colors hover:text-foreground"
+                      className="cursor-pointer text-xs text-muted-foreground transition-colors hover:text-foreground"
                     >
                       Forgot password?
                     </button>
@@ -171,7 +171,7 @@ export default function LoginPage() {
                     type="button"
                     onClick={() => setShowPassword((s) => !s)}
                     aria-label={showPassword ? "Hide password" : "Show password"}
-                    className="absolute inset-y-0 right-0 grid w-10 place-items-center text-muted-foreground transition-colors hover:text-foreground"
+                    className="absolute inset-y-0 right-0 grid w-10 cursor-pointer place-items-center text-muted-foreground transition-colors hover:text-foreground"
                   >
                     {showPassword ? <EyeOffIcon className="size-4" /> : <EyeIcon className="size-4" />}
                   </button>
@@ -207,7 +207,7 @@ export default function LoginPage() {
               <button
                 type="button"
                 onClick={() => switchMode("signin")}
-                className="inline-flex items-center gap-1 font-medium text-foreground hover:underline"
+                className="inline-flex cursor-pointer items-center gap-1 font-medium text-foreground hover:underline"
               >
                 <ArrowLeftIcon className="size-3.5" />
                 Back to sign in
@@ -218,7 +218,7 @@ export default function LoginPage() {
                 <button
                   type="button"
                   onClick={() => switchMode("signup")}
-                  className="font-medium text-foreground hover:underline"
+                  className="cursor-pointer font-medium text-foreground hover:underline"
                 >
                   Sign up
                 </button>
@@ -229,7 +229,7 @@ export default function LoginPage() {
                 <button
                   type="button"
                   onClick={() => switchMode("signin")}
-                  className="font-medium text-foreground hover:underline"
+                  className="cursor-pointer font-medium text-foreground hover:underline"
                 >
                   Sign in
                 </button>
