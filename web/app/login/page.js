@@ -84,35 +84,21 @@ export default function LoginPage() {
   }
 
   return (
-    <div className="grid min-h-screen grid-cols-1 lg:grid-cols-2">
-      {/* Showcase — a blueprint field, hidden on small screens */}
-      <aside className="relative hidden overflow-hidden bg-background lg:block">
-        <div aria-hidden className="absolute inset-0" style={GRID} />
-        <div className="relative flex h-full flex-col justify-between p-10">
-          <span className="font-mono text-xs tracking-[0.2em] text-muted-foreground">TEXT → 3D CAD</span>
-          <div className="space-y-3">
-            <p className="max-w-sm text-3xl font-semibold tracking-tight text-balance">
-              Turn plain text into 3D CAD models.
-            </p>
-            <p className="font-mono text-xs text-muted-foreground">// describe a part — we build the geometry.</p>
-          </div>
-        </div>
-      </aside>
+    <div className="relative flex min-h-screen items-center justify-center px-4 py-12">
+      {/* Blueprint field behind the card */}
+      <div aria-hidden className="pointer-events-none absolute inset-0" style={GRID} />
 
-      {/* Form */}
-      <main className="flex flex-col justify-center px-6 py-12 sm:px-12">
-        <div className="mx-auto w-full max-w-sm">
+      <div className="relative w-full max-w-sm rounded-xl border border-border bg-card p-8 shadow-lg">
+        <div className="flex flex-col items-center text-center">
           <Link href="/" className="inline-flex items-center gap-2 text-foreground">
             <span className="grid size-7 place-items-center rounded-md border border-foreground">
               <BoxIcon className="size-4" />
             </span>
             <span className="text-sm font-semibold tracking-tight">Text2CAD AI</span>
           </Link>
-
-          <div className="mt-10">
-            <h1 className="text-2xl font-semibold tracking-tight">{copy.heading}</h1>
-            <p className="mt-1 text-sm text-muted-foreground">{copy.sub}</p>
-          </div>
+          <h1 className="mt-6 text-2xl font-semibold tracking-tight">{copy.heading}</h1>
+          <p className="mt-1 text-sm text-muted-foreground">{copy.sub}</p>
+        </div>
 
           {!SUPABASE_CONFIGURED && (
             <div className="mt-6 rounded-lg border border-border bg-muted px-3 py-2.5 text-xs text-muted-foreground">
@@ -216,7 +202,7 @@ export default function LoginPage() {
             </Button>
           </form>
 
-          <div className="mt-6 text-sm text-muted-foreground">
+          <div className="mt-6 text-center text-sm text-muted-foreground">
             {mode === "forgot" ? (
               <button
                 type="button"
@@ -250,8 +236,7 @@ export default function LoginPage() {
               </>
             )}
           </div>
-        </div>
-      </main>
+      </div>
     </div>
   );
 }

@@ -8,6 +8,14 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 
+// color-mix keeps the blueprint grid subtle in both light and dark without a new token.
+const GRID = {
+  backgroundImage:
+    "linear-gradient(to right, color-mix(in oklch, var(--foreground) 10%, transparent) 1px, transparent 1px)," +
+    "linear-gradient(to bottom, color-mix(in oklch, var(--foreground) 10%, transparent) 1px, transparent 1px)",
+  backgroundSize: "34px 34px",
+};
+
 // Reached from the password-reset email. The browser client reads the recovery
 // token out of the URL on load and turns it into a session, which updateUser needs.
 export default function ResetPage() {
@@ -38,17 +46,21 @@ export default function ResetPage() {
   }
 
   return (
-    <main className="flex min-h-screen flex-col justify-center px-6 py-12 sm:px-12">
-      <div className="mx-auto w-full max-w-sm">
-        <Link href="/" className="inline-flex items-center gap-2 text-foreground">
-          <span className="grid size-7 place-items-center rounded-md border border-foreground">
-            <BoxIcon className="size-4" />
-          </span>
-          <span className="text-sm font-semibold tracking-tight">Text2CAD AI</span>
-        </Link>
+    <div className="relative flex min-h-screen items-center justify-center px-4 py-12">
+      {/* Blueprint field behind the card */}
+      <div aria-hidden className="pointer-events-none absolute inset-0" style={GRID} />
 
-        <h1 className="mt-8 text-2xl font-semibold tracking-tight">Set a new password</h1>
-        <p className="mt-1 text-sm text-muted-foreground">Choose a password to finish signing in.</p>
+      <div className="relative w-full max-w-sm rounded-xl border border-border bg-card p-8 shadow-lg">
+        <div className="flex flex-col items-center text-center">
+          <Link href="/" className="inline-flex items-center gap-2 text-foreground">
+            <span className="grid size-7 place-items-center rounded-md border border-foreground">
+              <BoxIcon className="size-4" />
+            </span>
+            <span className="text-sm font-semibold tracking-tight">Text2CAD AI</span>
+          </Link>
+          <h1 className="mt-6 text-2xl font-semibold tracking-tight">Set a new password</h1>
+          <p className="mt-1 text-sm text-muted-foreground">Choose a password to finish signing in.</p>
+        </div>
 
         <form onSubmit={submit} className="mt-6 space-y-4">
           <div className="space-y-1.5">
@@ -94,12 +106,12 @@ export default function ResetPage() {
           </Button>
         </form>
 
-        <p className="mt-6 text-sm text-muted-foreground">
+        <p className="mt-6 text-center text-sm text-muted-foreground">
           <Link href="/login" className="font-medium text-foreground hover:underline">
             Back to sign in
           </Link>
         </p>
       </div>
-    </main>
+    </div>
   );
 }
