@@ -3,6 +3,7 @@
 ## Commit Messages
 
 - Do NOT include `Co-Authored-By: Claude` or any AI attribution lines in commit messages or PR.
+- Use Conventional Commits (`type: subject`, e.g. `feat:`, `fix:`, `ci:`, etc.).
 
 ## Git Pull Protocol
 
