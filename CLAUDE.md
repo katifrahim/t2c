@@ -2,7 +2,7 @@
 
 ## Commit Messages
 
-- Do NOT include `Co-Authored-By: Claude` or any AI attribution lines in commit messages.
+- Do NOT include `Co-Authored-By: Claude` or any AI attribution lines in commit messages or PR.
 
 ## Git Pull Protocol
 
@@ -19,7 +19,7 @@
 
 ## Branch Hygiene
 
-- Occasionally run `git branch` to check all local non-main branches. For each, verify if it has been pushed, PR'd, and merged into `origin/main`. If yes, delete it locally with `git branch -d <branch>`.
+- Occasionally run `git branch` to check all local non-main branches. For each, verify if it has been pushed, PR'd, and merged into `origin/main`. If yes, delete it locally with `git branch -d <branch>` with user permission.
 
 ## Learning & Self-Improvement
 
