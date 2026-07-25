@@ -1,0 +1,119 @@
+# yaml-language-server: $schema=https://promptfoo.dev/config-schema.json
+# t2c MCP server — LLM capability benchmark. See GUIDE.md.
+# To run this, the mcp server must be up on :9000
+description: how well does each llm use the t2c mcp server
+
+# The prompt handed to each model = the `instruction` var of the current task
+# (pulled from tasks.yaml). This is the bridge between tasks.yaml and provider.mjs.
+prompts:
+  - "{{instruction}}"
+
+# Each provider = one model, all routed through provider.mjs (same stack as web/).
+# Add/remove freely; IDs live in https://openrouter.ai/models. `reasoning` is optional.
+providers:
+  - id: file://provider.mjs
+    label: deepseek-v4-flash
+    config: { model: deepseek/deepseek-v4-flash, maxSteps: 50 }
+  - id: file://provider.mjs
+    label: glm-5.2
+    config: { model: z-ai/glm-5.2, maxSteps: 50 }
+  - id: file://provider.mjs
+    label: gpt-oss-120b
+    config: { model: openai/gpt-oss-120b, maxSteps: 50 }
+  - id: file://provider.mjs
+    label: xiaomi-mimo-v2.5
+    config: { model: xiaomi/mimo-v2.5, maxSteps: 50 }
+
+# defaultTest = settings applied to EVERY task in the tests list below.
+#   - options.provider: llm judge for every llm-rubric in tasks.yaml
+#   - assert: deterministic checks that run on every task (in addition to each
+#     task's own llm-rubric)
+defaultTest:
+  options:
+    # using promptfoo's DEFAULT rubric grading (no custom rubricPrompt):
+    # Each task's llm-rubric `value` (the success criteria in tasks.yaml) 
+    # is the rubric the judge grades against.
+    provider: openrouter:z-ai/glm-5.2
+  assert:
+    # The ONLY pass/fail deterministic check: did any tool call return status:"error"?
+    - type: javascript
+      value: |
+        const errored = context.providerResponse?.metadata?.anyToolError;
+        return { pass: !errored, score: errored ? 0 : 1,
+                 reason: errored ? 'a tool call returned status:error' : 'no tool errors' };
+      metric: NoToolErrors
+
+    # Reporting metrics: numeric columns in `promptfoo view`. Two gotchas learned:
+    #  - The displayed metric = score * weight, so weight MUST be 1 (weight 0 -> shows 0).
+    #  - They MUST use the block form (value: |) with `return`; a single-line
+    #    "return {...}" is evaluated as an expression and throws SyntaxError.
+    # Each returns pass:true so it never fails a test — only NoToolErrors and the
+    # capability judge (metric per task in tasks.yaml) drive the green/red pass mark.
+    
+    # 0a. CAD tool calls = times workplane/sketch/assembly were invoked (NOT select_model).
+    - type: javascript
+      weight: 1
+      value: |
+        const v = context.providerResponse?.metadata?.cadToolCalls ?? 0;
+        return { pass: true, score: v, reason: `${v} cad tool calls` };
+      metric: CadToolCalls
+    # 0b. Doc tool calls = times query_docs was invoked.
+    - type: javascript
+      weight: 1
+      value: |
+        const v = context.providerResponse?.metadata?.docToolCalls ?? 0;
+        return { pass: true, score: v, reason: `${v} query_docs calls` };
+      metric: DocToolCalls
+    # 1. CAD methods = total "method" entries across workplane/sketch/assembly calls.
+    - type: javascript
+      weight: 1
+      value: |
+        const v = context.providerResponse?.metadata?.cadMethods ?? 0;
+        return { pass: true, score: v, reason: `${v} methods` };
+      metric: CadMethodCount
+    # 2. CAD operation params = total params supplied to those operations.
+    - type: javascript
+      weight: 1
+      value: |
+        const v = context.providerResponse?.metadata?.cadParams ?? 0;
+        return { pass: true, score: v, reason: `${v} params` };
+      metric: CadParamCount
+    # 3. Doc method count = total methods looked up across query_docs calls.
+    - type: javascript
+      weight: 1
+      value: |
+        const v = context.providerResponse?.metadata?.docMethodCount ?? 0;
+        return { pass: true, score: v, reason: `${v} methods looked up` };
+      metric: DocMethodCount
+    # 4. Assembly parts = parts in the final assembly (0 if not an assembly).
+    - type: javascript
+      weight: 1
+      value: |
+        const v = context.providerResponse?.metadata?.assemblyParts ?? 0;
+        return { pass: true, score: v, reason: `${v} parts` };
+      metric: AssemblyParts
+    # 5. Objects saved, by obj_type in each build tool's response.
+    - type: javascript
+      weight: 1
+      value: |
+        const v = context.providerResponse?.metadata?.sketchObjs ?? 0;
+        return { pass: true, score: v, reason: `${v} sketch objects` };
+      metric: SketchObjCount
+    - type: javascript
+      weight: 1
+      value: |
+        const v = context.providerResponse?.metadata?.workplaneObjs ?? 0;
+        return { pass: true, score: v, reason: `${v} workplane objects` };
+      metric: WorkplaneObjCount
+    - type: javascript
+      weight: 1
+      value: |
+        const v = context.providerResponse?.metadata?.assyObjs ?? 0;
+        return { pass: true, score: v, reason: `${v} assembly objects` };
+      metric: AssyObjCount
+    # Cost (USD) + tokens are returned at the provider's top level, so promptfoo shows
+    # them in its NATIVE cost/token columns (real numbers) — not as % metrics here.
+
+# The task list (each task = an instruction to t2c agent (llm+mcp) & its own llm-rubric). 
+# Every task here also gets the defaultTest judge + deterministic check above.
+tests: file://tasks.yaml

@@ -1,25 +1,70 @@
 """
-CadQuery Specialized MCP Server.
-Tools: workplane_api, sketch_api, assembly_api, query_docs
+Text2CAD MCP Server.
+Tools: workplane_api, sketch_api, assembly_api, query_docs, select_model
 """
 # MCP server entry point
 
 from typing import Any, Dict, List, Optional
+from contextvars import ContextVar
+from dataclasses import dataclass, field
 import inspect
 import json
 import math
+import os
+import pickle
+import re
+import time
 import traceback
 import sys
+import zlib
+
+import anyio
+
+# Port of the standalone ocp_vscode viewer (`python -m ocp_vscode`) used by the
+# stdio viewer-push pipeline. NOTE: instantiating ViewerBackend(0) below calls
+# set_port(0) and clobbers this, so _show_push re-asserts it before every show().
+VIEWER_PORT = 3939
 
 try:
     from ocp_vscode import show, set_port
-    set_port(3939)
+    set_port(VIEWER_PORT)
     OCP_VIEWER_AVAILABLE = True
 except ImportError:
     OCP_VIEWER_AVAILABLE = False
     show = None
+    set_port = None
 
-from mcp.server.fastmcp import FastMCP
+# Headless tessellation: _convert returns the {data, config} payload that the
+# frontend's three-cad-viewer renders.
+try:
+    from ocp_vscode.show import _convert as _ocp_convert
+    OCP_CONVERT_AVAILABLE = True
+except Exception:
+    OCP_CONVERT_AVAILABLE = False
+    _ocp_convert = None
+
+# Measurement backend (distance / properties tools). Forcing is_jupyter_cadquery
+# makes its handlers RETURN responses instead of websocket-sending them, so we
+# can expose them over HTTP via /backend. One backend is created PER SESSION
+# (lazily) so each user's measurements act on their own model — see Session.
+try:
+    import ocp_vscode.backend as _ocp_backend_mod
+    _ocp_backend_mod.is_jupyter_cadquery = True
+    from ocp_vscode.comms import MessageType as _MessageType, default as _ocp_default
+    MEASURE_AVAILABLE = True
+except Exception:
+    _ocp_backend_mod = None
+    _MessageType = None
+    _ocp_default = None
+    MEASURE_AVAILABLE = False
+
+
+def _new_measure_backend():
+    """A fresh measurement backend for one session (None if unavailable)."""
+    return _ocp_backend_mod.ViewerBackend(0) if MEASURE_AVAILABLE else None
+
+from mcp.server.fastmcp import FastMCP, Context
+from mcp.server.transport_security import TransportSecuritySettings
 
 import cadquery as cq
 from cadquery import (
@@ -43,15 +88,16 @@ from cadquery.selectors import (
 # =============================================================================
 
 mcp = FastMCP(
-    name="cadquery_specialized_mcp",
+    name="parametric_text2cad_mcp",
     instructions=(
-        "Three dedicated CadQuery tools:\n"
-        "  • workplane_api  — 3D modeling via cq.Workplane method chaining\n"
-        "  • sketch_api     — 2D profiles via cq.Sketch (face or edge workflows)\n"
-        "  • assembly_api   — multi-part assemblies via cq.Assembly add/constrain/solve\n"
+        "Dedicated parametric CAD tools:\n"
+        "  • workplane_api  — 3D modeling via Workplane API method chaining\n"
+        "  • sketch_api     — 2D profiles via Sketch API (face or edge workflows)\n"
+        "  • assembly_api   — multi-part assemblies via Assembly API add/constrain/solve\n"
+        "  • select_model   — re-activate an earlier model by name (shows it in the viewer and makes it exportable)\n"
         "  • query_docs     — fetch official detailed docs of specific methods and their parameters\n\n"
         "All tools share a persistent object store. Reference stored objects with "
-        "{\"_ref\": \"name\"} and construct CadQuery types inline with "
+        "{\"_ref\": \"name\"} and construct types inline with "
         "{\"_type\": \"Vector\"|\"Plane\"|\"Location\"|\"Color\", ...}.\n\n"
         "Typical workflow:\n"
         "  1. workplane_api → create and store parts\n"
@@ -59,37 +105,207 @@ mcp = FastMCP(
         "  3. assembly_api  → combine stored parts with constraints"
         "  4. query_docs    → fetch official detailed docs for specific methods causing error or confusion"
     ),
+    # Disable DNS-rebinding protection: the server is reached via a public host
+    # (tunnel / Render) and is protected by the MCP_TOKEN bearer check instead.
+    transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False),
 )
 
-DEBUG_MODE = True
-
 # =============================================================================
-# STATE  (name → CadQuery object)
+# STATE  —  one isolated Session per user/chat (multi-user)
 # =============================================================================
+# Every request carries a session id (the `X-Session-Id` header on /mcp, or the
+# `?session=` query param on the viewer routes). All CAD objects, the tessellated
+# viewer payload, and the measurement backend live on that session — never in
+# module globals — so concurrent users never see each other's models. Requests
+# without an id (stdio / local dev) fall back to a single shared "local" session.
 
-_state: Dict[str, Any] = {}
-_counters: Dict[str, int] = {}
-_current: Optional[str] = None
+_LOCAL_SID = "local"
+_SESSION_TTL = float(os.environ.get("SESSION_TTL_SECONDS", 3600))  # evict idle sessions
+
+
+@dataclass
+class Session:
+    state: Dict[str, Any] = field(default_factory=dict)       # name → CadQuery object
+    counters: Dict[str, int] = field(default_factory=dict)    # auto-naming counters
+    current: Optional[str] = None                             # active object name
+    # Latest tessellated model the browser polls (/model serves payload; /version
+    # lets it detect changes and reports obj_type for 2D-only export formats).
+    viewer: Dict[str, Any] = field(
+        default_factory=lambda: {"payload": None, "version": 0, "obj_type": None})
+    _measure: Any = None                                      # lazy measurement backend
+    last_used: float = field(default_factory=time.monotonic)
+
+    @property
+    def measure_backend(self):
+        if self._measure is None:
+            self._measure = _new_measure_backend()
+        return self._measure
+
+
+_sessions: Dict[str, Session] = {}
+# The session bound to the current request; set at each tool/route entry. anyio
+# copies it into the worker thread, so offloaded CAD work sees the right session.
+_cur_session: ContextVar[Optional[Session]] = ContextVar("cur_session", default=None)
+
+
+def _evict_idle() -> None:
+    now = time.monotonic()
+    stale = [sid for sid, s in _sessions.items() if s.last_used < now - _SESSION_TTL]
+    for sid in stale:
+        _sessions.pop(sid, None)
+
+
+def _get_session(sid: Optional[str]) -> Session:
+    sid = sid or _LOCAL_SID
+    _evict_idle()
+    sess = _sessions.get(sid)
+    if sess is None:
+        sess = _sessions[sid] = Session()
+        # Seed the placeholder so the viewer (grid + tools + empty scene) is always
+        # visible for every session, even before the LLM builds a model.
+        _init_viewer(sess)
+    sess.last_used = time.monotonic()
+    return sess
+
+
+def _sess() -> Session:
+    """The session for the current request (creating the local one if unbound)."""
+    sess = _cur_session.get()
+    if sess is None:
+        sess = _get_session(_LOCAL_SID)
+        _cur_session.set(sess)
+    return sess
+
+
+def _bind(sid: Optional[str]) -> Session:
+    """Bind the request's session so _store/_get/_show operate on it."""
+    sess = _get_session(sid)
+    _cur_session.set(sess)
+    return sess
+
+
+def _sid_from_ctx(ctx) -> Optional[str]:
+    """The X-Session-Id header from the live HTTP request (None over stdio)."""
+    try:
+        return ctx.request_context.request.headers.get("x-session-id")
+    except Exception:
+        return None
 
 
 def _store(name: str, obj: Any) -> None:
-    global _current
-    _state[name] = obj
-    _current = name
+    sess = _sess()
+    sess.state[name] = obj
+    sess.current = name
 
 
 def _get(name: Optional[str]) -> Any:
-    target = name or _current
+    sess = _sess()
+    target = name or sess.current
     if not target:
         raise ValueError("No object name given and no current object set")
-    if target not in _state:
+    if target not in sess.state:
         raise ValueError(f"Object '{target}' not found")
-    return _state[target]
+    return sess.state[target]
 
 
 def _auto_name(prefix: str) -> str:
-    _counters[prefix] = _counters.get(prefix, 0) + 1
-    return f"{prefix}_{_counters[prefix]}"
+    c = _sess().counters
+    c[prefix] = c.get(prefix, 0) + 1
+    return f"{prefix}_{c[prefix]}"
+
+
+# --- Durable snapshots ---------------------------------------------------------
+# A session's whole object store pickles with full fidelity: CadQuery shapes
+# serialize via OCCT BinTools, and Workplane/Sketch/Assembly (with colors,
+# locations, hierarchy) all round-trip. So a chat's CAD state can be saved to the
+# DB and restored after a server restart. The blob is produced AND consumed only
+# by this backend, so unpickling is trusted (never fed arbitrary user input).
+def _iter_assemblies(obj: Any):
+    """Yield an Assembly and all its nested Assembly children."""
+    if isinstance(obj, Assembly):
+        yield obj
+        for c in getattr(obj, "children", []) or []:
+            yield from _iter_assemblies(c)
+
+
+def _snapshot(sess: "Session") -> bytes:
+    # A solved Assembly caches an OCCT solver result (`_solve_result`) holding a
+    # non-picklable SwigPyObject. It's just solver metadata — solve() regenerates
+    # it and the solved child locations are already baked in — so strip it for the
+    # dump and restore it on the live objects afterward. Constraints (picklable)
+    # are kept, so a restored assembly can still be re-solved.
+    stripped = []
+    for obj in sess.state.values():
+        for a in _iter_assemblies(obj):
+            sr = getattr(a, "_solve_result", None)
+            if sr is not None:
+                a._solve_result = None
+                stripped.append((a, sr))
+    try:
+        raw = pickle.dumps(
+            {"counters": dict(sess.counters), "current": sess.current, "objects": sess.state},
+            protocol=pickle.HIGHEST_PROTOCOL,
+        )
+        # Deflate: BREP/pickle geometry is highly redundant, so this shrinks the
+        # stored blob several-fold (keeps DB rows small on the free tier).
+        return zlib.compress(raw, 9)
+    finally:
+        for a, sr in stripped:
+            a._solve_result = sr
+
+
+def _recast_shape(s: Any) -> Any:
+    """Downcast a restored shape: OCCT BinTools.Read returns a generic TopoDS_Shape
+    (not TopoDS_Solid/Compound/…), which the tessellator's type check rejects.
+    cq.Shape.cast reads the real ShapeType and re-wraps it correctly."""
+    if isinstance(s, cq.Shape) and s.wrapped is not None:
+        try:
+            return cq.Shape.cast(s.wrapped)
+        except Exception:
+            return s
+    return s
+
+
+def _normalize(obj: Any) -> Any:
+    """Make a restored object display-ready by recasting its shapes (see above).
+    Geometry/modeling already work on the raw restored object; this fixes the
+    viewer tessellation for Workplanes and Assemblies (Sketches are unaffected)."""
+    if isinstance(obj, Workplane):
+        shapes = [_recast_shape(o) for o in obj.objects if isinstance(o, cq.Shape)]
+        if not shapes:
+            return obj
+        plane = getattr(obj, "plane", None)
+        return (Workplane(plane) if plane is not None else Workplane()).newObject(shapes)
+    if isinstance(obj, Sketch):
+        f = getattr(obj, "_faces", None)
+        if isinstance(f, cq.Shape) and f.wrapped is not None:
+            obj._faces = _recast_shape(f)
+        return obj
+    if isinstance(obj, Assembly):
+        def _rec(a):
+            if getattr(a, "obj", None) is not None:
+                a.obj = _normalize(a.obj)
+            for c in getattr(a, "children", []) or []:
+                _rec(c)
+        _rec(obj)
+        return obj
+    if isinstance(obj, cq.Shape):
+        return _recast_shape(obj)
+    return obj
+
+
+def _restore_into(sess: "Session", data: bytes) -> int:
+    # New snapshots are zlib-compressed; fall back to raw for any legacy blob.
+    try:
+        data = zlib.decompress(data)
+    except zlib.error:
+        pass
+    d = pickle.loads(data)
+    objs = d.get("objects", {}) or {}
+    sess.state = {name: _normalize(o) for name, o in objs.items()}
+    sess.counters = d.get("counters", {}) or {}
+    sess.current = d.get("current")
+    return len(sess.state)
 
 # =============================================================================
 # REFERENCE & TYPE RESOLUTION
@@ -274,30 +490,121 @@ def _construct_type(spec: dict) -> Any:
 # HELPERS
 # =============================================================================
 
+# Strip tech-stack proper nouns from anything the LLM/client sees (BRep kept — it's
+# a geometry method the model needs, not a stack name).
+_BRAND_RE = re.compile(
+    r"open\s*cascade(\s*technology)?|\bocct\b|\bocp[_\s-]?vscode\b|\bocp\b"
+    r"|\bcadquery\b|\bcq\b|\bfast\s*mcp\b|\bfastmcp\b|\bpython\b",
+    re.IGNORECASE)
+
+
+def _scrub(t: str) -> str:
+    return _BRAND_RE.sub("", t or "")
+
+
+def _log_err(msg: str, tb: str = None) -> None:
+    # stderr: safe under stdio (stdout is the JSON-RPC pipe) and captured by the host over HTTP.
+    print(f"[t2c] {msg}\n{tb or ''}", file=sys.stderr, flush=True)
+
+
 def _error(msg: str, tb: str = None) -> str:
-    r = {"status": "error", "error": msg}
-    if DEBUG_MODE and tb:
-        r["traceback"] = tb
-    return json.dumps(r)
+    if tb:
+        _log_err(msg, tb)
+    return json.dumps({"status": "error", "error": _scrub(msg)})
+
+
+# The tessellated model for the web viewer now lives on each Session (Session.viewer);
+# /model + /version serve it per session so users never see each other's models.
+
+# Which viewer pipeline _show() uses, chosen by transport in __main__:
+#   "stdio" → push to the standalone ocp_vscode viewer on :3939 via show()
+#   "http"  → tessellate in-process and serve the payload over /model
+# Defaults to "http" so importing the module (tests, HTTP entrypoints) keeps the
+# tessellation pipeline; stdio runs flip it before any model is built.
+_VIEWER_MODE: str = "http"
 
 
 def _show(obj: Any) -> None:
+    """Render obj into the current session's viewer pipeline (see _VIEWER_MODE)."""
+    _sess().viewer["obj_type"] = _obj_type(obj)  # so /version can report it
+    if _VIEWER_MODE == "stdio":
+        _show_push(obj)
+    else:
+        _show_tessellate(obj)
+
+
+def _show_push(obj: Any) -> None:
+    """stdio: push obj to the standalone ocp_vscode viewer on :3939 via show().
+    Mirrors the main-branch behavior; show() chatters on stdout, so mute it to
+    keep the stdio JSON-RPC stream clean."""
     if not OCP_VIEWER_AVAILABLE:
         return
-    old, sys.stdout = sys.stdout, sys.stderr
+    import contextlib, io
     try:
         if isinstance(obj, Assembly):
-            show((obj,))
+            target = (obj,)
         elif isinstance(obj, Sketch):
-            show(Workplane().placeSketch(obj))
-        elif hasattr(obj, "wrapped"):
-            show(obj)
+            target = Workplane().placeSketch(obj)
         else:
-            show(obj)
+            target = obj
+        # ViewerBackend(0) clobbered the comms port to 0 at import; re-assert the
+        # viewer port so show() reaches the standalone viewer instead of port 0.
+        set_port(VIEWER_PORT)
+        with contextlib.redirect_stderr(io.StringIO()), contextlib.redirect_stdout(io.StringIO()):
+            show(target, port=VIEWER_PORT)
+    except Exception:
+        pass
+
+
+def _show_tessellate(obj: Any) -> None:
+    """http: tessellate obj into the three-cad-viewer payload and store it for
+    /model. Replaces the ocp_vscode websocket push (which can't work over HTTPS)."""
+    if not OCP_CONVERT_AVAILABLE:
+        return
+    try:
+        if isinstance(obj, Sketch):
+            obj = Workplane().placeSketch(obj)
+        import contextlib, io
+        # _convert harmlessly tries to read config from a live viewer and prints
+        # progress to stdout; mute both so the stdio JSON-RPC stream stays clean.
+        with contextlib.redirect_stderr(io.StringIO()), contextlib.redirect_stdout(io.StringIO()):
+            payload, mapping = _ocp_convert(obj)
+        payload["config"]["reset_camera"] = "iso"  # frame the part on each render
+        sess = _sess()
+        sess.viewer["payload"] = payload
+        sess.viewer["version"] += 1
+        # Load the BRep model into this session's measurement backend (serialize the
+        # live OCCT mapping the same way send_backend would).
+        mb = sess.measure_backend
+        if mb is not None:
+            try:
+                model = json.loads(json.dumps(mapping, default=_ocp_default))
+                with contextlib.redirect_stderr(io.StringIO()), contextlib.redirect_stdout(io.StringIO()):
+                    mb.load_model(model)
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+
+def _build_placeholder() -> Any:
+    """A single Workplane vertex shown at startup and after /clear so the 3D
+    viewer is never blank — it still renders the grid, axes, and toolbar."""
+    return Workplane().newObject([Vertex.makeVertex(0, 0, 0)])
+
+
+def _init_viewer(sess: "Session") -> None:
+    """Seed a new session's viewer with the placeholder so /model is never blank.
+    Only meaningful for the http pipeline; stdio pushes to the standalone viewer."""
+    if _VIEWER_MODE != "http":
+        return
+    token = _cur_session.set(sess)
+    try:
+        _show(_build_placeholder())
     except Exception:
         pass
     finally:
-        sys.stdout = old
+        _cur_session.reset(token)
 
 
 def _properties(obj: Any) -> dict:
@@ -413,20 +720,20 @@ async def workplane_api(
     init_params: Optional[dict] = None,
     start_from: Optional[str] = None,
     store_as: Optional[str] = None,
+    ctx: Context = None,
 ) -> str:
     """
-    Build 3D models using CadQuery's Workplane fluent API via method chaining.
+    Build 3D models using Workplane API via method chaining.
     
-    Underlying 3D modelling engine/ kernel: Open CASCADE Technology (OCCT)
     Modelling method: Boundary Representation (BRep)
 
     ── COORDINATE SYSTEM & VIEWER ──────────────────────────────────────────────
-    CadQuery uses a right-handed XYZ coordinate system:
-      X → points right                     (red axis in OCP viewer)
+    The CAD engine uses a right-handed XYZ coordinate system:
+      X → points right                     (red axis in 3D viewer)
       Y → points into or out of the screen (green axis)
       Z → points up                        (blue axis)
 
-    The OCP viewer (port 3939) renders accordingly:
+    The 3D viewer renders accordingly:
       • Displays objects to the USER in a 3D GLOBAL coordinate system
       • Default/ Isometric view: +Z is upward, +X is rightward, Y+ is inward, XY plane is the floor
       • User can use their mouse to view the object from any angle/side 
@@ -563,7 +870,7 @@ async def workplane_api(
             - Important for polyline(), lineTo(), threePointArc() and tangentArcPoint(). Also, methods like extrude can be performed on closed wire but not on opened one.
             - Cannot use the "move" or "moveTo" methods after "close".
         wire(forConstruction: bool=False)
-	        - Returns a CQ object with all pending edges connected into a wire.
+	        - Returns a model object with all pending edges connected into a wire.
         move(xDist: float=0, yDist: float=0)
 	        - Move the specified distance from the current point, without drawing.
             - Must read docs of this before use.
@@ -645,8 +952,8 @@ async def workplane_api(
         split(args, kwargs)
 	        - Splits a solid on the stack into two parts, optionally keeping the separate parts.
         mirror(mirrorPlane: Union[Literal['XY', 'YX', 'XZ', 'ZX', 'YZ', 'ZY'], Tuple[float, float], Tuple[float, float, float], Vector, Face, ForwardRef('Workplane')]='XY', basePointVector: Union[Tuple[float, float], Tuple[float, float, float], Vector, NoneType]=None, union: bool=False)
-	        - Mirror a single CQ object.
-            - Moves a single CQ object about a specific plane, but on the current workplane. Kinda like moving the object to a different quadrant in the current workplane
+	        - Mirror a single model object.
+            - Moves a single model object about a specific plane, but on the current workplane. Kinda like moving the object to a different quadrant in the current workplane
         clean()
 	        - Cleans the current solid by removing unwanted edges from the faces.
             - Essential after operations like boolean. Helps with accurate wire selection later on.
@@ -689,18 +996,18 @@ async def workplane_api(
       add(obj)
 	        - Adds an object or a list of objects to the stack
       tag(name: str)
-	        - Tags the current CQ object for later reference.
+	        - Tags the current model object for later reference.
             - Never use hyphens in tag names! It is not supported. Use underscores instead.
             - Example: Tag a solid, then select it's features later using selectors like solids, faces, edges, etc via the "tag" param.
       end(n: int=1)
-	        - Return the nth parent of this CQ element
+	        - Return the nth parent of this model element
             - Can be used to iterate over items on the current stack and move a specific item to the current selection.
             - If you use "end" 2x on a stack, then the N of your 2nd end cannot go before the position of the 1st end.
       pushPoints(pntList: Iterable[Union[Tuple[float, float], Tuple[float, float, float], Vector, Location]])
 	        - Pushes a list of 2D points onto the stack as vertices.
             - Creates an array of custom 2D points and pushed them onto the stack (similar to "rarray" or "polarArray")
       each(callback: Callable[[Union[Vector, Location, Shape, Sketch]], Shape], useLocalCoordinates: bool=False, combine: Union[bool, Literal['cut', 'a', 's']]=True, clean: bool=True)
-	        - Runs the provided function on each value in the stack, and collects the return values into a new CQ object. 
+	        - Runs the provided function on each value in the stack, and collects the return values into a new model object. 
             - lambda function [not supported]
       eachpoint(arg: Union[Shape, ForwardRef('Workplane'), Callable[[Location], Shape]], useLocalCoordinates: bool=False, combine: Union[bool, Literal['cut', 'a', 's']]=False, clean: bool=True)
 	        - Same as each(), except arg is translated by the positions on the stack. 
@@ -732,9 +1039,9 @@ async def workplane_api(
         - Attempt to consolidate wires on the stack into a single.
       copyWorkplane(obj: ~T)
         - Copies the workplane from obj.
-        - Parameters: obj (a CQ object) – an object to copy the workplane from
-        - Returns: a CQ object with obj’s workplane
-        - Example: Workplane("front").circle(1).extrude(10).copyWorkplane(cq.Workplane("right", origin=(-5, 0, 0)) ).circle(1).extrude(10) # This creates two perpendicular cylinders
+        - Parameters: obj (a model object) – an object to copy the workplane from
+        - Returns: a model object with obj’s workplane
+        - Example: Workplane("front").circle(1).extrude(10).copyWorkplane(Workplane("right", origin=(-5, 0, 0)) ).circle(1).extrude(10) # This creates two perpendicular cylinders
       findSolid(searchStack: bool=True, searchParents: bool=True)
         - Finds the first solid object in the chain, searching from the current node backwards through parents until one is found.
       section(height: float=0.0)
@@ -745,10 +1052,6 @@ async def workplane_api(
         - Create a spline interpolated through the provided points (2D or 3D).
       workplaneFromTagged(name: str)
         - Copies the workplane from a tagged parent.
-      export(fname: str, tolerance: float=0.1, angularTolerance: float=0.1, opt: Optional[Dict[str, Any]]=None)
-		- Export Workplane to file.
-	  exportSvg(fileName: str)
-		- Exports the first item on the stack as an SVG file
 
     ── _ref / _type in params ──────────────────────────────────────────────────
       {"_ref": "name"}
@@ -815,7 +1118,7 @@ async def workplane_api(
 
     ── Computed values (_attr / _call / _run_on) ───────────────────────────────
     Inside any "args" or "params" value, three additional dict keys let you
-    compute CadQuery objects at resolve-time without a separate tool call:
+    compute CAD objects at resolve-time without a separate tool call:
 
       {"_attr": {"obj": <resolvable>, "name": "plane"}}
         - Access an attribute on a resolved object.
@@ -908,6 +1211,7 @@ async def workplane_api(
     {"status":"success", "name":str, "obj_type":str,
      "properties": {"volume":float, "area":float, "center":[x,y,z], "bounding_box":{...}}}
     """
+    _bind(_sid_from_ctx(ctx))
     try:
         if start_from:
             obj = _get(start_from)
@@ -922,7 +1226,7 @@ async def workplane_api(
             else:
                 obj = Workplane(plane)
 
-        obj = _run(obj, operations)
+        obj = await anyio.to_thread.run_sync(_run, obj, operations)
 
         # tag() chains via newObject([Vertex]) leave only a Vertex on the stack.
         # Storing that would break assembly selectors (partName@faces@...) on the part.
@@ -935,7 +1239,7 @@ async def workplane_api(
 
         name = store_as or _auto_name("workplane")
         _store(name, obj)
-        _show(obj)
+        await anyio.to_thread.run_sync(_show, obj)
 
         return json.dumps({"status": "success", "name": name,
                            "obj_type": _obj_type(obj), "properties": _properties(obj)})
@@ -952,12 +1256,24 @@ async def sketch_api(
     init_params: Optional[dict] = None,
     start_from: Optional[str] = None,
     store_as: Optional[str] = None,
+    ctx: Context = None,
 ) -> str:
     """
-    Build 2D profiles using CadQuery's Sketch API via method chaining.
+    Build 2D profiles using Sketch API via method chaining.
     The stored Sketch can be passed to workplane_api via:
       {"method": "placeSketch", "args": [{"_ref": "sketch_1"}]}
     followed by extrude or cutBlind.
+
+    ── FLAT PARTS FOR LASER / PLASMA / WATERJET / CNC CUTTING ───────────────────
+    These processes cut a flat sheet, so the deliverable is a 2D vector profile,
+    NOT a 3D solid. When the user wants a part for laser cutting, a plasma/waterjet
+    table, CNC routing, vinyl cutting, etc.:
+      • Build the cut outline (and any internal holes) as a Sketch here, and leave
+        it as a Sketch — do NOT extrude it into a solid.
+      • select_model the sketch so it is the active model.
+      • The user can then download it as DXF or SVG (flat 2D vector formats).
+    DXF/SVG downloads are offered ONLY when the active model is a 2D Sketch; 3D
+    solids and assemblies cannot be exported to these formats.
 
     ── TWO WORKFLOWS ───────────────────────────────────────────────────────────
 
@@ -1133,23 +1449,22 @@ async def sketch_api(
 		- Finish sketch construction and return the parent.
 	importDXF(filename: str, tol: float=1e-06, exclude: List[str]=[], include: List[str]=[], angle: float=0, mode: Literal['a', 's', 'i', 'c', 'r']='a', tag: str | None=None)
 		- Import a DXF file and construct face(s)
-	export(fname: str, tolerance: float=0.1, angularTolerance: float=0.1, opt: Optional[Dict[str, Any]]=None)
-		- Export Sketch to file.
 
     ── RETURN ──────────────────────────────────────────────────────────────────
     {"status":"success", "name":str, "obj_type":"Sketch",
      "properties": {"face_count":int, "total_area":float, "edge_count":int}}
     """
+    _bind(_sid_from_ctx(ctx))
     try:
         if start_from:
             obj = _get(start_from)
         else:
             obj = Sketch()
 
-        obj = _run(obj, operations)
+        obj = await anyio.to_thread.run_sync(_run, obj, operations)
         name = store_as or _auto_name("sketch")
         _store(name, obj)
-        _show(obj)
+        await anyio.to_thread.run_sync(_show, obj)
 
         return json.dumps({"status": "success", "name": name,
                            "obj_type": _obj_type(obj), "properties": _properties(obj)})
@@ -1166,6 +1481,7 @@ async def assembly_api(
     init_params: Optional[dict] = None,
     start_from: Optional[str] = None,
     store_as: Optional[str] = None,
+    ctx: Context = None,
 ) -> str:
     """
     Assembly API fundamentals: 
@@ -1197,11 +1513,9 @@ async def assembly_api(
                 - Fixed constraints (4) with param — pass it as the 3rd positional arg: {"method": "constrain", "args": ["query1", "Kind", param_value]}
             3. "solve" - calculates position and orientation based on the provided constraints
                 - solve()
-            4. "export" - exports the assembly to a file
-                - export(path: str, exportType: Literal['STEP','XML','XBF','GLTF','VTKJS','VRML','STL'] | None = None, mode: Literal['default','fused'] = 'default', tolerance: float = 0.1, angularTolerance: float = 0.1, unit: Literal['MM','CM','M','KM','INCH','FT','MI','UM','NM'] = 'MM', outputUnit: Literal['MM','CM','M','KM','INCH','FT','MI','UM','NM'] | None = None, **kwargs)
-                - DEFAULT export type: STEP — only change if the user explicitly requests another format
-            5. "toCompound" - converts the multi-part assembly to a single compound solid
+            4. "toCompound" - converts the multi-part assembly to a single compound solid
                 - toCompound()
+                - Note: this method is optional - not necessary!
 
     ── Adding objects section ─────────────────────────────────────────────────────────────────────
 
@@ -1212,7 +1526,7 @@ async def assembly_api(
             - "name": the name used to reference this assembly object in the "constrain" method (via its "query1" and "query2" positional args) later on to apply constraints on it
             - "color": {"_type": "Color", ...} - set the material color of the added object in the assembly
             - "material": Not supported right now, so set to "None"
-            - "metadata": Dict[str, Any] - any specific metadata/ context about the assembly part (do this if the user asks you to export the assembly to a STEP file)
+            - "metadata": Dict[str, Any] - any specific metadata/ context about the assembly part
 
     {"_type": "Location", ...} ("loc" param of the "add" method):
         method #1: {"_type": "Location", "x":0, "y":0, "z":0, "rx":0, "ry":0, "rz":0}
@@ -1236,7 +1550,7 @@ async def assembly_api(
         method #1: {"_type": "Color", name= "..."}
             - All available values for the "name" argument (some of these might be a bit misleading - if so, use method #2): 
                 aliceblue, antiquewhite, antiquewhite1, antiquewhite2, antiquewhite3, antiquewhite4, aquamarine1, aquamarine2, aquamarine4, azure, azure2, azure3, azure4, beet, beige, bisque, bisque2, bisque3, bisque4, black, blanchedalmond, blue, blue1, blue2, blue3, blue4, blueviolet, brown, brown1, brown2, brown3, brown4, burlywood, burlywood1, burlywood2, burlywood3, burlywood4, cadetblue, cadetblue1, cadetblue2, cadetblue3, cadetblue4, chartreuse, chartreuse1, chartreuse2, chartreuse3, chartreuse4, chocolate, chocolate1, chocolate2, chocolate3, chocolate4, coral, coral1, coral2, coral3, coral4, cornflowerblue, cornsilk1, cornsilk2, cornsilk3, cornsilk4, cyan, cyan1, cyan2, cyan3, cyan4, darkgoldenrod, darkgoldenrod1, darkgoldenrod2, darkgoldenrod3, darkgoldenrod4, darkgreen, darkkhaki, darkolivegreen, darkolivegreen1, darkolivegreen2, darkolivegreen3, darkolivegreen4, darkorange, darkorange1, darkorange2, darkorange3, darkorange4, darkorchid, darkorchid1, darkorchid2, darkorchid3, darkorchid4, darksalmon, darkseagreen, darkseagreen1, darkseagreen2, darkseagreen3, darkseagreen4, darkslateblue, darkslategray, darkslategray1, darkslategray2, darkslategray3, darkslategray4, darkturquoise, darkviolet, deeppink, deeppink2, deeppink3, deeppink4, deepskyblue1, deepskyblue2, deepskyblue3, deepskyblue4, dodgerblue1, dodgerblue2, dodgerblue3, dodgerblue4, firebrick, firebrick1, firebrick2, firebrick3, firebrick4, floralwhite, forestgreen, gainsboro, ghostwhite, gold, gold1, gold2, gold3, gold4, goldenrod, goldenrod1, goldenrod2, goldenrod3, goldenrod4, gray, gray0, gray1, gray10, gray11, gray12, gray13, gray14, gray15, gray16, gray17, gray18, gray19, gray2, gray20, gray21, gray22, gray23, gray24, gray25, gray26, gray27, gray28, gray29, gray3, gray30, gray31, gray32, gray33, gray34, gray35, gray36, gray37, gray38, gray39, gray4, gray40, gray41, gray42, gray43, gray44, gray45, gray46, gray47, gray48, gray49, gray5, gray50, gray51, gray52, gray53, gray54, gray55, gray56, gray57, gray58, gray59, gray6, gray60, gray61, gray62, gray63, gray64, gray65, gray66, gray67, gray68, gray69, gray7, gray70, gray71, gray72, gray73, gray74, gray75, gray76, gray77, gray78, gray79, gray8, gray80, gray81, gray82, gray83, gray85, gray86, gray87, gray88, gray89, gray9, gray90, gray91, gray92, gray93, gray94, gray95, gray97, gray98, gray99, green, green1, green2, green3, green4, greenyellow, honeydew, honeydew2, honeydew3, honeydew4, hotpink, hotpink1, hotpink2, hotpink3, hotpink4, indianred, indianred1, indianred2, indianred3, indianred4, ivory, ivory2, ivory3, ivory4, khaki, khaki1, khaki2, khaki3, khaki4, lavender, lavenderblush1, lavenderblush2, lavenderblush3, lavenderblush4, lawngreen, lemonchiffon1, lemonchiffon2, lemonchiffon3, lemonchiffon4, lightblue, lightblue1, lightblue2, lightblue3, lightblue4, lightcoral, lightcyan, lightcyan1, lightcyan2, lightcyan3, lightcyan4, lightgoldenrod, lightgoldenrod1, lightgoldenrod2, lightgoldenrod3, lightgoldenrod4, lightgoldenrodyellow, lightgray, lightpink, lightpink1, lightpink2, lightpink3, lightpink4, lightsalmon1, lightsalmon2, lightsalmon3, lightsalmon4, lightseagreen, lightskyblue, lightskyblue1, lightskyblue2, lightskyblue3, lightskyblue4, lightslateblue, lightslategray, lightsteelblue, lightsteelblue1, lightsteelblue2, lightsteelblue3, lightsteelblue4, lightyellow, lightyellow2, lightyellow3, lightyellow4, limegreen, linen, magenta, magenta1, magenta2, magenta3, magenta4, maroon, maroon1, maroon2, maroon3, maroon4, matrablue, matragray, mediumaquamarine, mediumorchid, mediumorchid1, mediumorchid2, mediumorchid3, mediumorchid4, mediumpurple, mediumpurple1, mediumpurple2, mediumpurple3, mediumpurple4, mediumseagreen, mediumslateblue, mediumspringgreen, mediumturquoise, mediumvioletred, midnightblue, mintcream, mistyrose, mistyrose2, mistyrose3, mistyrose4, moccasin, navajowhite1, navajowhite2, navajowhite3, navajowhite4, navyblue, oldlace, olivedrab, olivedrab1, olivedrab2, olivedrab3, olivedrab4, orange, orange1, orange2, orange3, orange4, orangered, orangered1, orangered2, orangered3, orangered4, orchid, orchid1, orchid2, orchid3, orchid4, palegoldenrod, palegreen, palegreen1, palegreen2, palegreen3, palegreen4, paleturquoise, paleturquoise1, paleturquoise2, paleturquoise3, paleturquoise4, palevioletred, palevioletred1, palevioletred2, palevioletred3, palevioletred4, papayawhip, peachpuff, peachpuff2, peachpuff3, peachpuff4, peru, pink, pink1, pink2, pink3, pink4, plum, plum1, plum2, plum3, plum4, powderblue, purple, purple1, purple2, purple3, purple4, red, red1, red2, red3, red4, rosybrown, rosybrown1, rosybrown2, rosybrown3, rosybrown4, royalblue, royalblue1, royalblue2, royalblue3, royalblue4, saddlebrown, salmon, salmon1, salmon2, salmon3, salmon4, sandybrown, seagreen, seagreen1, seagreen2, seagreen3, seagreen4, seashell, seashell2, seashell3, seashell4, sienna, sienna1, sienna2, sienna3, sienna4, skyblue, skyblue1, skyblue2, skyblue3, skyblue4, slateblue, slateblue1, slateblue2, slateblue3, slateblue4, slategray, slategray1, slategray2, slategray3, slategray4, snow, snow2, snow3, snow4, springgreen, springgreen2, springgreen3, springgreen4, steelblue, steelblue1, steelblue2, steelblue3, steelblue4, tan, tan1, tan2, tan3, tan4, teal, thistle, thistle1, thistle2, thistle3, thistle4, tomato, tomato1, tomato2, tomato3, tomato4, turquoise, turquoise1, turquoise2, turquoise3, turquoise4, violet, violetred, violetred1, violetred2, violetred3, violetred4, wheat, wheat1, wheat2, wheat3, wheat4, white, whitesmoke, yellow, yellow1, yellow2, yellow3, yellow4, yellowgreen
-            - By default, use "gray90" for everything. It creates an off-white material color. If the user increases the material "metalness" variable in the OCP viewer, then "gray90" makes the material look like silver metal.
+            - By default, use "gray90" for everything. It creates an off-white material color. If the user increases the material "metalness" variable in the 3D viewer, then "gray90" makes the material look like silver metal.
         method #2: {"_type": "Color", "r":0, "g":0, "b":0, "a":1}
             - "r", "g", "b" accept EITHER 0–255 integers OR 0.0–1.0 floats. The server auto-normalises: if any channel exceeds 1 the whole triple is divided by 255.
             - "a" is alpha (0.0 = fully transparent, 1.0 = fully opaque). Always pass a value in the 0.0–1.0 range.
@@ -1246,10 +1560,10 @@ async def assembly_api(
     ── Constraint section ─────────────────────────────────────────────────────────────────────────
 
     "constrain" method formats and info:
-        CRITICAL: "constrain" is an *args method in CadQuery. It does NOT accept keyword arguments. 
+        CRITICAL: "constrain" is an *args method. It does NOT accept keyword arguments. 
         ALWAYS use the positional "args" form in MCP tool calls. NEVER use the "params" (keyword) form.
 
-        Positional dispatch rules (CadQuery detects the form from the number and types of args):
+        Positional dispatch rules (the CAD engine detects the form from the number and types of args):
             Relative constraints (5 total — 2 query strings + kind string):
                 {"method": "constrain", "args": ["query1", "query2", "Kind"]}
                 With a non-default param (e.g. Axis at 90°, PointInPlane with offset):
@@ -1301,7 +1615,7 @@ async def assembly_api(
                     # newObject() allows you to tag without losing your PART's chain position/ stack selection
                     # Workplane API has a plane() attribute that tracks the current 2D local coordinate system's position/orientation in the 3D world space (like a mapping system). It has 3 parts: origin, xDir/yDir and normal.
                     # plane.toWorldCoords(x,y) converts your 2D local workplane point to 3D world coordinates (x,y,z). use the x,y param to select a point in the 2D local workplane before the conversion (it's affected by the center(x,y) method of Workplane API)
-                    # Vertex.makeVertex(x,y,z) converts the raw 3D world coordinates into a OCCT Vertex Shape.
+                    # Vertex.makeVertex(x,y,z) converts the raw 3D world coordinates into a Vertex Shape.
             - Example #2: Another way to do almost the same thing as Example #1
                 - workplane_api("init_params": {"plane": "XY"}, "operations": [{"method": "box", "args": [30, 30, 30]}, {"method": "faces", "args": [">>X"]}, {"method": "workplane", "params": {"centerOption": "CenterOfMass"}}, {"method": "center", "args": [10, -5]}, {"method": "hole", "args": [1]}], "store_as": "PART")
                     # This creates a hole of 1mm diameter 10mm in the +X direction and 5mm in the -Y direction from the center of the >>X face. 
@@ -1838,7 +2152,7 @@ async def assembly_api(
         Each operation: {"method": str, "params": dict} or {"method": str, "args": list}
 
     add:
-        First param key is "arg" (the CadQuery object to add).
+        First param key is "arg" (the CAD object to add).
 
         {"method": "add", "params": {
             "arg":   {"_ref": "box_1"},
@@ -1882,27 +2196,6 @@ async def assembly_api(
         {"method": "solve", "params": {}}
         {"method": "solve", "params": {"verbosity": 1}}
 
-    export:
-        Signature: export(path, exportType=None, mode='default', tolerance=0.1, angularTolerance=0.1, unit='MM', outputUnit=None, **kwargs)
-
-        DEFAULT behaviour (use unless user explicitly requests otherwise):
-          - path: C:\\Users\\...\\<filename>.step
-          - exportType: "STEP"
-
-        Standard STEP export (default — use this unless told otherwise):
-        {"method": "export", "params": {"path": "C:\\Users\\...\\assy.step", "exportType": "STEP"}}
-
-        glTF / GLB (only if user asks for web/viewer format):
-        {"method": "export", "params": {"path": "C:\\Users\\...\\assy.gltf"}}
-        {"method": "export", "params": {"path": "C:\\Users\\...\\assy.glb"}}
-
-        Fused STEP (only if user asks for a single merged solid):
-        {"method": "export", "params": {"path": "C:\\Users\\...\\assy.step", "exportType": "STEP", "mode": "fused"}}
-        
-        Note: Whenever the user asks to export something, ask him/ her to provide you an absolute file path where you should export the files. Remember to include double backslahes (\\) in that path rather than single ones (\\)!
-
-        Supported exportType values: 'STEP', 'XML', 'XBF', 'GLTF', 'VTKJS', 'VRML', 'STL'
-
     toCompound:
          {"method": "toCompound", "params": {}}
         Converts the assembly to a single Compound; the result is re-stored.
@@ -1940,6 +2233,7 @@ async def assembly_api(
         {"status":"success", "name":str, "obj_type":"Assembly",
          "properties": {"children":[str,...], "object_count":int, "volume":float, "center":[x,y,z]}}
     """
+    _bind(_sid_from_ctx(ctx))
     try:
         if start_from:
             obj = _get(start_from)
@@ -1952,10 +2246,10 @@ async def assembly_api(
                 color=resolved.get("color"),
             )
 
-        obj = _run(obj, operations)
+        obj = await anyio.to_thread.run_sync(_run, obj, operations)
         name = store_as or _auto_name("assembly")
         _store(name, obj)
-        _show(obj)
+        await anyio.to_thread.run_sync(_show, obj)
 
         return json.dumps({"status": "success", "name": name,
                            "obj_type": _obj_type(obj), "properties": _properties(obj)})
@@ -1963,7 +2257,41 @@ async def assembly_api(
         return _error(str(e), traceback.format_exc())
 
 # =============================================================================
-# TOOL 4 — query_docs
+# TOOL 4 — select_model
+# =============================================================================
+
+@mcp.tool(name="select_model")
+async def select_model(name: str, ctx: Context = None) -> str:
+    """
+    Make a previously built model the ACTIVE model.
+
+    Every model you build (via workplane_api / sketch_api / assembly_api) is stored
+    under a name and automatically becomes active. The 3D viewer always shows the
+    active model, and the active model is the one the user can download/ export.
+
+    Only ONE model/assembly/sketch can be active at a time: the viewer displays
+    exactly one active model, and only that one is downloadable. It cannot show
+    multiple stored models at once.
+
+    Use this tool to bring back an EARLIER model (by its stored name) WITHOUT
+    rebuilding it — e.g. when the user wants to view a previous model again, or wants
+    to download a previous model instead of the latest one.
+
+    name: stored name of a model created earlier (returned as "name" by the build
+          tools). Works with models from all three APIs.
+    """
+    sess = _bind(_sid_from_ctx(ctx))
+    try:
+        obj = _get(name)  # raises if name unknown
+        sess.current = name
+        await anyio.to_thread.run_sync(_show, obj)
+        return json.dumps({"status": "success", "name": name,
+                           "obj_type": _obj_type(obj), "properties": _properties(obj)})
+    except Exception as e:
+        return _error(str(e), traceback.format_exc())
+
+# =============================================================================
+# TOOL 5 — query_docs
 # =============================================================================
 
 import cadquery.selectors as _cq_selectors
@@ -1978,7 +2306,7 @@ def _resolve_cls(name: str):
         obj = getattr(module, name, None)
         if isinstance(obj, type):
             return obj
-    raise ValueError(f"Unknown CadQuery class: '{name}'")
+    raise ValueError(f"Unknown class: '{name}'")
 
 
 def _doc_type(ann) -> str:
@@ -2046,7 +2374,7 @@ def _doc_render(cls_name, name, method, sig) -> str:
     if raw:
         out.append(f"\n  Full docstring:\n{raw}")
     out.append("\n---")
-    return "\n".join(out)
+    return _scrub("\n".join(out))
 
 
 @mcp.tool(name="query_docs")
@@ -2074,6 +2402,4575 @@ async def query_docs(methods: List[str], cls: Optional[str] = None) -> str:
              Omit to search Workplane, Sketch, and Assembly.
 
     Returns plain-text docs per entry: signature, summary, params, full docstring.
+
+    IMPORTANT (YOU MUST FOLLOW THIS RULE AT ALL COST !!!):
+        IF the user's prompt contains "@cabinet101", you MUST first run the following tool commands to create and LOAD a template cabinet and then customize it based on the user's requirements (if none are provided, build the template first, then ask for customization details):
+        workplane_api
+		{
+		    "init_params": {
+		        "plane": "XY"
+		    },
+		    "operations": [
+		        {
+		            "method": "box",
+		            "params": {
+		                "height": 650,
+		                "length": 450,
+		                "width": 650
+		            }
+		        },
+		        {
+		            "args": [
+		                ">X or >Z or <Z"
+		            ],
+		            "method": "faces"
+		        },
+		        {
+		            "method": "shell",
+		            "params": {
+		                "kind": "intersection",
+		                "thickness": -0.5
+		            }
+		        }
+		    ],
+		    "store_as": "walls_u"
+		}
+		{
+		    "init_params": {
+		        "plane": "XY"
+		    },
+		    "operations": [
+		        {
+		            "method": "box",
+		            "params": {
+		                "combine": false,
+		                "height": 650,
+		                "length": 0.5,
+		                "width": 30
+		            }
+		        },
+		        {
+		            "method": "translate",
+		            "params": {
+		                "vec": [
+		                    224.75,
+		                    309.5,
+		                    0
+		                ]
+		            }
+		        }
+		    ],
+		    "store_as": "front_flange_final"
+		}
+		{
+		    "init_params": {
+		        "plane": "XY"
+		    },
+		    "operations": [
+		        {
+		            "method": "box",
+		            "params": {
+		                "combine": false,
+		                "height": 650,
+		                "length": 0.5,
+		                "width": 30
+		            }
+		        },
+		        {
+		            "method": "translate",
+		            "params": {
+		                "vec": [
+		                    224.75,
+		                    -309.5,
+		                    0
+		                ]
+		            }
+		        }
+		    ],
+		    "store_as": "back_flange_final"
+		}
+		{
+		    "operations": [
+		        {
+		            "method": "union",
+		            "params": {
+		                "toUnion": {
+		                    "_ref": "front_flange_final"
+		                }
+		            }
+		        }
+		    ],
+		    "start_from": "walls_u",
+		    "store_as": "walls_with_front"
+		}
+		{
+		    "operations": [
+		        {
+		            "method": "union",
+		            "params": {
+		                "toUnion": {
+		                    "_ref": "back_flange_final"
+		                }
+		            }
+		        }
+		    ],
+		    "start_from": "walls_with_front",
+		    "store_as": "walls_complete"
+		}
+		{
+		    "init_params": {
+		        "plane": "XY"
+		    },
+		    "operations": [
+		        {
+		            "method": "box",
+		            "params": {
+		                "combine": false,
+		                "height": 30,
+		                "length": 449,
+		                "width": 649
+		            }
+		        },
+		        {
+		            "method": "translate",
+		            "params": {
+		                "vec": [
+		                    0,
+		                    0,
+		                    310
+		                ]
+		            }
+		        }
+		    ],
+		    "store_as": "roof_final"
+		}
+		{
+		    "init_params": {
+		        "plane": "XY"
+		    },
+		    "operations": [
+		        {
+		            "method": "box",
+		            "params": {
+		                "combine": false,
+		                "height": 30,
+		                "length": 449,
+		                "width": 649
+		            }
+		        },
+		        {
+		            "method": "translate",
+		            "params": {
+		                "vec": [
+		                    0,
+		                    0,
+		                    -310
+		                ]
+		            }
+		        }
+		    ],
+		    "store_as": "floor_final"
+		}
+		{
+		    "init_params": {
+		        "plane": "XY"
+		    },
+		    "operations": [
+		        {
+		            "method": "box",
+		            "params": {
+		                "combine": false,
+		                "height": 30,
+		                "length": 449,
+		                "width": 649
+		            }
+		        },
+		        {
+		            "method": "translate",
+		            "params": {
+		                "vec": [
+		                    0,
+		                    0,
+		                    0
+		                ]
+		            }
+		        }
+		    ],
+		    "store_as": "shelf_final"
+		}
+		{
+		    "init_params": {
+		        "plane": {
+		            "_type": "Plane",
+		            "normal": [
+		                0,
+		                0,
+		                1
+		            ],
+		            "origin": [
+		                0,
+		                0,
+		                -325
+		            ],
+		            "xDir": [
+		                1,
+		                0,
+		                0
+		            ]
+		        }
+		    },
+		    "operations": [
+		        {
+		            "method": "pushPoints",
+		            "params": {
+		                "pntList": [
+		                    [
+		                        164.5,
+		                        264.5
+		                    ],
+		                    [
+		                        164.5,
+		                        -264.5
+		                    ],
+		                    [
+		                        -164.5,
+		                        264.5
+		                    ],
+		                    [
+		                        -164.5,
+		                        -264.5
+		                    ]
+		                ]
+		            }
+		        },
+		        {
+		            "method": "circle",
+		            "params": {
+		                "radius": 30
+		            }
+		        },
+		        {
+		            "method": "extrude",
+		            "params": {
+		                "combine": false,
+		                "until": -50
+		            }
+		        }
+		    ],
+		    "store_as": "feet_final"
+		}
+		assembly_api
+		{
+		    "operations": [
+		        {
+		            "method": "add",
+		            "params": {
+		                "arg": {
+		                    "_ref": "walls_complete"
+		                },
+		                "color": {
+		                    "_type": "Color",
+		                    "name": "gray80"
+		                },
+		                "name": "walls"
+		            }
+		        },
+		        {
+		            "method": "add",
+		            "params": {
+		                "arg": {
+		                    "_ref": "roof_final"
+		                },
+		                "color": {
+		                    "_type": "Color",
+		                    "name": "gray80"
+		                },
+		                "loc": {
+		                    "_type": "Location",
+		                    "x": 0,
+		                    "y": 0,
+		                    "z": 310
+		                },
+		                "name": "roof"
+		            }
+		        },
+		        {
+		            "method": "add",
+		            "params": {
+		                "arg": {
+		                    "_ref": "floor_final"
+		                },
+		                "color": {
+		                    "_type": "Color",
+		                    "name": "gray80"
+		                },
+		                "loc": {
+		                    "_type": "Location",
+		                    "x": 0,
+		                    "y": 0,
+		                    "z": -310
+		                },
+		                "name": "floor"
+		            }
+		        },
+		        {
+		            "method": "add",
+		            "params": {
+		                "arg": {
+		                    "_ref": "shelf_final"
+		                },
+		                "color": {
+		                    "_type": "Color",
+		                    "name": "gray80"
+		                },
+		                "loc": {
+		                    "_type": "Location",
+		                    "x": 0,
+		                    "y": 0,
+		                    "z": 0
+		                },
+		                "name": "shelf"
+		            }
+		        },
+		        {
+		            "method": "add",
+		            "params": {
+		                "arg": {
+		                    "_ref": "feet_final"
+		                },
+		                "color": {
+		                    "_type": "Color",
+		                    "a": 1,
+		                    "b": 120,
+		                    "g": 175,
+		                    "r": 230
+		                },
+		                "loc": {
+		                    "_type": "Location",
+		                    "x": 0,
+		                    "y": 0,
+		                    "z": 0
+		                },
+		                "name": "feet"
+		            }
+		        },
+		        {
+		            "args": [
+		                "walls",
+		                "Fixed"
+		            ],
+		            "method": "constrain"
+		        },
+		        {
+		            "args": [
+		                "roof",
+		                "FixedPoint",
+		                [
+		                    0,
+		                    0,
+		                    310
+		                ]
+		            ],
+		            "method": "constrain"
+		        },
+		        {
+		            "args": [
+		                "roof@faces@>Z",
+		                "FixedAxis",
+		                [
+		                    0,
+		                    0,
+		                    1
+		                ]
+		            ],
+		            "method": "constrain"
+		        },
+		        {
+		            "args": [
+		                "floor",
+		                "FixedPoint",
+		                [
+		                    0,
+		                    0,
+		                    -310
+		                ]
+		            ],
+		            "method": "constrain"
+		        },
+		        {
+		            "args": [
+		                "floor@faces@>Z",
+		                "FixedAxis",
+		                [
+		                    0,
+		                    0,
+		                    1
+		                ]
+		            ],
+		            "method": "constrain"
+		        },
+		        {
+		            "args": [
+		                "shelf",
+		                "FixedPoint",
+		                [
+		                    0,
+		                    0,
+		                    0
+		                ]
+		            ],
+		            "method": "constrain"
+		        },
+		        {
+		            "args": [
+		                "shelf@faces@>Z",
+		                "FixedAxis",
+		                [
+		                    0,
+		                    0,
+		                    1
+		                ]
+		            ],
+		            "method": "constrain"
+		        },
+		        {
+		            "args": [
+		                "feet",
+		                "FixedPoint",
+		                [
+		                    0,
+		                    0,
+		                    -350
+		                ]
+		            ],
+		            "method": "constrain"
+		        },
+		        {
+		            "args": [
+		                "feet@faces@>Z",
+		                "FixedAxis",
+		                [
+		                    0,
+		                    0,
+		                    1
+		                ]
+		            ],
+		            "method": "constrain"
+		        },
+		        {
+		            "method": "solve",
+		            "params": {}
+		        }
+		    ],
+		    "store_as": "cabinet_final_clean"
+		}
+		select_model
+		{
+		    "name": "cabinet_final_clean"
+		}
+        
+        IF the user's prompt contains "@roller-coaster", you MUST first run the tool commands mentioned in the following json to create and LOAD a template turbine:
+        {
+            "role": "assistant",
+            "content": [
+                {
+                    "type": "text",
+                    "text": "Step 1: Road Wheel"
+                },
+                {
+                    "type": "tool-call",
+                    "toolName": "workplane_api",
+                    "input": {
+                        "init_params": {
+                            "plane": "XY"
+                        },
+                        "operations": [
+                            {
+                                "args": [
+                                    100
+                                ],
+                                "method": "circle"
+                            },
+                            {
+                                "args": [
+                                    50
+                                ],
+                                "method": "extrude"
+                            },
+                            {
+                                "args": [
+                                    ">Z"
+                                ],
+                                "method": "faces"
+                            },
+                            {
+                                "method": "workplane"
+                            },
+                            {
+                                "args": [
+                                    25
+                                ],
+                                "method": "circle"
+                            },
+                            {
+                                "method": "cutThruAll"
+                            },
+                            {
+                                "args": [
+                                    ">Z"
+                                ],
+                                "method": "edges"
+                            },
+                            {
+                                "args": [
+                                    10
+                                ],
+                                "method": "fillet"
+                            },
+                            {
+                                "args": [
+                                    "<Z"
+                                ],
+                                "method": "edges"
+                            },
+                            {
+                                "args": [
+                                    10
+                                ],
+                                "method": "fillet"
+                            }
+                        ],
+                        "store_as": "road_wheel"
+                    }
+                }
+            ]
+        },
+        {
+            "role": "assistant",
+            "content": [
+                {
+                    "type": "text",
+                    "text": "Step 2: Guide Wheel"
+                },
+                {
+                    "type": "tool-call",
+                    "toolName": "workplane_api",
+                    "input": {
+                        "init_params": {
+                            "plane": "XY"
+                        },
+                        "operations": [
+                            {
+                                "args": [
+                                    75
+                                ],
+                                "method": "circle"
+                            },
+                            {
+                                "args": [
+                                    40
+                                ],
+                                "method": "extrude"
+                            },
+                            {
+                                "args": [
+                                    ">Z"
+                                ],
+                                "method": "faces"
+                            },
+                            {
+                                "method": "workplane"
+                            },
+                            {
+                                "args": [
+                                    20
+                                ],
+                                "method": "circle"
+                            },
+                            {
+                                "method": "cutThruAll"
+                            },
+                            {
+                                "args": [
+                                    ">Z"
+                                ],
+                                "method": "edges"
+                            },
+                            {
+                                "args": [
+                                    8
+                                ],
+                                "method": "fillet"
+                            },
+                            {
+                                "args": [
+                                    "<Z"
+                                ],
+                                "method": "edges"
+                            },
+                            {
+                                "args": [
+                                    8
+                                ],
+                                "method": "fillet"
+                            }
+                        ],
+                        "store_as": "guide_wheel"
+                    }
+                }
+            ]
+        },
+        {
+            "role": "assistant",
+            "content": [
+                {
+                    "type": "text",
+                    "text": "Step 3: Seat"
+                },
+                {
+                    "type": "tool-call",
+                    "toolName": "workplane_api",
+                    "input": {
+                        "init_params": {
+                            "plane": "YZ"
+                        },
+                        "operations": [
+                            {
+                                "args": [
+                                    0,
+                                    0
+                                ],
+                                "method": "moveTo"
+                            },
+                            {
+                                "args": [
+                                    [
+                                        [
+                                            0,
+                                            120
+                                        ],
+                                        [
+                                            370,
+                                            120
+                                        ],
+                                        [
+                                            370,
+                                            770
+                                        ],
+                                        [
+                                            400,
+                                            780
+                                        ],
+                                        [
+                                            450,
+                                            770
+                                        ],
+                                        [
+                                            450,
+                                            120
+                                        ],
+                                        [
+                                            450,
+                                            0
+                                        ]
+                                    ]
+                                ],
+                                "method": "polyline"
+                            },
+                            {
+                                "method": "close"
+                            },
+                            {
+                                "args": [
+                                    520
+                                ],
+                                "method": "extrude"
+                            },
+                            {
+                                "method": "edges"
+                            },
+                            {
+                                "args": [
+                                    18
+                                ],
+                                "method": "fillet"
+                            }
+                        ],
+                        "store_as": "seat"
+                    }
+                }
+            ]
+        },
+        {
+            "role": "assistant",
+            "content": [
+                {
+                    "type": "text",
+                    "text": "Step 4: Nose Cone (D-shape)\n\n"
+                },
+                {
+                    "type": "tool-call",
+                    "toolName": "workplane_api",
+                    "input": {
+                        "init_params": {
+                            "plane": "XY"
+                        },
+                        "operations": [
+                            {
+                                "args": [
+                                    0,
+                                    0
+                                ],
+                                "method": "moveTo"
+                            },
+                            {
+                                "args": [
+                                    500,
+                                    600,
+                                    -90,
+                                    90
+                                ],
+                                "kwargs": {
+                                    "sense": 1,
+                                    "startAtCurrent": false
+                                },
+                                "method": "ellipseArc"
+                            },
+                            {
+                                "method": "close"
+                            },
+                            {
+                                "args": [
+                                    585
+                                ],
+                                "method": "extrude"
+                            },
+                            {
+                                "args": [
+                                    "%ELLIPSE"
+                                ],
+                                "method": "edges"
+                            },
+                            {
+                                "args": [
+                                    50
+                                ],
+                                "method": "fillet"
+                            }
+                        ],
+                        "store_as": "nose_cone"
+                    }
+                }
+            ]
+        },
+        {
+            "role": "assistant",
+            "content": [
+                {
+                    "type": "text",
+                    "text": "Step 5: Chassis\n\n"
+                },
+                {
+                    "type": "tool-call",
+                    "toolName": "workplane_api",
+                    "input": {
+                        "init_params": {
+                            "plane": "XY"
+                        },
+                        "operations": [
+                            {
+                                "method": "box",
+                                "params": {
+                                    "height": 120,
+                                    "length": 1500,
+                                    "width": 1100
+                                }
+                            },
+                            {
+                                "args": [
+                                    ">Z"
+                                ],
+                                "method": "faces"
+                            },
+                            {
+                                "args": [
+                                    15
+                                ],
+                                "method": "shell"
+                            }
+                        ],
+                        "store_as": "chassis"
+                    }
+                }
+            ]
+        },
+        {
+            "role": "assistant",
+            "content": [
+                {
+                    "type": "text",
+                    "text": "Step 6: Side Fairing\n\n"
+                },
+                {
+                    "type": "tool-call",
+                    "toolName": "workplane_api",
+                    "input": {
+                        "init_params": {
+                            "plane": "XY"
+                        },
+                        "operations": [
+                            {
+                                "method": "box",
+                                "params": {
+                                    "height": 450,
+                                    "length": 1400,
+                                    "width": 60
+                                }
+                            },
+                            {
+                                "args": [
+                                    25
+                                ],
+                                "method": "fillet"
+                            }
+                        ],
+                        "store_as": "side_fairing"
+                    }
+                }
+            ]
+        },
+        {
+            "role": "assistant",
+            "content": [
+                {
+                    "type": "text",
+                    "text": "Step 7: Headrest\n\n"
+                },
+                {
+                    "type": "tool-call",
+                    "toolName": "workplane_api",
+                    "input": {
+                        "init_params": {
+                            "plane": "XY"
+                        },
+                        "operations": [
+                            {
+                                "method": "box",
+                                "params": {
+                                    "height": 180,
+                                    "length": 300,
+                                    "width": 80
+                                }
+                            },
+                            {
+                                "args": [
+                                    30
+                                ],
+                                "method": "fillet"
+                            }
+                        ],
+                        "store_as": "headrest"
+                    }
+                }
+            ]
+        },
+        {
+            "role": "assistant",
+            "content": [
+                {
+                    "type": "text",
+                    "text": "Step 8: OTSR Path\n\n\n\n"
+                },
+                {
+                    "type": "tool-call",
+                    "toolName": "workplane_api",
+                    "input": {
+                        "init_params": {
+                            "plane": "YZ"
+                        },
+                        "operations": [
+                            {
+                                "args": [
+                                    -200,
+                                    500
+                                ],
+                                "method": "moveTo"
+                            },
+                            {
+                                "args": [
+                                    -200,
+                                    620
+                                ],
+                                "method": "lineTo"
+                            },
+                            {
+                                "args": [
+                                    [
+                                        0,
+                                        680
+                                    ],
+                                    [
+                                        200,
+                                        620
+                                    ]
+                                ],
+                                "method": "threePointArc"
+                            },
+                            {
+                                "args": [
+                                    200,
+                                    500
+                                ],
+                                "method": "lineTo"
+                            },
+                            {
+                                "method": "wire"
+                            }
+                        ],
+                        "store_as": "otsr_path"
+                    }
+                }
+            ]
+        },
+        {
+            "role": "assistant",
+            "content": [
+                {
+                    "type": "text",
+                    "text": "Step 9: OTSR (sweep)"
+                },
+                {
+                    "type": "tool-call",
+                    "toolName": "workplane_api",
+                    "input": {
+                        "init_params": {
+                            "plane": "XY"
+                        },
+                        "operations": [
+                            {
+                                "method": "workplane",
+                                "params": {
+                                    "offset": 500
+                                }
+                            },
+                            {
+                                "args": [
+                                    0,
+                                    -200
+                                ],
+                                "method": "center"
+                            },
+                            {
+                                "args": [
+                                    15
+                                ],
+                                "method": "circle"
+                            },
+                            {
+                                "args": [
+                                    {
+                                        "_ref": "otsr_path"
+                                    }
+                                ],
+                                "kwargs": {
+                                    "combine": false
+                                },
+                                "method": "sweep"
+                            }
+                        ],
+                        "store_as": "otsr"
+                    }
+                }
+            ]
+        },
+        {
+            "role": "assistant",
+            "content": [
+                {
+                    "type": "text",
+                    "text": "Step 10: Bogie Frame\n\n"
+                },
+                {
+                    "type": "tool-call",
+                    "toolName": "workplane_api",
+                    "input": {
+                        "init_params": {
+                            "plane": "XY"
+                        },
+                        "operations": [
+                            {
+                                "method": "box",
+                                "params": {
+                                    "height": 30,
+                                    "length": 700,
+                                    "width": 1000
+                                }
+                            },
+                            {
+                                "args": [
+                                    ">Z"
+                                ],
+                                "method": "edges"
+                            },
+                            {
+                                "args": [
+                                    8
+                                ],
+                                "method": "fillet"
+                            },
+                            {
+                                "args": [
+                                    "<Z"
+                                ],
+                                "method": "edges"
+                            },
+                            {
+                                "args": [
+                                    8
+                                ],
+                                "method": "fillet"
+                            }
+                        ],
+                        "store_as": "bogie_frame"
+                    }
+                }
+            ]
+        },
+        {
+            "role": "assistant",
+            "content": [
+                {
+                    "type": "text",
+                    "text": "Step 11: Floor Pan"
+                },
+                {
+                    "type": "tool-call",
+                    "toolName": "workplane_api",
+                    "input": {
+                        "init_params": {
+                            "plane": "XY"
+                        },
+                        "operations": [
+                            {
+                                "method": "box",
+                                "params": {
+                                    "height": 20,
+                                    "length": 1500,
+                                    "width": 1100
+                                }
+                            },
+                            {
+                                "args": [
+                                    ">Z"
+                                ],
+                                "method": "edges"
+                            },
+                            {
+                                "args": [
+                                    5
+                                ],
+                                "method": "fillet"
+                            },
+                            {
+                                "args": [
+                                    "<Z"
+                                ],
+                                "method": "edges"
+                            },
+                            {
+                                "args": [
+                                    5
+                                ],
+                                "method": "fillet"
+                            }
+                        ],
+                        "store_as": "floor_pan"
+                    }
+                }
+            ]
+        },
+        {
+            "role": "assistant",
+            "content": [
+                {
+                    "type": "text",
+                    "text": "Step 12: Coupling\n\n"
+                },
+                {
+                    "type": "tool-call",
+                    "toolName": "workplane_api",
+                    "input": {
+                        "init_params": {
+                            "plane": "XY"
+                        },
+                        "operations": [
+                            {
+                                "method": "box",
+                                "params": {
+                                    "height": 80,
+                                    "length": 300,
+                                    "width": 80
+                                }
+                            },
+                            {
+                                "args": [
+                                    "|X"
+                                ],
+                                "method": "edges"
+                            },
+                            {
+                                "args": [
+                                    10
+                                ],
+                                "method": "fillet"
+                            }
+                        ],
+                        "store_as": "coupling"
+                    }
+                }
+            ]
+        },
+        {
+            "role": "assistant",
+            "content": [
+                {
+                    "type": "text",
+                    "text": "Step 13: Rear Panel"
+                },
+                {
+                    "type": "tool-call",
+                    "toolName": "workplane_api",
+                    "input": {
+                        "init_params": {
+                            "plane": "XY"
+                        },
+                        "operations": [
+                            {
+                                "method": "box",
+                                "params": {
+                                    "height": 450,
+                                    "length": 30,
+                                    "width": 1100
+                                }
+                            },
+                            {
+                                "args": [
+                                    "|X"
+                                ],
+                                "method": "edges"
+                            },
+                            {
+                                "args": [
+                                    20
+                                ],
+                                "method": "fillet"
+                            }
+                        ],
+                        "store_as": "rear_panel"
+                    }
+                }
+            ]
+        },
+        {
+            "role": "assistant",
+            "content": [
+                {
+                    "type": "text",
+                    "text": "Step 14: Brake Fin"
+                },
+                {
+                    "type": "tool-call",
+                    "toolName": "workplane_api",
+                    "input": {
+                        "init_params": {
+                            "plane": "XY"
+                        },
+                        "operations": [
+                            {
+                                "method": "box",
+                                "params": {
+                                    "height": 8,
+                                    "length": 1200,
+                                    "width": 80
+                                }
+                            },
+                            {
+                                "args": [
+                                    "|Y"
+                                ],
+                                "method": "edges"
+                            },
+                            {
+                                "args": [
+                                    3
+                                ],
+                                "method": "fillet"
+                            }
+                        ],
+                        "store_as": "brake_fin"
+                    }
+                }
+            ]
+        },
+        {
+            "role": "assistant",
+            "content": [
+                {
+                    "type": "text",
+                    "text": "Step 15: Wheel Cover"
+                },
+                {
+                    "type": "tool-call",
+                    "toolName": "workplane_api",
+                    "input": {
+                        "init_params": {
+                            "plane": "XY"
+                        },
+                        "operations": [
+                            {
+                                "method": "box",
+                                "params": {
+                                    "height": 125,
+                                    "length": 400,
+                                    "width": 500
+                                }
+                            }
+                        ],
+                        "store_as": "wcover"
+                    }
+                }
+            ]
+        },
+        {
+            "role": "assistant",
+            "content": [
+                {
+                    "type": "text",
+                    "text": "Step 16: Grab Rail"
+                },
+                {
+                    "type": "tool-call",
+                    "toolName": "workplane_api",
+                    "input": {
+                        "init_params": {
+                            "plane": "XY"
+                        },
+                        "operations": [
+                            {
+                                "args": [
+                                    15
+                                ],
+                                "method": "circle"
+                            },
+                            {
+                                "args": [
+                                    1200
+                                ],
+                                "method": "extrude"
+                            }
+                        ],
+                        "store_as": "grab_rail"
+                    }
+                }
+            ]
+        },
+        {
+            "role": "assistant",
+            "content": [
+                {
+                    "type": "text",
+                    "text": "Step 17: Axle Rod\n\n"
+                },
+                {
+                    "type": "tool-call",
+                    "toolName": "workplane_api",
+                    "input": {
+                        "init_params": {
+                            "plane": "XY"
+                        },
+                        "operations": [
+                            {
+                                "args": [
+                                    1300,
+                                    22
+                                ],
+                                "method": "cylinder"
+                            }
+                        ],
+                        "store_as": "axle_rod"
+                    }
+                }
+            ]
+        },
+        {
+            "role": "assistant",
+            "content": [
+                {
+                    "type": "text",
+                    "text": "Step 18: C-Bar Path Right"
+                },
+                {
+                    "type": "tool-call",
+                    "toolName": "workplane_api",
+                    "input": {
+                        "init_params": {
+                            "plane": "YZ"
+                        },
+                        "operations": [
+                            {
+                                "args": [
+                                    540,
+                                    30
+                                ],
+                                "method": "moveTo"
+                            },
+                            {
+                                "args": [
+                                    540,
+                                    250
+                                ],
+                                "method": "lineTo"
+                            },
+                            {
+                                "args": [
+                                    600,
+                                    250
+                                ],
+                                "method": "lineTo"
+                            },
+                            {
+                                "args": [
+                                    600,
+                                    30
+                                ],
+                                "method": "lineTo"
+                            },
+                            {
+                                "method": "wire"
+                            }
+                        ],
+                        "store_as": "c_bar_path_R"
+                    }
+                }
+            ]
+        },
+        {
+            "role": "assistant",
+            "content": [
+                {
+                    "type": "text",
+                    "text": "Step 19: C-Bar Path Left"
+                },
+                {
+                    "type": "tool-call",
+                    "toolName": "workplane_api",
+                    "input": {
+                        "init_params": {
+                            "plane": "YZ"
+                        },
+                        "operations": [
+                            {
+                                "args": [
+                                    -540,
+                                    30
+                                ],
+                                "method": "moveTo"
+                            },
+                            {
+                                "args": [
+                                    -540,
+                                    250
+                                ],
+                                "method": "lineTo"
+                            },
+                            {
+                                "args": [
+                                    -600,
+                                    250
+                                ],
+                                "method": "lineTo"
+                            },
+                            {
+                                "args": [
+                                    -600,
+                                    30
+                                ],
+                                "method": "lineTo"
+                            },
+                            {
+                                "method": "wire"
+                            }
+                        ],
+                        "store_as": "c_bar_path_L"
+                    }
+                }
+            ]
+        },
+        {
+            "role": "assistant",
+            "content": [
+                {
+                    "type": "text",
+                    "text": "Step 20: Sweep the C-Bar Right\n\n"
+                },
+                {
+                    "type": "tool-call",
+                    "toolName": "workplane_api",
+                    "input": {
+                        "init_params": {
+                            "plane": "XY"
+                        },
+                        "operations": [
+                            {
+                                "method": "workplane",
+                                "params": {
+                                    "offset": 30
+                                }
+                            },
+                            {
+                                "args": [
+                                    0,
+                                    540
+                                ],
+                                "method": "center"
+                            },
+                            {
+                                "args": [
+                                    8
+                                ],
+                                "method": "circle"
+                            },
+                            {
+                                "args": [
+                                    {
+                                        "_ref": "c_bar_path_R"
+                                    }
+                                ],
+                                "kwargs": {
+                                    "combine": false
+                                },
+                                "method": "sweep"
+                            }
+                        ],
+                        "store_as": "c_bar_R"
+                    }
+                }
+            ]
+        },
+        {
+            "role": "assistant",
+            "content": [
+                {
+                    "type": "text",
+                    "text": "Step 21: Sweep the C-Bar Left"
+                },
+                {
+                    "type": "tool-call",
+                    "toolName": "workplane_api",
+                    "input": {
+                        "init_params": {
+                            "plane": "XY"
+                        },
+                        "operations": [
+                            {
+                                "method": "workplane",
+                                "params": {
+                                    "offset": 30
+                                }
+                            },
+                            {
+                                "args": [
+                                    0,
+                                    -540
+                                ],
+                                "method": "center"
+                            },
+                            {
+                                "args": [
+                                    8
+                                ],
+                                "method": "circle"
+                            },
+                            {
+                                "args": [
+                                    {
+                                        "_ref": "c_bar_path_L"
+                                    }
+                                ],
+                                "kwargs": {
+                                    "combine": false
+                                },
+                                "method": "sweep"
+                            }
+                        ],
+                        "store_as": "c_bar_L"
+                    }
+                }
+            ]
+        },
+        {
+            "role": "assistant",
+            "content": [
+                {
+                    "type": "text",
+                    "text": "Front Car (31 parts)"
+                },
+                {
+                    "type": "tool-call",
+                    "toolName": "assembly_api",
+                    "input": {
+                        "operations": [
+                            {
+                                "method": "add",
+                                "params": {
+                                    "arg": {
+                                        "_ref": "chassis"
+                                    },
+                                    "color": {
+                                        "_type": "Color",
+                                        "name": "gray40"
+                                    },
+                                    "loc": {
+                                        "_type": "Location",
+                                        "x": 0,
+                                        "y": 0,
+                                        "z": 0
+                                    },
+                                    "name": "chassis_F"
+                                }
+                            },
+                            {
+                                "method": "add",
+                                "params": {
+                                    "arg": {
+                                        "_ref": "floor_pan"
+                                    },
+                                    "color": {
+                                        "_type": "Color",
+                                        "name": "gray60"
+                                    },
+                                    "loc": {
+                                        "_type": "Location",
+                                        "x": 0,
+                                        "y": 0,
+                                        "z": -35
+                                    },
+                                    "name": "floor_F"
+                                }
+                            },
+                            {
+                                "method": "add",
+                                "params": {
+                                    "arg": {
+                                        "_ref": "side_fairing"
+                                    },
+                                    "color": {
+                                        "_type": "Color",
+                                        "name": "red"
+                                    },
+                                    "loc": {
+                                        "_type": "Location",
+                                        "x": 0,
+                                        "y": -570,
+                                        "z": 285
+                                    },
+                                    "name": "fairing_L_F"
+                                }
+                            },
+                            {
+                                "method": "add",
+                                "params": {
+                                    "arg": {
+                                        "_ref": "side_fairing"
+                                    },
+                                    "color": {
+                                        "_type": "Color",
+                                        "name": "red"
+                                    },
+                                    "loc": {
+                                        "_type": "Location",
+                                        "x": 0,
+                                        "y": 570,
+                                        "z": 285
+                                    },
+                                    "name": "fairing_R_F"
+                                }
+                            },
+                            {
+                                "method": "add",
+                                "params": {
+                                    "arg": {
+                                        "_ref": "seat"
+                                    },
+                                    "color": {
+                                        "_type": "Color",
+                                        "name": "gray30"
+                                    },
+                                    "loc": {
+                                        "_type": "Location",
+                                        "rz": 90,
+                                        "x": 650,
+                                        "y": -520,
+                                        "z": -35
+                                    },
+                                    "name": "seat_R1L_F"
+                                }
+                            },
+                            {
+                                "method": "add",
+                                "params": {
+                                    "arg": {
+                                        "_ref": "seat"
+                                    },
+                                    "color": {
+                                        "_type": "Color",
+                                        "name": "gray30"
+                                    },
+                                    "loc": {
+                                        "_type": "Location",
+                                        "rz": 90,
+                                        "x": 650,
+                                        "y": 0,
+                                        "z": -35
+                                    },
+                                    "name": "seat_R1R_F"
+                                }
+                            },
+                            {
+                                "method": "add",
+                                "params": {
+                                    "arg": {
+                                        "_ref": "seat"
+                                    },
+                                    "color": {
+                                        "_type": "Color",
+                                        "name": "gray30"
+                                    },
+                                    "loc": {
+                                        "_type": "Location",
+                                        "rz": 90,
+                                        "x": 150,
+                                        "y": -520,
+                                        "z": -35
+                                    },
+                                    "name": "seat_R2L_F"
+                                }
+                            },
+                            {
+                                "method": "add",
+                                "params": {
+                                    "arg": {
+                                        "_ref": "seat"
+                                    },
+                                    "color": {
+                                        "_type": "Color",
+                                        "name": "gray30"
+                                    },
+                                    "loc": {
+                                        "_type": "Location",
+                                        "rz": 90,
+                                        "x": 150,
+                                        "y": 0,
+                                        "z": -35
+                                    },
+                                    "name": "seat_R2R_F"
+                                }
+                            },
+                            {
+                                "method": "add",
+                                "params": {
+                                    "arg": {
+                                        "_ref": "otsr"
+                                    },
+                                    "color": {
+                                        "_type": "Color",
+                                        "name": "gold"
+                                    },
+                                    "loc": {
+                                        "_type": "Location",
+                                        "x": 240,
+                                        "y": -260,
+                                        "z": 172
+                                    },
+                                    "name": "otsr_R1L_F"
+                                }
+                            },
+                            {
+                                "method": "add",
+                                "params": {
+                                    "arg": {
+                                        "_ref": "otsr"
+                                    },
+                                    "color": {
+                                        "_type": "Color",
+                                        "name": "gold"
+                                    },
+                                    "loc": {
+                                        "_type": "Location",
+                                        "x": 240,
+                                        "y": 260,
+                                        "z": 172
+                                    },
+                                    "name": "otsr_R1R_F"
+                                }
+                            },
+                            {
+                                "method": "add",
+                                "params": {
+                                    "arg": {
+                                        "_ref": "otsr"
+                                    },
+                                    "color": {
+                                        "_type": "Color",
+                                        "name": "gold"
+                                    },
+                                    "loc": {
+                                        "_type": "Location",
+                                        "x": -260,
+                                        "y": -260,
+                                        "z": 172
+                                    },
+                                    "name": "otsr_R2L_F"
+                                }
+                            },
+                            {
+                                "method": "add",
+                                "params": {
+                                    "arg": {
+                                        "_ref": "otsr"
+                                    },
+                                    "color": {
+                                        "_type": "Color",
+                                        "name": "gold"
+                                    },
+                                    "loc": {
+                                        "_type": "Location",
+                                        "x": -260,
+                                        "y": 260,
+                                        "z": 172
+                                    },
+                                    "name": "otsr_R2R_F"
+                                }
+                            },
+                            {
+                                "method": "add",
+                                "params": {
+                                    "arg": {
+                                        "_ref": "headrest"
+                                    },
+                                    "color": {
+                                        "_type": "Color",
+                                        "name": "gray50"
+                                    },
+                                    "loc": {
+                                        "_type": "Location",
+                                        "rz": 90,
+                                        "x": 240,
+                                        "y": -260,
+                                        "z": 813
+                                    },
+                                    "name": "head_R1L_F"
+                                }
+                            },
+                            {
+                                "method": "add",
+                                "params": {
+                                    "arg": {
+                                        "_ref": "headrest"
+                                    },
+                                    "color": {
+                                        "_type": "Color",
+                                        "name": "gray50"
+                                    },
+                                    "loc": {
+                                        "_type": "Location",
+                                        "rz": 90,
+                                        "x": 240,
+                                        "y": 260,
+                                        "z": 813
+                                    },
+                                    "name": "head_R1R_F"
+                                }
+                            },
+                            {
+                                "method": "add",
+                                "params": {
+                                    "arg": {
+                                        "_ref": "headrest"
+                                    },
+                                    "color": {
+                                        "_type": "Color",
+                                        "name": "gray50"
+                                    },
+                                    "loc": {
+                                        "_type": "Location",
+                                        "rz": 90,
+                                        "x": -260,
+                                        "y": -260,
+                                        "z": 813
+                                    },
+                                    "name": "head_R2L_F"
+                                }
+                            },
+                            {
+                                "method": "add",
+                                "params": {
+                                    "arg": {
+                                        "_ref": "headrest"
+                                    },
+                                    "color": {
+                                        "_type": "Color",
+                                        "name": "gray50"
+                                    },
+                                    "loc": {
+                                        "_type": "Location",
+                                        "rz": 90,
+                                        "x": -260,
+                                        "y": 260,
+                                        "z": 813
+                                    },
+                                    "name": "head_R2R_F"
+                                }
+                            },
+                            {
+                                "method": "add",
+                                "params": {
+                                    "arg": {
+                                        "_ref": "bogie_frame"
+                                    },
+                                    "color": {
+                                        "_type": "Color",
+                                        "name": "gray40"
+                                    },
+                                    "loc": {
+                                        "_type": "Location",
+                                        "x": 400,
+                                        "y": 0,
+                                        "z": -90
+                                    },
+                                    "name": "bogie_F_F"
+                                }
+                            },
+                            {
+                                "method": "add",
+                                "params": {
+                                    "arg": {
+                                        "_ref": "bogie_frame"
+                                    },
+                                    "color": {
+                                        "_type": "Color",
+                                        "name": "gray40"
+                                    },
+                                    "loc": {
+                                        "_type": "Location",
+                                        "x": -400,
+                                        "y": 0,
+                                        "z": -90
+                                    },
+                                    "name": "bogie_R_F"
+                                }
+                            },
+                            {
+                                "method": "add",
+                                "params": {
+                                    "arg": {
+                                        "_ref": "road_wheel"
+                                    },
+                                    "color": {
+                                        "_type": "Color",
+                                        "name": "darkorange"
+                                    },
+                                    "loc": {
+                                        "_type": "Location",
+                                        "rx": 90,
+                                        "x": 400,
+                                        "y": -575,
+                                        "z": -110
+                                    },
+                                    "name": "wheel_FL_F"
+                                }
+                            },
+                            {
+                                "method": "add",
+                                "params": {
+                                    "arg": {
+                                        "_ref": "road_wheel"
+                                    },
+                                    "color": {
+                                        "_type": "Color",
+                                        "name": "darkorange"
+                                    },
+                                    "loc": {
+                                        "_type": "Location",
+                                        "rx": 90,
+                                        "x": 400,
+                                        "y": 625,
+                                        "z": -110
+                                    },
+                                    "name": "wheel_FR_F"
+                                }
+                            },
+                            {
+                                "method": "add",
+                                "params": {
+                                    "arg": {
+                                        "_ref": "road_wheel"
+                                    },
+                                    "color": {
+                                        "_type": "Color",
+                                        "name": "darkorange"
+                                    },
+                                    "loc": {
+                                        "_type": "Location",
+                                        "rx": 90,
+                                        "x": -400,
+                                        "y": -575,
+                                        "z": -110
+                                    },
+                                    "name": "wheel_RL_F"
+                                }
+                            },
+                            {
+                                "method": "add",
+                                "params": {
+                                    "arg": {
+                                        "_ref": "road_wheel"
+                                    },
+                                    "color": {
+                                        "_type": "Color",
+                                        "name": "darkorange"
+                                    },
+                                    "loc": {
+                                        "_type": "Location",
+                                        "rx": 90,
+                                        "x": -400,
+                                        "y": 625,
+                                        "z": -110
+                                    },
+                                    "name": "wheel_RR_F"
+                                }
+                            },
+                            {
+                                "method": "add",
+                                "params": {
+                                    "arg": {
+                                        "_ref": "wcover"
+                                    },
+                                    "color": {
+                                        "_type": "Color",
+                                        "name": "red"
+                                    },
+                                    "loc": {
+                                        "_type": "Location",
+                                        "x": 400,
+                                        "y": 0,
+                                        "z": -122.5
+                                    },
+                                    "name": "wcover_F_F"
+                                }
+                            },
+                            {
+                                "method": "add",
+                                "params": {
+                                    "arg": {
+                                        "_ref": "wcover"
+                                    },
+                                    "color": {
+                                        "_type": "Color",
+                                        "name": "red"
+                                    },
+                                    "loc": {
+                                        "_type": "Location",
+                                        "x": -400,
+                                        "y": 0,
+                                        "z": -122.5
+                                    },
+                                    "name": "wcover_R_F"
+                                }
+                            },
+                            {
+                                "method": "add",
+                                "params": {
+                                    "arg": {
+                                        "_ref": "nose_cone"
+                                    },
+                                    "color": {
+                                        "_type": "Color",
+                                        "name": "red"
+                                    },
+                                    "loc": {
+                                        "_type": "Location",
+                                        "x": 750,
+                                        "y": 0,
+                                        "z": -60
+                                    },
+                                    "name": "nose_F"
+                                }
+                            },
+                            {
+                                "method": "add",
+                                "params": {
+                                    "arg": {
+                                        "_ref": "grab_rail"
+                                    },
+                                    "color": {
+                                        "_type": "Color",
+                                        "name": "gray80"
+                                    },
+                                    "loc": {
+                                        "_type": "Location",
+                                        "rx": 90,
+                                        "x": 630,
+                                        "y": 600,
+                                        "z": 300
+                                    },
+                                    "name": "grab_R1_F"
+                                }
+                            },
+                            {
+                                "method": "add",
+                                "params": {
+                                    "arg": {
+                                        "_ref": "grab_rail"
+                                    },
+                                    "color": {
+                                        "_type": "Color",
+                                        "name": "gray80"
+                                    },
+                                    "loc": {
+                                        "_type": "Location",
+                                        "rx": 90,
+                                        "x": 150,
+                                        "y": 600,
+                                        "z": 300
+                                    },
+                                    "name": "grab_R2_F"
+                                }
+                            },
+                            {
+                                "method": "add",
+                                "params": {
+                                    "arg": {
+                                        "_ref": "axle_rod"
+                                    },
+                                    "color": {
+                                        "_type": "Color",
+                                        "name": "gray70"
+                                    },
+                                    "loc": {
+                                        "_type": "Location",
+                                        "rx": 90,
+                                        "x": 400,
+                                        "y": 0,
+                                        "z": -110
+                                    },
+                                    "name": "axle_F_F"
+                                }
+                            },
+                            {
+                                "method": "add",
+                                "params": {
+                                    "arg": {
+                                        "_ref": "axle_rod"
+                                    },
+                                    "color": {
+                                        "_type": "Color",
+                                        "name": "gray70"
+                                    },
+                                    "loc": {
+                                        "_type": "Location",
+                                        "rx": 90,
+                                        "x": -400,
+                                        "y": 0,
+                                        "z": -110
+                                    },
+                                    "name": "axle_R_F"
+                                }
+                            },
+                            {
+                                "method": "add",
+                                "params": {
+                                    "arg": {
+                                        "_ref": "c_bar_R"
+                                    },
+                                    "color": {
+                                        "_type": "Color",
+                                        "name": "gray70"
+                                    },
+                                    "loc": {
+                                        "_type": "Location",
+                                        "x": 0,
+                                        "y": 0,
+                                        "z": 0
+                                    },
+                                    "name": "cbar_R_F"
+                                }
+                            },
+                            {
+                                "method": "add",
+                                "params": {
+                                    "arg": {
+                                        "_ref": "c_bar_L"
+                                    },
+                                    "color": {
+                                        "_type": "Color",
+                                        "name": "gray70"
+                                    },
+                                    "loc": {
+                                        "_type": "Location",
+                                        "x": 0,
+                                        "y": 0,
+                                        "z": 0
+                                    },
+                                    "name": "cbar_L_F"
+                                }
+                            },
+                            {
+                                "args": [
+                                    "chassis_F",
+                                    "Fixed"
+                                ],
+                                "method": "constrain"
+                            },
+                            {
+                                "args": [
+                                    "floor_F",
+                                    "Fixed"
+                                ],
+                                "method": "constrain"
+                            },
+                            {
+                                "args": [
+                                    "fairing_L_F",
+                                    "Fixed"
+                                ],
+                                "method": "constrain"
+                            },
+                            {
+                                "args": [
+                                    "fairing_R_F",
+                                    "Fixed"
+                                ],
+                                "method": "constrain"
+                            },
+                            {
+                                "args": [
+                                    "seat_R1L_F",
+                                    "Fixed"
+                                ],
+                                "method": "constrain"
+                            },
+                            {
+                                "args": [
+                                    "seat_R1R_F",
+                                    "Fixed"
+                                ],
+                                "method": "constrain"
+                            },
+                            {
+                                "args": [
+                                    "seat_R2L_F",
+                                    "Fixed"
+                                ],
+                                "method": "constrain"
+                            },
+                            {
+                                "args": [
+                                    "seat_R2R_F",
+                                    "Fixed"
+                                ],
+                                "method": "constrain"
+                            },
+                            {
+                                "args": [
+                                    "otsr_R1L_F",
+                                    "Fixed"
+                                ],
+                                "method": "constrain"
+                            },
+                            {
+                                "args": [
+                                    "otsr_R1R_F",
+                                    "Fixed"
+                                ],
+                                "method": "constrain"
+                            },
+                            {
+                                "args": [
+                                    "otsr_R2L_F",
+                                    "Fixed"
+                                ],
+                                "method": "constrain"
+                            },
+                            {
+                                "args": [
+                                    "otsr_R2R_F",
+                                    "Fixed"
+                                ],
+                                "method": "constrain"
+                            },
+                            {
+                                "args": [
+                                    "head_R1L_F",
+                                    "Fixed"
+                                ],
+                                "method": "constrain"
+                            },
+                            {
+                                "args": [
+                                    "head_R1R_F",
+                                    "Fixed"
+                                ],
+                                "method": "constrain"
+                            },
+                            {
+                                "args": [
+                                    "head_R2L_F",
+                                    "Fixed"
+                                ],
+                                "method": "constrain"
+                            },
+                            {
+                                "args": [
+                                    "head_R2R_F",
+                                    "Fixed"
+                                ],
+                                "method": "constrain"
+                            },
+                            {
+                                "args": [
+                                    "bogie_F_F",
+                                    "Fixed"
+                                ],
+                                "method": "constrain"
+                            },
+                            {
+                                "args": [
+                                    "bogie_R_F",
+                                    "Fixed"
+                                ],
+                                "method": "constrain"
+                            },
+                            {
+                                "args": [
+                                    "wheel_FL_F",
+                                    "Fixed"
+                                ],
+                                "method": "constrain"
+                            },
+                            {
+                                "args": [
+                                    "wheel_FR_F",
+                                    "Fixed"
+                                ],
+                                "method": "constrain"
+                            },
+                            {
+                                "args": [
+                                    "wheel_RL_F",
+                                    "Fixed"
+                                ],
+                                "method": "constrain"
+                            },
+                            {
+                                "args": [
+                                    "wheel_RR_F",
+                                    "Fixed"
+                                ],
+                                "method": "constrain"
+                            },
+                            {
+                                "args": [
+                                    "wcover_F_F",
+                                    "Fixed"
+                                ],
+                                "method": "constrain"
+                            },
+                            {
+                                "args": [
+                                    "wcover_R_F",
+                                    "Fixed"
+                                ],
+                                "method": "constrain"
+                            },
+                            {
+                                "args": [
+                                    "nose_F",
+                                    "Fixed"
+                                ],
+                                "method": "constrain"
+                            },
+                            {
+                                "args": [
+                                    "grab_R1_F",
+                                    "Fixed"
+                                ],
+                                "method": "constrain"
+                            },
+                            {
+                                "args": [
+                                    "grab_R2_F",
+                                    "Fixed"
+                                ],
+                                "method": "constrain"
+                            },
+                            {
+                                "args": [
+                                    "axle_F_F",
+                                    "Fixed"
+                                ],
+                                "method": "constrain"
+                            },
+                            {
+                                "args": [
+                                    "axle_R_F",
+                                    "Fixed"
+                                ],
+                                "method": "constrain"
+                            },
+                            {
+                                "args": [
+                                    "cbar_R_F",
+                                    "Fixed"
+                                ],
+                                "method": "constrain"
+                            },
+                            {
+                                "args": [
+                                    "cbar_L_F",
+                                    "Fixed"
+                                ],
+                                "method": "constrain"
+                            }
+                        ],
+                        "store_as": "coaster_train"
+                    }
+                }
+            ]
+        },
+        {
+            "role": "assistant",
+            "content": [
+                {
+                    "type": "text",
+                    "text": "Middle Car (32 parts including coupling)"
+                },
+                {
+                    "type": "tool-call",
+                    "toolName": "assembly_api",
+                    "input": {
+                        "operations": [
+                            {
+                                "method": "add",
+                                "params": {
+                                    "arg": {
+                                        "_ref": "chassis"
+                                    },
+                                    "color": {
+                                        "_type": "Color",
+                                        "name": "gray40"
+                                    },
+                                    "loc": {
+                                        "_type": "Location",
+                                        "x": -1700,
+                                        "y": 0,
+                                        "z": 0
+                                    },
+                                    "name": "chassis_M"
+                                }
+                            },
+                            {
+                                "method": "add",
+                                "params": {
+                                    "arg": {
+                                        "_ref": "floor_pan"
+                                    },
+                                    "color": {
+                                        "_type": "Color",
+                                        "name": "gray60"
+                                    },
+                                    "loc": {
+                                        "_type": "Location",
+                                        "x": -1700,
+                                        "y": 0,
+                                        "z": -35
+                                    },
+                                    "name": "floor_M"
+                                }
+                            },
+                            {
+                                "method": "add",
+                                "params": {
+                                    "arg": {
+                                        "_ref": "side_fairing"
+                                    },
+                                    "color": {
+                                        "_type": "Color",
+                                        "name": "red"
+                                    },
+                                    "loc": {
+                                        "_type": "Location",
+                                        "x": -1700,
+                                        "y": -570,
+                                        "z": 285
+                                    },
+                                    "name": "fairing_L_M"
+                                }
+                            },
+                            {
+                                "method": "add",
+                                "params": {
+                                    "arg": {
+                                        "_ref": "side_fairing"
+                                    },
+                                    "color": {
+                                        "_type": "Color",
+                                        "name": "red"
+                                    },
+                                    "loc": {
+                                        "_type": "Location",
+                                        "x": -1700,
+                                        "y": 570,
+                                        "z": 285
+                                    },
+                                    "name": "fairing_R_M"
+                                }
+                            },
+                            {
+                                "method": "add",
+                                "params": {
+                                    "arg": {
+                                        "_ref": "seat"
+                                    },
+                                    "color": {
+                                        "_type": "Color",
+                                        "name": "gray30"
+                                    },
+                                    "loc": {
+                                        "_type": "Location",
+                                        "rz": 90,
+                                        "x": -1050,
+                                        "y": -520,
+                                        "z": -35
+                                    },
+                                    "name": "seat_R1L_M"
+                                }
+                            },
+                            {
+                                "method": "add",
+                                "params": {
+                                    "arg": {
+                                        "_ref": "seat"
+                                    },
+                                    "color": {
+                                        "_type": "Color",
+                                        "name": "gray30"
+                                    },
+                                    "loc": {
+                                        "_type": "Location",
+                                        "rz": 90,
+                                        "x": -1050,
+                                        "y": 0,
+                                        "z": -35
+                                    },
+                                    "name": "seat_R1R_M"
+                                }
+                            },
+                            {
+                                "method": "add",
+                                "params": {
+                                    "arg": {
+                                        "_ref": "seat"
+                                    },
+                                    "color": {
+                                        "_type": "Color",
+                                        "name": "gray30"
+                                    },
+                                    "loc": {
+                                        "_type": "Location",
+                                        "rz": 90,
+                                        "x": -1550,
+                                        "y": -520,
+                                        "z": -35
+                                    },
+                                    "name": "seat_R2L_M"
+                                }
+                            },
+                            {
+                                "method": "add",
+                                "params": {
+                                    "arg": {
+                                        "_ref": "seat"
+                                    },
+                                    "color": {
+                                        "_type": "Color",
+                                        "name": "gray30"
+                                    },
+                                    "loc": {
+                                        "_type": "Location",
+                                        "rz": 90,
+                                        "x": -1550,
+                                        "y": 0,
+                                        "z": -35
+                                    },
+                                    "name": "seat_R2R_M"
+                                }
+                            },
+                            {
+                                "method": "add",
+                                "params": {
+                                    "arg": {
+                                        "_ref": "otsr"
+                                    },
+                                    "color": {
+                                        "_type": "Color",
+                                        "name": "gold"
+                                    },
+                                    "loc": {
+                                        "_type": "Location",
+                                        "x": -1460,
+                                        "y": -260,
+                                        "z": 172
+                                    },
+                                    "name": "otsr_R1L_M"
+                                }
+                            },
+                            {
+                                "method": "add",
+                                "params": {
+                                    "arg": {
+                                        "_ref": "otsr"
+                                    },
+                                    "color": {
+                                        "_type": "Color",
+                                        "name": "gold"
+                                    },
+                                    "loc": {
+                                        "_type": "Location",
+                                        "x": -1460,
+                                        "y": 260,
+                                        "z": 172
+                                    },
+                                    "name": "otsr_R1R_M"
+                                }
+                            },
+                            {
+                                "method": "add",
+                                "params": {
+                                    "arg": {
+                                        "_ref": "otsr"
+                                    },
+                                    "color": {
+                                        "_type": "Color",
+                                        "name": "gold"
+                                    },
+                                    "loc": {
+                                        "_type": "Location",
+                                        "x": -1960,
+                                        "y": -260,
+                                        "z": 172
+                                    },
+                                    "name": "otsr_R2L_M"
+                                }
+                            },
+                            {
+                                "method": "add",
+                                "params": {
+                                    "arg": {
+                                        "_ref": "otsr"
+                                    },
+                                    "color": {
+                                        "_type": "Color",
+                                        "name": "gold"
+                                    },
+                                    "loc": {
+                                        "_type": "Location",
+                                        "x": -1960,
+                                        "y": 260,
+                                        "z": 172
+                                    },
+                                    "name": "otsr_R2R_M"
+                                }
+                            },
+                            {
+                                "method": "add",
+                                "params": {
+                                    "arg": {
+                                        "_ref": "headrest"
+                                    },
+                                    "color": {
+                                        "_type": "Color",
+                                        "name": "gray50"
+                                    },
+                                    "loc": {
+                                        "_type": "Location",
+                                        "rz": 90,
+                                        "x": -1460,
+                                        "y": -260,
+                                        "z": 813
+                                    },
+                                    "name": "head_R1L_M"
+                                }
+                            },
+                            {
+                                "method": "add",
+                                "params": {
+                                    "arg": {
+                                        "_ref": "headrest"
+                                    },
+                                    "color": {
+                                        "_type": "Color",
+                                        "name": "gray50"
+                                    },
+                                    "loc": {
+                                        "_type": "Location",
+                                        "rz": 90,
+                                        "x": -1460,
+                                        "y": 260,
+                                        "z": 813
+                                    },
+                                    "name": "head_R1R_M"
+                                }
+                            },
+                            {
+                                "method": "add",
+                                "params": {
+                                    "arg": {
+                                        "_ref": "headrest"
+                                    },
+                                    "color": {
+                                        "_type": "Color",
+                                        "name": "gray50"
+                                    },
+                                    "loc": {
+                                        "_type": "Location",
+                                        "rz": 90,
+                                        "x": -1960,
+                                        "y": -260,
+                                        "z": 813
+                                    },
+                                    "name": "head_R2L_M"
+                                }
+                            },
+                            {
+                                "method": "add",
+                                "params": {
+                                    "arg": {
+                                        "_ref": "headrest"
+                                    },
+                                    "color": {
+                                        "_type": "Color",
+                                        "name": "gray50"
+                                    },
+                                    "loc": {
+                                        "_type": "Location",
+                                        "rz": 90,
+                                        "x": -1960,
+                                        "y": 260,
+                                        "z": 813
+                                    },
+                                    "name": "head_R2R_M"
+                                }
+                            },
+                            {
+                                "method": "add",
+                                "params": {
+                                    "arg": {
+                                        "_ref": "bogie_frame"
+                                    },
+                                    "color": {
+                                        "_type": "Color",
+                                        "name": "gray40"
+                                    },
+                                    "loc": {
+                                        "_type": "Location",
+                                        "x": -1300,
+                                        "y": 0,
+                                        "z": -90
+                                    },
+                                    "name": "bogie_F_M"
+                                }
+                            },
+                            {
+                                "method": "add",
+                                "params": {
+                                    "arg": {
+                                        "_ref": "bogie_frame"
+                                    },
+                                    "color": {
+                                        "_type": "Color",
+                                        "name": "gray40"
+                                    },
+                                    "loc": {
+                                        "_type": "Location",
+                                        "x": -2100,
+                                        "y": 0,
+                                        "z": -90
+                                    },
+                                    "name": "bogie_R_M"
+                                }
+                            },
+                            {
+                                "method": "add",
+                                "params": {
+                                    "arg": {
+                                        "_ref": "road_wheel"
+                                    },
+                                    "color": {
+                                        "_type": "Color",
+                                        "name": "darkorange"
+                                    },
+                                    "loc": {
+                                        "_type": "Location",
+                                        "rx": 90,
+                                        "x": -1300,
+                                        "y": -575,
+                                        "z": -110
+                                    },
+                                    "name": "wheel_FL_M"
+                                }
+                            },
+                            {
+                                "method": "add",
+                                "params": {
+                                    "arg": {
+                                        "_ref": "road_wheel"
+                                    },
+                                    "color": {
+                                        "_type": "Color",
+                                        "name": "darkorange"
+                                    },
+                                    "loc": {
+                                        "_type": "Location",
+                                        "rx": 90,
+                                        "x": -1300,
+                                        "y": 625,
+                                        "z": -110
+                                    },
+                                    "name": "wheel_FR_M"
+                                }
+                            },
+                            {
+                                "method": "add",
+                                "params": {
+                                    "arg": {
+                                        "_ref": "road_wheel"
+                                    },
+                                    "color": {
+                                        "_type": "Color",
+                                        "name": "darkorange"
+                                    },
+                                    "loc": {
+                                        "_type": "Location",
+                                        "rx": 90,
+                                        "x": -2100,
+                                        "y": -575,
+                                        "z": -110
+                                    },
+                                    "name": "wheel_RL_M"
+                                }
+                            },
+                            {
+                                "method": "add",
+                                "params": {
+                                    "arg": {
+                                        "_ref": "road_wheel"
+                                    },
+                                    "color": {
+                                        "_type": "Color",
+                                        "name": "darkorange"
+                                    },
+                                    "loc": {
+                                        "_type": "Location",
+                                        "rx": 90,
+                                        "x": -2100,
+                                        "y": 625,
+                                        "z": -110
+                                    },
+                                    "name": "wheel_RR_M"
+                                }
+                            },
+                            {
+                                "method": "add",
+                                "params": {
+                                    "arg": {
+                                        "_ref": "wcover"
+                                    },
+                                    "color": {
+                                        "_type": "Color",
+                                        "name": "red"
+                                    },
+                                    "loc": {
+                                        "_type": "Location",
+                                        "x": -1300,
+                                        "y": 0,
+                                        "z": -122.5
+                                    },
+                                    "name": "wcover_F_M"
+                                }
+                            },
+                            {
+                                "method": "add",
+                                "params": {
+                                    "arg": {
+                                        "_ref": "wcover"
+                                    },
+                                    "color": {
+                                        "_type": "Color",
+                                        "name": "red"
+                                    },
+                                    "loc": {
+                                        "_type": "Location",
+                                        "x": -2100,
+                                        "y": 0,
+                                        "z": -122.5
+                                    },
+                                    "name": "wcover_R_M"
+                                }
+                            },
+                            {
+                                "method": "add",
+                                "params": {
+                                    "arg": {
+                                        "_ref": "grab_rail"
+                                    },
+                                    "color": {
+                                        "_type": "Color",
+                                        "name": "gray80"
+                                    },
+                                    "loc": {
+                                        "_type": "Location",
+                                        "rx": 90,
+                                        "x": -1070,
+                                        "y": 600,
+                                        "z": 300
+                                    },
+                                    "name": "grab_R1_M"
+                                }
+                            },
+                            {
+                                "method": "add",
+                                "params": {
+                                    "arg": {
+                                        "_ref": "grab_rail"
+                                    },
+                                    "color": {
+                                        "_type": "Color",
+                                        "name": "gray80"
+                                    },
+                                    "loc": {
+                                        "_type": "Location",
+                                        "rx": 90,
+                                        "x": -1550,
+                                        "y": 600,
+                                        "z": 300
+                                    },
+                                    "name": "grab_R2_M"
+                                }
+                            },
+                            {
+                                "method": "add",
+                                "params": {
+                                    "arg": {
+                                        "_ref": "axle_rod"
+                                    },
+                                    "color": {
+                                        "_type": "Color",
+                                        "name": "gray70"
+                                    },
+                                    "loc": {
+                                        "_type": "Location",
+                                        "rx": 90,
+                                        "x": -1300,
+                                        "y": 0,
+                                        "z": -110
+                                    },
+                                    "name": "axle_F_M"
+                                }
+                            },
+                            {
+                                "method": "add",
+                                "params": {
+                                    "arg": {
+                                        "_ref": "axle_rod"
+                                    },
+                                    "color": {
+                                        "_type": "Color",
+                                        "name": "gray70"
+                                    },
+                                    "loc": {
+                                        "_type": "Location",
+                                        "rx": 90,
+                                        "x": -2100,
+                                        "y": 0,
+                                        "z": -110
+                                    },
+                                    "name": "axle_R_M"
+                                }
+                            },
+                            {
+                                "method": "add",
+                                "params": {
+                                    "arg": {
+                                        "_ref": "c_bar_R"
+                                    },
+                                    "color": {
+                                        "_type": "Color",
+                                        "name": "gray70"
+                                    },
+                                    "loc": {
+                                        "_type": "Location",
+                                        "x": -1700,
+                                        "y": 0,
+                                        "z": 0
+                                    },
+                                    "name": "cbar_R_M"
+                                }
+                            },
+                            {
+                                "method": "add",
+                                "params": {
+                                    "arg": {
+                                        "_ref": "c_bar_L"
+                                    },
+                                    "color": {
+                                        "_type": "Color",
+                                        "name": "gray70"
+                                    },
+                                    "loc": {
+                                        "_type": "Location",
+                                        "x": -1700,
+                                        "y": 0,
+                                        "z": 0
+                                    },
+                                    "name": "cbar_L_M"
+                                }
+                            },
+                            {
+                                "method": "add",
+                                "params": {
+                                    "arg": {
+                                        "_ref": "coupling"
+                                    },
+                                    "color": {
+                                        "_type": "Color",
+                                        "name": "gray50"
+                                    },
+                                    "loc": {
+                                        "_type": "Location",
+                                        "x": -850,
+                                        "y": 0,
+                                        "z": -30
+                                    },
+                                    "name": "coupling_1"
+                                }
+                            },
+                            {
+                                "args": [
+                                    "chassis_M",
+                                    "Fixed"
+                                ],
+                                "method": "constrain"
+                            },
+                            {
+                                "args": [
+                                    "floor_M",
+                                    "Fixed"
+                                ],
+                                "method": "constrain"
+                            },
+                            {
+                                "args": [
+                                    "fairing_L_M",
+                                    "Fixed"
+                                ],
+                                "method": "constrain"
+                            },
+                            {
+                                "args": [
+                                    "fairing_R_M",
+                                    "Fixed"
+                                ],
+                                "method": "constrain"
+                            },
+                            {
+                                "args": [
+                                    "seat_R1L_M",
+                                    "Fixed"
+                                ],
+                                "method": "constrain"
+                            },
+                            {
+                                "args": [
+                                    "seat_R1R_M",
+                                    "Fixed"
+                                ],
+                                "method": "constrain"
+                            },
+                            {
+                                "args": [
+                                    "seat_R2L_M",
+                                    "Fixed"
+                                ],
+                                "method": "constrain"
+                            },
+                            {
+                                "args": [
+                                    "seat_R2R_M",
+                                    "Fixed"
+                                ],
+                                "method": "constrain"
+                            },
+                            {
+                                "args": [
+                                    "otsr_R1L_M",
+                                    "Fixed"
+                                ],
+                                "method": "constrain"
+                            },
+                            {
+                                "args": [
+                                    "otsr_R1R_M",
+                                    "Fixed"
+                                ],
+                                "method": "constrain"
+                            },
+                            {
+                                "args": [
+                                    "otsr_R2L_M",
+                                    "Fixed"
+                                ],
+                                "method": "constrain"
+                            },
+                            {
+                                "args": [
+                                    "otsr_R2R_M",
+                                    "Fixed"
+                                ],
+                                "method": "constrain"
+                            },
+                            {
+                                "args": [
+                                    "head_R1L_M",
+                                    "Fixed"
+                                ],
+                                "method": "constrain"
+                            },
+                            {
+                                "args": [
+                                    "head_R1R_M",
+                                    "Fixed"
+                                ],
+                                "method": "constrain"
+                            },
+                            {
+                                "args": [
+                                    "head_R2L_M",
+                                    "Fixed"
+                                ],
+                                "method": "constrain"
+                            },
+                            {
+                                "args": [
+                                    "head_R2R_M",
+                                    "Fixed"
+                                ],
+                                "method": "constrain"
+                            },
+                            {
+                                "args": [
+                                    "bogie_F_M",
+                                    "Fixed"
+                                ],
+                                "method": "constrain"
+                            },
+                            {
+                                "args": [
+                                    "bogie_R_M",
+                                    "Fixed"
+                                ],
+                                "method": "constrain"
+                            },
+                            {
+                                "args": [
+                                    "wheel_FL_M",
+                                    "Fixed"
+                                ],
+                                "method": "constrain"
+                            },
+                            {
+                                "args": [
+                                    "wheel_FR_M",
+                                    "Fixed"
+                                ],
+                                "method": "constrain"
+                            },
+                            {
+                                "args": [
+                                    "wheel_RL_M",
+                                    "Fixed"
+                                ],
+                                "method": "constrain"
+                            },
+                            {
+                                "args": [
+                                    "wheel_RR_M",
+                                    "Fixed"
+                                ],
+                                "method": "constrain"
+                            },
+                            {
+                                "args": [
+                                    "wcover_F_M",
+                                    "Fixed"
+                                ],
+                                "method": "constrain"
+                            },
+                            {
+                                "args": [
+                                    "wcover_R_M",
+                                    "Fixed"
+                                ],
+                                "method": "constrain"
+                            },
+                            {
+                                "args": [
+                                    "grab_R1_M",
+                                    "Fixed"
+                                ],
+                                "method": "constrain"
+                            },
+                            {
+                                "args": [
+                                    "grab_R2_M",
+                                    "Fixed"
+                                ],
+                                "method": "constrain"
+                            },
+                            {
+                                "args": [
+                                    "axle_F_M",
+                                    "Fixed"
+                                ],
+                                "method": "constrain"
+                            },
+                            {
+                                "args": [
+                                    "axle_R_M",
+                                    "Fixed"
+                                ],
+                                "method": "constrain"
+                            },
+                            {
+                                "args": [
+                                    "cbar_R_M",
+                                    "Fixed"
+                                ],
+                                "method": "constrain"
+                            },
+                            {
+                                "args": [
+                                    "cbar_L_M",
+                                    "Fixed"
+                                ],
+                                "method": "constrain"
+                            },
+                            {
+                                "args": [
+                                    "coupling_1",
+                                    "Fixed"
+                                ],
+                                "method": "constrain"
+                            }
+                        ],
+                        "start_from": "coaster_train",
+                        "store_as": "coaster_train"
+                    }
+                }
+            ]
+        },
+        {
+            "role": "assistant",
+            "content": [
+                {
+                    "type": "text",
+                    "text": "Rear Car (33 parts including coupling, rear panel, brake fin + solve)"
+                },
+                {
+                    "type": "tool-call",
+                    "toolName": "assembly_api",
+                    "input": {
+                        "operations": [
+                            {
+                                "method": "add",
+                                "params": {
+                                    "arg": {
+                                        "_ref": "chassis"
+                                    },
+                                    "color": {
+                                        "_type": "Color",
+                                        "name": "gray40"
+                                    },
+                                    "loc": {
+                                        "_type": "Location",
+                                        "x": -3400,
+                                        "y": 0,
+                                        "z": 0
+                                    },
+                                    "name": "chassis_R"
+                                }
+                            },
+                            {
+                                "method": "add",
+                                "params": {
+                                    "arg": {
+                                        "_ref": "floor_pan"
+                                    },
+                                    "color": {
+                                        "_type": "Color",
+                                        "name": "gray60"
+                                    },
+                                    "loc": {
+                                        "_type": "Location",
+                                        "x": -3400,
+                                        "y": 0,
+                                        "z": -35
+                                    },
+                                    "name": "floor_R"
+                                }
+                            },
+                            {
+                                "method": "add",
+                                "params": {
+                                    "arg": {
+                                        "_ref": "side_fairing"
+                                    },
+                                    "color": {
+                                        "_type": "Color",
+                                        "name": "red"
+                                    },
+                                    "loc": {
+                                        "_type": "Location",
+                                        "x": -3400,
+                                        "y": -570,
+                                        "z": 285
+                                    },
+                                    "name": "fairing_L_R"
+                                }
+                            },
+                            {
+                                "method": "add",
+                                "params": {
+                                    "arg": {
+                                        "_ref": "side_fairing"
+                                    },
+                                    "color": {
+                                        "_type": "Color",
+                                        "name": "red"
+                                    },
+                                    "loc": {
+                                        "_type": "Location",
+                                        "x": -3400,
+                                        "y": 570,
+                                        "z": 285
+                                    },
+                                    "name": "fairing_R_R"
+                                }
+                            },
+                            {
+                                "method": "add",
+                                "params": {
+                                    "arg": {
+                                        "_ref": "seat"
+                                    },
+                                    "color": {
+                                        "_type": "Color",
+                                        "name": "gray30"
+                                    },
+                                    "loc": {
+                                        "_type": "Location",
+                                        "rz": 90,
+                                        "x": -2750,
+                                        "y": -520,
+                                        "z": -35
+                                    },
+                                    "name": "seat_R1L_R"
+                                }
+                            },
+                            {
+                                "method": "add",
+                                "params": {
+                                    "arg": {
+                                        "_ref": "seat"
+                                    },
+                                    "color": {
+                                        "_type": "Color",
+                                        "name": "gray30"
+                                    },
+                                    "loc": {
+                                        "_type": "Location",
+                                        "rz": 90,
+                                        "x": -2750,
+                                        "y": 0,
+                                        "z": -35
+                                    },
+                                    "name": "seat_R1R_R"
+                                }
+                            },
+                            {
+                                "method": "add",
+                                "params": {
+                                    "arg": {
+                                        "_ref": "seat"
+                                    },
+                                    "color": {
+                                        "_type": "Color",
+                                        "name": "gray30"
+                                    },
+                                    "loc": {
+                                        "_type": "Location",
+                                        "rz": 90,
+                                        "x": -3250,
+                                        "y": -520,
+                                        "z": -35
+                                    },
+                                    "name": "seat_R2L_R"
+                                }
+                            },
+                            {
+                                "method": "add",
+                                "params": {
+                                    "arg": {
+                                        "_ref": "seat"
+                                    },
+                                    "color": {
+                                        "_type": "Color",
+                                        "name": "gray30"
+                                    },
+                                    "loc": {
+                                        "_type": "Location",
+                                        "rz": 90,
+                                        "x": -3250,
+                                        "y": 0,
+                                        "z": -35
+                                    },
+                                    "name": "seat_R2R_R"
+                                }
+                            },
+                            {
+                                "method": "add",
+                                "params": {
+                                    "arg": {
+                                        "_ref": "otsr"
+                                    },
+                                    "color": {
+                                        "_type": "Color",
+                                        "name": "gold"
+                                    },
+                                    "loc": {
+                                        "_type": "Location",
+                                        "x": -3160,
+                                        "y": -260,
+                                        "z": 172
+                                    },
+                                    "name": "otsr_R1L_R"
+                                }
+                            },
+                            {
+                                "method": "add",
+                                "params": {
+                                    "arg": {
+                                        "_ref": "otsr"
+                                    },
+                                    "color": {
+                                        "_type": "Color",
+                                        "name": "gold"
+                                    },
+                                    "loc": {
+                                        "_type": "Location",
+                                        "x": -3160,
+                                        "y": 260,
+                                        "z": 172
+                                    },
+                                    "name": "otsr_R1R_R"
+                                }
+                            },
+                            {
+                                "method": "add",
+                                "params": {
+                                    "arg": {
+                                        "_ref": "otsr"
+                                    },
+                                    "color": {
+                                        "_type": "Color",
+                                        "name": "gold"
+                                    },
+                                    "loc": {
+                                        "_type": "Location",
+                                        "x": -3660,
+                                        "y": -260,
+                                        "z": 172
+                                    },
+                                    "name": "otsr_R2L_R"
+                                }
+                            },
+                            {
+                                "method": "add",
+                                "params": {
+                                    "arg": {
+                                        "_ref": "otsr"
+                                    },
+                                    "color": {
+                                        "_type": "Color",
+                                        "name": "gold"
+                                    },
+                                    "loc": {
+                                        "_type": "Location",
+                                        "x": -3660,
+                                        "y": 260,
+                                        "z": 172
+                                    },
+                                    "name": "otsr_R2R_R"
+                                }
+                            },
+                            {
+                                "method": "add",
+                                "params": {
+                                    "arg": {
+                                        "_ref": "headrest"
+                                    },
+                                    "color": {
+                                        "_type": "Color",
+                                        "name": "gray50"
+                                    },
+                                    "loc": {
+                                        "_type": "Location",
+                                        "rz": 90,
+                                        "x": -3160,
+                                        "y": -260,
+                                        "z": 813
+                                    },
+                                    "name": "head_R1L_R"
+                                }
+                            },
+                            {
+                                "method": "add",
+                                "params": {
+                                    "arg": {
+                                        "_ref": "headrest"
+                                    },
+                                    "color": {
+                                        "_type": "Color",
+                                        "name": "gray50"
+                                    },
+                                    "loc": {
+                                        "_type": "Location",
+                                        "rz": 90,
+                                        "x": -3160,
+                                        "y": 260,
+                                        "z": 813
+                                    },
+                                    "name": "head_R1R_R"
+                                }
+                            },
+                            {
+                                "method": "add",
+                                "params": {
+                                    "arg": {
+                                        "_ref": "headrest"
+                                    },
+                                    "color": {
+                                        "_type": "Color",
+                                        "name": "gray50"
+                                    },
+                                    "loc": {
+                                        "_type": "Location",
+                                        "rz": 90,
+                                        "x": -3660,
+                                        "y": -260,
+                                        "z": 813
+                                    },
+                                    "name": "head_R2L_R"
+                                }
+                            },
+                            {
+                                "method": "add",
+                                "params": {
+                                    "arg": {
+                                        "_ref": "headrest"
+                                    },
+                                    "color": {
+                                        "_type": "Color",
+                                        "name": "gray50"
+                                    },
+                                    "loc": {
+                                        "_type": "Location",
+                                        "rz": 90,
+                                        "x": -3660,
+                                        "y": 260,
+                                        "z": 813
+                                    },
+                                    "name": "head_R2R_R"
+                                }
+                            },
+                            {
+                                "method": "add",
+                                "params": {
+                                    "arg": {
+                                        "_ref": "bogie_frame"
+                                    },
+                                    "color": {
+                                        "_type": "Color",
+                                        "name": "gray40"
+                                    },
+                                    "loc": {
+                                        "_type": "Location",
+                                        "x": -3000,
+                                        "y": 0,
+                                        "z": -90
+                                    },
+                                    "name": "bogie_F_R"
+                                }
+                            },
+                            {
+                                "method": "add",
+                                "params": {
+                                    "arg": {
+                                        "_ref": "bogie_frame"
+                                    },
+                                    "color": {
+                                        "_type": "Color",
+                                        "name": "gray40"
+                                    },
+                                    "loc": {
+                                        "_type": "Location",
+                                        "x": -3800,
+                                        "y": 0,
+                                        "z": -90
+                                    },
+                                    "name": "bogie_R_R"
+                                }
+                            },
+                            {
+                                "method": "add",
+                                "params": {
+                                    "arg": {
+                                        "_ref": "road_wheel"
+                                    },
+                                    "color": {
+                                        "_type": "Color",
+                                        "name": "darkorange"
+                                    },
+                                    "loc": {
+                                        "_type": "Location",
+                                        "rx": 90,
+                                        "x": -3000,
+                                        "y": -575,
+                                        "z": -110
+                                    },
+                                    "name": "wheel_FL_R"
+                                }
+                            },
+                            {
+                                "method": "add",
+                                "params": {
+                                    "arg": {
+                                        "_ref": "road_wheel"
+                                    },
+                                    "color": {
+                                        "_type": "Color",
+                                        "name": "darkorange"
+                                    },
+                                    "loc": {
+                                        "_type": "Location",
+                                        "rx": 90,
+                                        "x": -3000,
+                                        "y": 625,
+                                        "z": -110
+                                    },
+                                    "name": "wheel_FR_R"
+                                }
+                            },
+                            {
+                                "method": "add",
+                                "params": {
+                                    "arg": {
+                                        "_ref": "road_wheel"
+                                    },
+                                    "color": {
+                                        "_type": "Color",
+                                        "name": "darkorange"
+                                    },
+                                    "loc": {
+                                        "_type": "Location",
+                                        "rx": 90,
+                                        "x": -3800,
+                                        "y": -575,
+                                        "z": -110
+                                    },
+                                    "name": "wheel_RL_R"
+                                }
+                            },
+                            {
+                                "method": "add",
+                                "params": {
+                                    "arg": {
+                                        "_ref": "road_wheel"
+                                    },
+                                    "color": {
+                                        "_type": "Color",
+                                        "name": "darkorange"
+                                    },
+                                    "loc": {
+                                        "_type": "Location",
+                                        "rx": 90,
+                                        "x": -3800,
+                                        "y": 625,
+                                        "z": -110
+                                    },
+                                    "name": "wheel_RR_R"
+                                }
+                            },
+                            {
+                                "method": "add",
+                                "params": {
+                                    "arg": {
+                                        "_ref": "wcover"
+                                    },
+                                    "color": {
+                                        "_type": "Color",
+                                        "name": "red"
+                                    },
+                                    "loc": {
+                                        "_type": "Location",
+                                        "x": -3000,
+                                        "y": 0,
+                                        "z": -122.5
+                                    },
+                                    "name": "wcover_F_R"
+                                }
+                            },
+                            {
+                                "method": "add",
+                                "params": {
+                                    "arg": {
+                                        "_ref": "wcover"
+                                    },
+                                    "color": {
+                                        "_type": "Color",
+                                        "name": "red"
+                                    },
+                                    "loc": {
+                                        "_type": "Location",
+                                        "x": -3800,
+                                        "y": 0,
+                                        "z": -122.5
+                                    },
+                                    "name": "wcover_R_R"
+                                }
+                            },
+                            {
+                                "method": "add",
+                                "params": {
+                                    "arg": {
+                                        "_ref": "grab_rail"
+                                    },
+                                    "color": {
+                                        "_type": "Color",
+                                        "name": "gray80"
+                                    },
+                                    "loc": {
+                                        "_type": "Location",
+                                        "rx": 90,
+                                        "x": -2770,
+                                        "y": 600,
+                                        "z": 300
+                                    },
+                                    "name": "grab_R1_R"
+                                }
+                            },
+                            {
+                                "method": "add",
+                                "params": {
+                                    "arg": {
+                                        "_ref": "grab_rail"
+                                    },
+                                    "color": {
+                                        "_type": "Color",
+                                        "name": "gray80"
+                                    },
+                                    "loc": {
+                                        "_type": "Location",
+                                        "rx": 90,
+                                        "x": -3250,
+                                        "y": 600,
+                                        "z": 300
+                                    },
+                                    "name": "grab_R2_R"
+                                }
+                            },
+                            {
+                                "method": "add",
+                                "params": {
+                                    "arg": {
+                                        "_ref": "axle_rod"
+                                    },
+                                    "color": {
+                                        "_type": "Color",
+                                        "name": "gray70"
+                                    },
+                                    "loc": {
+                                        "_type": "Location",
+                                        "rx": 90,
+                                        "x": -3000,
+                                        "y": 0,
+                                        "z": -110
+                                    },
+                                    "name": "axle_F_R"
+                                }
+                            },
+                            {
+                                "method": "add",
+                                "params": {
+                                    "arg": {
+                                        "_ref": "axle_rod"
+                                    },
+                                    "color": {
+                                        "_type": "Color",
+                                        "name": "gray70"
+                                    },
+                                    "loc": {
+                                        "_type": "Location",
+                                        "rx": 90,
+                                        "x": -3800,
+                                        "y": 0,
+                                        "z": -110
+                                    },
+                                    "name": "axle_R_R"
+                                }
+                            },
+                            {
+                                "method": "add",
+                                "params": {
+                                    "arg": {
+                                        "_ref": "c_bar_R"
+                                    },
+                                    "color": {
+                                        "_type": "Color",
+                                        "name": "gray70"
+                                    },
+                                    "loc": {
+                                        "_type": "Location",
+                                        "x": -3400,
+                                        "y": 0,
+                                        "z": 0
+                                    },
+                                    "name": "cbar_R_R"
+                                }
+                            },
+                            {
+                                "method": "add",
+                                "params": {
+                                    "arg": {
+                                        "_ref": "c_bar_L"
+                                    },
+                                    "color": {
+                                        "_type": "Color",
+                                        "name": "gray70"
+                                    },
+                                    "loc": {
+                                        "_type": "Location",
+                                        "x": -3400,
+                                        "y": 0,
+                                        "z": 0
+                                    },
+                                    "name": "cbar_L_R"
+                                }
+                            },
+                            {
+                                "method": "add",
+                                "params": {
+                                    "arg": {
+                                        "_ref": "rear_panel"
+                                    },
+                                    "color": {
+                                        "_type": "Color",
+                                        "name": "red"
+                                    },
+                                    "loc": {
+                                        "_type": "Location",
+                                        "x": -4150,
+                                        "y": 0,
+                                        "z": 285
+                                    },
+                                    "name": "rear_panel_R"
+                                }
+                            },
+                            {
+                                "method": "add",
+                                "params": {
+                                    "arg": {
+                                        "_ref": "brake_fin"
+                                    },
+                                    "color": {
+                                        "_type": "Color",
+                                        "name": "gray70"
+                                    },
+                                    "loc": {
+                                        "_type": "Location",
+                                        "x": -3400,
+                                        "y": 0,
+                                        "z": -120
+                                    },
+                                    "name": "brake_fin_R"
+                                }
+                            },
+                            {
+                                "method": "add",
+                                "params": {
+                                    "arg": {
+                                        "_ref": "coupling"
+                                    },
+                                    "color": {
+                                        "_type": "Color",
+                                        "name": "gray50"
+                                    },
+                                    "loc": {
+                                        "_type": "Location",
+                                        "x": -2550,
+                                        "y": 0,
+                                        "z": -30
+                                    },
+                                    "name": "coupling_2"
+                                }
+                            },
+                            {
+                                "args": [
+                                    "chassis_R",
+                                    "Fixed"
+                                ],
+                                "method": "constrain"
+                            },
+                            {
+                                "args": [
+                                    "floor_R",
+                                    "Fixed"
+                                ],
+                                "method": "constrain"
+                            },
+                            {
+                                "args": [
+                                    "fairing_L_R",
+                                    "Fixed"
+                                ],
+                                "method": "constrain"
+                            },
+                            {
+                                "args": [
+                                    "fairing_R_R",
+                                    "Fixed"
+                                ],
+                                "method": "constrain"
+                            },
+                            {
+                                "args": [
+                                    "seat_R1L_R",
+                                    "Fixed"
+                                ],
+                                "method": "constrain"
+                            },
+                            {
+                                "args": [
+                                    "seat_R1R_R",
+                                    "Fixed"
+                                ],
+                                "method": "constrain"
+                            },
+                            {
+                                "args": [
+                                    "seat_R2L_R",
+                                    "Fixed"
+                                ],
+                                "method": "constrain"
+                            },
+                            {
+                                "args": [
+                                    "seat_R2R_R",
+                                    "Fixed"
+                                ],
+                                "method": "constrain"
+                            },
+                            {
+                                "args": [
+                                    "otsr_R1L_R",
+                                    "Fixed"
+                                ],
+                                "method": "constrain"
+                            },
+                            {
+                                "args": [
+                                    "otsr_R1R_R",
+                                    "Fixed"
+                                ],
+                                "method": "constrain"
+                            },
+                            {
+                                "args": [
+                                    "otsr_R2L_R",
+                                    "Fixed"
+                                ],
+                                "method": "constrain"
+                            },
+                            {
+                                "args": [
+                                    "otsr_R2R_R",
+                                    "Fixed"
+                                ],
+                                "method": "constrain"
+                            },
+                            {
+                                "args": [
+                                    "head_R1L_R",
+                                    "Fixed"
+                                ],
+                                "method": "constrain"
+                            },
+                            {
+                                "args": [
+                                    "head_R1R_R",
+                                    "Fixed"
+                                ],
+                                "method": "constrain"
+                            },
+                            {
+                                "args": [
+                                    "head_R2L_R",
+                                    "Fixed"
+                                ],
+                                "method": "constrain"
+                            },
+                            {
+                                "args": [
+                                    "head_R2R_R",
+                                    "Fixed"
+                                ],
+                                "method": "constrain"
+                            },
+                            {
+                                "args": [
+                                    "bogie_F_R",
+                                    "Fixed"
+                                ],
+                                "method": "constrain"
+                            },
+                            {
+                                "args": [
+                                    "bogie_R_R",
+                                    "Fixed"
+                                ],
+                                "method": "constrain"
+                            },
+                            {
+                                "args": [
+                                    "wheel_FL_R",
+                                    "Fixed"
+                                ],
+                                "method": "constrain"
+                            },
+                            {
+                                "args": [
+                                    "wheel_FR_R",
+                                    "Fixed"
+                                ],
+                                "method": "constrain"
+                            },
+                            {
+                                "args": [
+                                    "wheel_RL_R",
+                                    "Fixed"
+                                ],
+                                "method": "constrain"
+                            },
+                            {
+                                "args": [
+                                    "wheel_RR_R",
+                                    "Fixed"
+                                ],
+                                "method": "constrain"
+                            },
+                            {
+                                "args": [
+                                    "wcover_F_R",
+                                    "Fixed"
+                                ],
+                                "method": "constrain"
+                            },
+                            {
+                                "args": [
+                                    "wcover_R_R",
+                                    "Fixed"
+                                ],
+                                "method": "constrain"
+                            },
+                            {
+                                "args": [
+                                    "grab_R1_R",
+                                    "Fixed"
+                                ],
+                                "method": "constrain"
+                            },
+                            {
+                                "args": [
+                                    "grab_R2_R",
+                                    "Fixed"
+                                ],
+                                "method": "constrain"
+                            },
+                            {
+                                "args": [
+                                    "axle_F_R",
+                                    "Fixed"
+                                ],
+                                "method": "constrain"
+                            },
+                            {
+                                "args": [
+                                    "axle_R_R",
+                                    "Fixed"
+                                ],
+                                "method": "constrain"
+                            },
+                            {
+                                "args": [
+                                    "cbar_R_R",
+                                    "Fixed"
+                                ],
+                                "method": "constrain"
+                            },
+                            {
+                                "args": [
+                                    "cbar_L_R",
+                                    "Fixed"
+                                ],
+                                "method": "constrain"
+                            },
+                            {
+                                "args": [
+                                    "rear_panel_R",
+                                    "Fixed"
+                                ],
+                                "method": "constrain"
+                            },
+                            {
+                                "args": [
+                                    "brake_fin_R",
+                                    "Fixed"
+                                ],
+                                "method": "constrain"
+                            },
+                            {
+                                "args": [
+                                    "coupling_2",
+                                    "Fixed"
+                                ],
+                                "method": "constrain"
+                            },
+                            {
+                                "method": "solve",
+                                "params": {}
+                            }
+                        ],
+                        "start_from": "coaster_train",
+                        "store_as": "coaster_train"
+                    }
+                }
+            ]
+        },
+        {
+            "role": "assistant",
+            "content": [
+                {
+                    "type": "tool-call",
+                    "toolName": "select_model",
+                    "input": {
+                        "name": "coaster_train"
+                    }
+                }
+            ]
+        }
+
+        IF the user's prompt contains "@francis-turbine", you MUST first run the tool commands mentioned in the "calls" field of the following json to create and LOAD a template turbine:
+        {
+        "description": "Ordered sequence of t2c MCP tool calls that build a complete, practical, fully-sealed Francis turbine assembly from scratch. Run each call in order; 'store_as' names are referenced later via {\"_ref\": name}. Units are millimetres; machine axis is global Z (vertical). Distributor passage spans z=55..150 (95 mm). The runner uses a downward-pointing bullet/ogive crown (hub) with no band: the 13 blades attach to the bullet surface and the shaft embeds into the dome. The scroll casing is a hollow round pipe tapering from the inlet to a capped tongue; its bore opens to the distributor through a constant 95 mm throat slot. The head cover + bottom ring are extended to R366, and a seal wall closes the 47-degree tongue gap so the distributor's outer boundary is fully enclosed. The bottom ring opening matches the draft tube bore (R148) and the draft tube is raised to seal against it. The runner's top opening is closed by a capped hollow-cylinder enclosure, and the inlet penstock carries a bolted outer flange.",
+        "geometry_notes": {
+            "distributor_passage_z": [55, 150],
+            "ring_outer_radius": 366,
+            "volute_mouth_radius": 360,
+            "volute_angular_span_deg": [2, 315],
+            "tongue_gap_deg": [315, 362],
+            "seal_wall": "R358..366, z54..151, arc theta 313..364 (revolve 51 deg then rotate 313 deg about Z); overlaps both rings ~1 mm and both volute ends ~2 deg for a watertight seal",
+            "crown_hub": "Bullet/ogive solid of revolution: nose tip at (r0, z20) pointing down into the draft tube, bulging to ~R175 at the inlet height (z150..160), doming back to (r0, z190). Blade inner edges overlap its surface along z45..150 so they are attached and tilted to follow it. Shaft (R48, z180+) embeds in the dome.",
+            "band": "REMOVED in v4 (the lower conical shroud obstructed inflow and is not used).",
+            "bottom_ring_opening_radius": 148,
+            "draft_tube_top_z": 42,
+            "draft_tube_bore_radius": 148,
+            "inlet_pipe_length": 380,
+            "inlet_flange_bolts": "8 counterbored holes (through-hole d14, counterbore d24 x 10 deep) on a R145 bolt circle in the R113..178 outer flange.",
+            "top_enclosure": "Capped hollow cylinder over the runner's top opening: collar R188..206 (18 mm wall), z175..225 (50 mm tall), capped by a flat lid disk R0..206, z225..240, with an exact R48 shaft hole (no tolerance)."
+        },
+        "calls": [
+            {
+            "step": 1,
+            "tool": "t2c:workplane_api",
+            "comment": "Runner blade camber line: 3D spline (outer-top inlet -> inner-bottom outlet, with tangential lean).",
+            "arguments": {
+                "init_params": {"plane": "XY"},
+                "operations": [
+                {"args": [[[0, 0, 0], [-50, 16, -35], [-100, 6, -75], [-150, -26, -120]]], "method": "spline"}
+                ],
+                "store_as": "blade_path"
+            }
+            },
+            {
+            "step": 2,
+            "tool": "t2c:workplane_api",
+            "comment": "Sweep a thin airfoil lens (ellipse 6 x 32) along the camber path with Frenet framing -> one curved, twisted blade.",
+            "arguments": {
+                "init_params": {"plane": "YZ"},
+                "operations": [
+                {"args": [6, 32], "method": "ellipse"},
+                {"args": [{"_ref": "blade_path"}], "kwargs": {"combine": false, "isFrenet": true}, "method": "sweep"}
+                ],
+                "store_as": "blade0"
+            }
+            },
+            {
+            "step": 3,
+            "tool": "t2c:workplane_api",
+            "comment": "Position the blade at the runner inlet (radius ~180, top ~z150).",
+            "arguments": {
+                "start_from": "blade0",
+                "operations": [{"args": [[180, 0, 150]], "method": "translate"}],
+                "store_as": "blade"
+            }
+            },
+            {
+            "step": 4,
+            "tool": "t2c:workplane_api",
+            "comment": "Pattern the blade into 13 copies about Z (polarArray radius ~0 + rotate is a rotate-copy trick).",
+            "arguments": {
+                "init_params": {"plane": "XY"},
+                "operations": [
+                {"args": [0.001, 0, 360, 13], "kwargs": {"fill": true, "rotate": true}, "method": "polarArray"},
+                {"args": [{"_ref": "blade"}], "kwargs": {"combine": true, "useLocalCoordinates": true}, "method": "eachpoint"}
+                ],
+                "store_as": "runner_blades"
+            }
+            },
+            {
+            "step": 5,
+            "tool": "t2c:workplane_api",
+            "comment": "Runner crown / hub: a downward-pointing bullet (ogive). Nose tip at (0,20) points into the draft tube; body bulges to ~R175 at the inlet height and domes back to (0,190). Blade inner edges attach along its surface (z45..150) and the shaft embeds in the dome.",
+            "arguments": {
+                "init_params": {"plane": "XZ"},
+                "operations": [
+                {"args": [[[0, 20], [30, 45], [60, 75], [95, 105], [135, 132], [170, 150], [175, 160], [140, 175], [70, 186], [0, 190]]], "method": "polyline"},
+                {"method": "close"},
+                {"args": [360], "method": "revolve"}
+                ],
+                "store_as": "crown"
+            }
+            },
+            {
+            "step": 6,
+            "tool": "t2c:workplane_api",
+            "comment": "Vertical drive shaft (cylinder r48, z180..480) rising from and embedded into the crown dome.",
+            "arguments": {
+                "init_params": {"plane": "XY"},
+                "operations": [
+                {"args": [], "kwargs": {"offset": 180}, "method": "workplane"},
+                {"args": [48], "method": "circle"},
+                {"args": [300], "method": "extrude"}
+                ],
+                "store_as": "shaft"
+            }
+            },
+            {
+            "step": 7,
+            "tool": "t2c:workplane_api",
+            "comment": "Single stay vane (fixed airfoil, chord ~radial, slight lean).",
+            "arguments": {
+                "init_params": {"plane": "XY"},
+                "operations": [
+                {"args": [38, 11], "kwargs": {"rotation_angle": 12}, "method": "ellipse"},
+                {"args": [95], "method": "extrude"}
+                ],
+                "store_as": "stay_vane"
+            }
+            },
+            {
+            "step": 8,
+            "tool": "t2c:workplane_api",
+            "comment": "Stay ring: 16 stay vanes patterned at radius 285, lifted to z55..150.",
+            "arguments": {
+                "init_params": {"plane": "XY"},
+                "operations": [
+                {"args": [285, 0, 360, 16], "kwargs": {"fill": true, "rotate": true}, "method": "polarArray"},
+                {"args": [{"_ref": "stay_vane"}], "kwargs": {"combine": true, "useLocalCoordinates": true}, "method": "eachpoint"},
+                {"args": [[0, 0, 55]], "method": "translate"}
+                ],
+                "store_as": "stay_ring"
+            }
+            },
+            {
+            "step": 9,
+            "tool": "t2c:workplane_api",
+            "comment": "Single guide vane (wicket gate): smaller airfoil canted 35 degrees from radial.",
+            "arguments": {
+                "init_params": {"plane": "XY"},
+                "operations": [
+                {"args": [30, 9], "kwargs": {"rotation_angle": 35}, "method": "ellipse"},
+                {"args": [95], "method": "extrude"}
+                ],
+                "store_as": "guide_vane"
+            }
+            },
+            {
+            "step": 10,
+            "tool": "t2c:workplane_api",
+            "comment": "Guide ring: 16 wicket gates patterned at radius 220 (staggered 11.25 deg vs stay vanes), lifted to z55..150.",
+            "arguments": {
+                "init_params": {"plane": "XY"},
+                "operations": [
+                {"args": [220, 11.25, 360, 16], "kwargs": {"fill": true, "rotate": true}, "method": "polarArray"},
+                {"args": [{"_ref": "guide_vane"}], "kwargs": {"combine": true, "useLocalCoordinates": true}, "method": "eachpoint"},
+                {"args": [[0, 0, 55]], "method": "translate"}
+                ],
+                "store_as": "guide_ring"
+            }
+            },
+            {
+            "step": 11,
+            "tool": "t2c:workplane_api",
+            "comment": "Bottom ring (lower distributor cover), annulus r148..366 at z40..55. Inner opening reduced to R148 to match the draft tube bore so flow funnels into the draft tube; outer R366 seals the volute throat.",
+            "arguments": {
+                "init_params": {"plane": "XZ"},
+                "operations": [
+                {"args": [[[148, 40], [366, 40], [366, 55], [148, 55]]], "method": "polyline"},
+                {"method": "close"},
+                {"args": [360], "method": "revolve"}
+                ],
+                "store_as": "bottom_ring"
+            }
+            },
+            {
+            "step": 12,
+            "tool": "t2c:workplane_api",
+            "comment": "Head cover (upper distributor cover), annulus r188..366 at z150..175. Extended to R366 to seal the volute throat.",
+            "arguments": {
+                "init_params": {"plane": "XZ"},
+                "operations": [
+                {"args": [[[188, 150], [366, 150], [366, 168], [188, 175]]], "method": "polyline"},
+                {"method": "close"},
+                {"args": [360], "method": "revolve"}
+                ],
+                "store_as": "head_cover"
+            }
+            },
+            {
+            "step": 13,
+            "tool": "t2c:workplane_api",
+            "comment": "Draft tube: diverging conical diffuser below the runner. Raised 14 mm vs v3 (top rim now z42) so its R148 inner bore seals against the bottom ring (z40..55) with ~2 mm overlap, removing the vertical gap.",
+            "arguments": {
+                "init_params": {"plane": "XZ"},
+                "operations": [
+                {"args": [[[148, 42], [172, -96], [212, -236], [258, -386], [274, -386], [228, -236], [188, -96], [164, 42]]], "method": "polyline"},
+                {"method": "close"},
+                {"args": [360], "method": "revolve"}
+                ],
+                "store_as": "draft_tube"
+            }
+            },
+            {
+            "step": 14,
+            "tool": "t2c:workplane_api",
+            "comment": "Volute section 0 (theta=2 deg, inlet, largest). Circle r135 at center radius 465; innermost point at R=330.",
+            "arguments": {
+                "init_params": {"plane": {"_type": "Plane", "normal": [0.0349, -0.99939, 0], "origin": [0, 0, 0], "xDir": [0.99939, 0.0349, 0]}},
+                "operations": [{"args": [465, 102.5], "method": "moveTo"}, {"args": [135], "method": "circle"}],
+                "store_as": "vsec0"
+            }
+            },
+            {
+            "step": 15,
+            "tool": "t2c:workplane_api",
+            "comment": "Volute section 1 (theta=46.7 deg), circle r123.4 at center radius 453.4.",
+            "arguments": {
+                "init_params": {"plane": {"_type": "Plane", "normal": [0.72752, -0.68608, 0], "origin": [0, 0, 0], "xDir": [0.68608, 0.72752, 0]}},
+                "operations": [{"args": [453.4, 102.5], "method": "moveTo"}, {"args": [123.4], "method": "circle"}],
+                "store_as": "vsec1"
+            }
+            },
+            {
+            "step": 16,
+            "tool": "t2c:workplane_api",
+            "comment": "Volute section 2 (theta=91.4 deg), circle r111.86 at center radius 441.86.",
+            "arguments": {
+                "init_params": {"plane": {"_type": "Plane", "normal": [0.9997, 0.02443, 0], "origin": [0, 0, 0], "xDir": [-0.02443, 0.9997, 0]}},
+                "operations": [{"args": [441.86, 102.5], "method": "moveTo"}, {"args": [111.86], "method": "circle"}],
+                "store_as": "vsec2"
+            }
+            },
+            {
+            "step": 17,
+            "tool": "t2c:workplane_api",
+            "comment": "Volute section 3 (theta=136.1 deg), circle r100.3 at center radius 430.3.",
+            "arguments": {
+                "init_params": {"plane": {"_type": "Plane", "normal": [0.69256, 0.72137, 0], "origin": [0, 0, 0], "xDir": [-0.72137, 0.69256, 0]}},
+                "operations": [{"args": [430.3, 102.5], "method": "moveTo"}, {"args": [100.3], "method": "circle"}],
+                "store_as": "vsec3"
+            }
+            },
+            {
+            "step": 18,
+            "tool": "t2c:workplane_api",
+            "comment": "Volute section 4 (theta=180.9 deg), circle r88.7 at center radius 418.7.",
+            "arguments": {
+                "init_params": {"plane": {"_type": "Plane", "normal": [-0.01571, 0.99988, 0], "origin": [0, 0, 0], "xDir": [-0.99988, -0.01571, 0]}},
+                "operations": [{"args": [418.7, 102.5], "method": "moveTo"}, {"args": [88.7], "method": "circle"}],
+                "store_as": "vsec4"
+            }
+            },
+            {
+            "step": 19,
+            "tool": "t2c:workplane_api",
+            "comment": "Volute section 5 (theta=225.6 deg), circle r77.13 at center radius 407.13.",
+            "arguments": {
+                "init_params": {"plane": {"_type": "Plane", "normal": [-0.71488, 0.69925, 0], "origin": [0, 0, 0], "xDir": [-0.69925, -0.71488, 0]}},
+                "operations": [{"args": [407.13, 102.5], "method": "moveTo"}, {"args": [77.13], "method": "circle"}],
+                "store_as": "vsec5"
+            }
+            },
+            {
+            "step": 20,
+            "tool": "t2c:workplane_api",
+            "comment": "Volute section 6 (theta=270.3 deg), circle r65.57 at center radius 395.57.",
+            "arguments": {
+                "init_params": {"plane": {"_type": "Plane", "normal": [-0.99999, -0.00524, 0], "origin": [0, 0, 0], "xDir": [0.00524, -0.99999, 0]}},
+                "operations": [{"args": [395.57, 102.5], "method": "moveTo"}, {"args": [65.57], "method": "circle"}],
+                "store_as": "vsec6"
+            }
+            },
+            {
+            "step": 21,
+            "tool": "t2c:workplane_api",
+            "comment": "Volute section 7 (theta=315 deg, tongue end, smallest), circle r54 at center radius 384. Clears the inlet.",
+            "arguments": {
+                "init_params": {"plane": {"_type": "Plane", "normal": [-0.70711, -0.70711, 0], "origin": [0, 0, 0], "xDir": [0.70711, -0.70711, 0]}},
+                "operations": [{"args": [384, 102.5], "method": "moveTo"}, {"args": [54], "method": "circle"}],
+                "store_as": "vsec7"
+            }
+            },
+            {
+            "step": 22,
+            "tool": "t2c:workplane_api",
+            "comment": "Loft the 8 tapering circular sections into the solid scroll (~313 deg sweep leaves the tongue/cutwater gap).",
+            "arguments": {
+                "init_params": {"plane": "XY"},
+                "operations": [
+                {"args": [{"_ref": "vsec0"}], "method": "add"},
+                {"args": [{"_ref": "vsec1"}], "method": "add"},
+                {"args": [{"_ref": "vsec2"}], "method": "add"},
+                {"args": [{"_ref": "vsec3"}], "method": "add"},
+                {"args": [{"_ref": "vsec4"}], "method": "add"},
+                {"args": [{"_ref": "vsec5"}], "method": "add"},
+                {"args": [{"_ref": "vsec6"}], "method": "add"},
+                {"args": [{"_ref": "vsec7"}], "method": "add"},
+                {"method": "toPending"},
+                {"args": [], "kwargs": {"combine": false, "ruled": false}, "method": "loft"}
+                ],
+                "store_as": "volute_solid"
+            }
+            },
+            {
+            "step": 23,
+            "tool": "t2c:workplane_api",
+            "comment": "Hollow the scroll into a pipe: select the two planar end caps and shell inward 22 mm.",
+            "arguments": {
+                "start_from": "volute_solid",
+                "operations": [
+                {"args": ["%Plane"], "method": "faces"},
+                {"args": [-22], "method": "shell"}
+                ],
+                "store_as": "volute_hollow"
+            }
+            },
+            {
+            "step": 24,
+            "tool": "t2c:workplane_api",
+            "comment": "Throat slot cutter: revolved ring (R314..360, z55..150) -> opens the bore inner wall to the distributor over the full 95 mm height.",
+            "arguments": {
+                "init_params": {"plane": "XZ"},
+                "operations": [
+                {"args": [[[314, 55], [360, 55], [360, 150], [314, 150]]], "method": "polyline"},
+                {"method": "close"},
+                {"args": [360], "method": "revolve"}
+                ],
+                "store_as": "slot_cutter"
+            }
+            },
+            {
+            "step": 25,
+            "tool": "t2c:workplane_api",
+            "comment": "Cut the throat slot from the hollow pipe -> open scroll mouth. clean=false avoids an OCCT trimmed-surface error.",
+            "arguments": {
+                "start_from": "volute_hollow",
+                "operations": [
+                {"args": [{"_ref": "slot_cutter"}], "kwargs": {"clean": false}, "method": "cut"}
+                ],
+                "store_as": "volute_open"
+            }
+            },
+            {
+            "step": 26,
+            "tool": "t2c:workplane_api",
+            "comment": "Tongue cap: a disk (r54, matching the tongue section outer radius) on the theta=315 radial plane, extruded +-16 mm to plug the open closing end.",
+            "arguments": {
+                "init_params": {"plane": {"_type": "Plane", "normal": [-0.70711, -0.70711, 0], "origin": [0, 0, 0], "xDir": [0.70711, -0.70711, 0]}},
+                "operations": [
+                {"args": [384, 102.5], "method": "moveTo"},
+                {"args": [54], "method": "circle"},
+                {"args": [16], "kwargs": {"both": true}, "method": "extrude"}
+                ],
+                "store_as": "tongue_cap"
+            }
+            },
+            {
+            "step": 27,
+            "tool": "t2c:workplane_api",
+            "comment": "Union the tongue cap onto the open scroll -> final sealed, hollow C-section volute.",
+            "arguments": {
+                "start_from": "volute_open",
+                "operations": [
+                {"args": [{"_ref": "tongue_cap"}], "kwargs": {"clean": false}, "method": "union"}
+                ],
+                "store_as": "volute"
+            }
+            },
+            {
+            "step": 28,
+            "tool": "t2c:workplane_api",
+            "comment": "Seal wall: closes the 47-degree tongue gap. Revolve a thin r-z box (R358..366, z54..151) by 51 deg, then rotate 313 deg about Z so the arc spans theta 313..364 (overlapping both volute ends and both rings).",
+            "arguments": {
+                "init_params": {"plane": "XZ"},
+                "operations": [
+                {"args": [[[358, 54], [366, 54], [366, 151], [358, 151]]], "method": "polyline"},
+                {"method": "close"},
+                {"args": [51], "method": "revolve"},
+                {"args": [[0, 0, 0], [0, 0, 1], 313], "method": "rotate"}
+                ],
+                "store_as": "seal_wall"
+            }
+            },
+            {
+            "step": 29,
+            "tool": "t2c:workplane_api",
+            "comment": "Inlet penstock: hollow flanged pipe (outer r135, bore r113, length 380) built along +Z, with 8 counterbored bolt holes (through d14, counterbore d24 x 10) on a R145 bolt circle in the outer flange; rotated +90 about X to lie along -Y, butted flush against the volute's large opening at (464.7, 18, 102.5). Length increased 80 mm outward vs v3.",
+            "arguments": {
+                "init_params": {"plane": "XY"},
+                "operations": [
+                {"args": [135], "method": "circle"},
+                {"args": [380], "method": "extrude"},
+                {"args": [">Z"], "method": "faces"},
+                {"method": "workplane"},
+                {"args": [178], "method": "circle"},
+                {"args": [28], "method": "extrude"},
+                {"args": ["<Z"], "method": "faces"},
+                {"method": "workplane"},
+                {"args": [113], "method": "circle"},
+                {"method": "cutThruAll"},
+                {"args": [">Z"], "method": "faces"},
+                {"method": "workplane"},
+                {"args": [145, 0, 360, 8], "kwargs": {"fill": true, "rotate": true}, "method": "polarArray"},
+                {"args": [14, 24, 10, 28], "method": "cboreHole"},
+                {"args": [[0, 0, 0], [1, 0, 0], 90], "method": "rotate"},
+                {"args": [[464.7, 18, 102.5]], "method": "translate"}
+                ],
+                "store_as": "inlet"
+            }
+            },
+            {
+            "step": 30,
+            "tool": "t2c:workplane_api",
+            "comment": "Top enclosure collar: hollow cylinder over the runner's top opening. Outer r206, inner r188 (18 mm wall), z175..225 (50 mm tall).",
+            "arguments": {
+                "init_params": {"plane": "XY"},
+                "operations": [
+                {"args": [], "kwargs": {"offset": 175}, "method": "workplane"},
+                {"args": [206], "method": "circle"},
+                {"args": [50], "method": "extrude"},
+                {"args": [">Z"], "method": "faces"},
+                {"method": "workplane"},
+                {"args": [188], "method": "circle"},
+                {"method": "cutThruAll"}
+                ],
+                "store_as": "top_enclosure"
+            }
+            },
+            {
+            "step": 31,
+            "tool": "t2c:workplane_api",
+            "comment": "Top enclosure lid: a flat disk (outer r206, matching the collar's outer radius) at z225..240, with an exact R48 shaft hole (no tolerance, matching the shaft).",
+            "arguments": {
+                "init_params": {"plane": "XY"},
+                "operations": [
+                {"args": [], "kwargs": {"offset": 225}, "method": "workplane"},
+                {"args": [206], "method": "circle"},
+                {"args": [15], "method": "extrude"},
+                {"args": [">Z"], "method": "faces"},
+                {"method": "workplane"},
+                {"args": [48], "method": "circle"},
+                {"method": "cutThruAll"}
+                ],
+                "store_as": "top_disk"
+            }
+            },
+            {
+            "step": 32,
+            "tool": "t2c:workplane_api",
+            "comment": "Union the lid onto the collar -> capped hollow-cylinder enclosure with a central shaft hole.",
+            "arguments": {
+                "start_from": "top_enclosure",
+                "operations": [
+                {"args": [{"_ref": "top_disk"}], "kwargs": {"clean": false}, "method": "union"}
+                ],
+                "store_as": "top_enclosure"
+            }
+            },
+            {
+            "step": 33,
+            "tool": "t2c:assembly_api",
+            "comment": "Assemble all 12 parts (band removed, top_enclosure added). Every part is pre-positioned in global coordinates, so no constraints are needed.",
+            "arguments": {
+                "operations": [
+                {"method": "add", "params": {"arg": {"_ref": "volute"}, "color": {"_type": "Color", "name": "steelblue"}, "name": "volute"}},
+                {"method": "add", "params": {"arg": {"_ref": "inlet"}, "color": {"_type": "Color", "name": "cadetblue"}, "name": "inlet"}},
+                {"method": "add", "params": {"arg": {"_ref": "head_cover"}, "color": {"_type": "Color", "name": "slategray"}, "name": "head_cover"}},
+                {"method": "add", "params": {"arg": {"_ref": "bottom_ring"}, "color": {"_type": "Color", "name": "slategray"}, "name": "bottom_ring"}},
+                {"method": "add", "params": {"arg": {"_ref": "seal_wall"}, "color": {"_type": "Color", "name": "slategray"}, "name": "seal_wall"}},
+                {"method": "add", "params": {"arg": {"_ref": "top_enclosure"}, "color": {"_type": "Color", "name": "slategray"}, "name": "top_enclosure"}},
+                {"method": "add", "params": {"arg": {"_ref": "stay_ring"}, "color": {"_type": "Color", "name": "darkgoldenrod"}, "name": "stay_ring"}},
+                {"method": "add", "params": {"arg": {"_ref": "guide_ring"}, "color": {"_type": "Color", "name": "gold"}, "name": "guide_ring"}},
+                {"method": "add", "params": {"arg": {"_ref": "runner_blades"}, "color": {"_type": "Color", "name": "firebrick"}, "name": "runner_blades"}},
+                {"method": "add", "params": {"arg": {"_ref": "crown"}, "color": {"_type": "Color", "name": "indianred"}, "name": "crown"}},
+                {"method": "add", "params": {"arg": {"_ref": "shaft"}, "color": {"_type": "Color", "name": "gray80"}, "name": "shaft"}},
+                {"method": "add", "params": {"arg": {"_ref": "draft_tube"}, "color": {"_type": "Color", "name": "seagreen"}, "name": "draft_tube"}}
+                ],
+                "store_as": "francis_turbine"
+            }
+            }
+        ]
+        }
     """
     # "Edge", "Wire", "Face", "Shell", "Solid", "Compound", "Shape" - add this once there is a direct_api tool
     
@@ -2100,8 +6997,230 @@ async def query_docs(methods: List[str], cls: Optional[str] = None) -> str:
 
 
 # =============================================================================
+# HTTP ROUTES & AUTH  (only used when MCP_TRANSPORT=http)
+# =============================================================================
+# These run on the same FastMCP app as the streamable-HTTP /mcp endpoint.
+# Auth model: a single shared secret (MCP_TOKEN). The web backend sends it as
+# a Bearer token; the browser never sees it. If MCP_TOKEN is unset (local/dev),
+# requests are allowed so stdio / local testing is unaffected.
+
+def _authorized(request) -> bool:
+    expected = os.environ.get("MCP_TOKEN")
+    if not expected:
+        return True
+    return request.headers.get("authorization") == f"Bearer {expected}"
+
+
+@mcp.custom_route("/health", methods=["GET"])
+async def _health(request):
+    from starlette.responses import JSONResponse
+    return JSONResponse({"status": "ok"})
+
+
+@mcp.custom_route("/clear", methods=["POST"])
+async def _clear(request):
+    """Reset ONE session's object store to a clean slate and re-show the
+    placeholder vertex so its viewer updates. Token-gated. ?session=<id>."""
+    from starlette.responses import JSONResponse
+    if not _authorized(request):
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+    sess = _get_session(request.query_params.get("session"))
+    sess.state.clear()
+    sess.counters.clear()
+    sess.current = None
+    _init_viewer(sess)  # re-show the placeholder (grid + tools) so the viewer stays visible
+    return JSONResponse({"status": "ok"})
+
+
+@mcp.custom_route("/session/export", methods=["GET"])
+async def _session_export(request):
+    """Serialize a session's CAD objects for durable storage. Token-gated.
+    404 when the session has nothing to save."""
+    from starlette.responses import JSONResponse, Response
+    if not _authorized(request):
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+    sess = _get_session(request.query_params.get("session"))
+    if not sess.state:
+        return JSONResponse({"error": "empty"}, status_code=404)
+    try:
+        data = _snapshot(sess)
+    except Exception as e:
+        _log_err(str(e), traceback.format_exc())
+        return JSONResponse({"error": "snapshot failed"}, status_code=500)
+    return Response(data, media_type="application/octet-stream")
+
+
+@mcp.custom_route("/session/import", methods=["POST"])
+async def _session_import(request):
+    """Restore a previously-saved snapshot into a session so the LLM can keep
+    working on models built in an earlier run. Token-gated. Skips if the session
+    already has objects (never clobbers live work)."""
+    from starlette.responses import JSONResponse
+    if not _authorized(request):
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+    sess = _get_session(request.query_params.get("session"))
+    if sess.state:
+        return JSONResponse({"status": "already-loaded"})
+    body = await request.body()
+    if not body:
+        return JSONResponse({"status": "empty"})
+    try:
+        n = _restore_into(sess, body)
+        # Re-tessellate the active model so the viewer shows it immediately.
+        if sess.current and sess.current in sess.state:
+            token = _cur_session.set(sess)
+            try:
+                _show(sess.state[sess.current])
+            finally:
+                _cur_session.reset(token)
+    except Exception as e:
+        _log_err(str(e), traceback.format_exc())
+        return JSONResponse({"error": "restore failed"}, status_code=500)
+    return JSONResponse({"status": "ok", "objects": n})
+
+
+@mcp.custom_route("/export", methods=["GET"])
+async def _export(request):
+    """Export the current stored object so the web backend can serve it as a
+    download. Token-gated. ?fmt=stl|3mf|step|amf|brep (3D), or dxf|svg (2D, sketches
+    only — for laser cutting / plasma / CNC). Default step."""
+    from starlette.responses import JSONResponse, FileResponse
+    if not _authorized(request):
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+    _bind(request.query_params.get("session"))
+    fmt = request.query_params.get("fmt", "step").lower()
+    fmt_map = {
+        "step": ("step", "STEP"), "stp": ("step", "STEP"),
+        "stl":  ("stl",  "STL"),
+        "3mf":  ("3mf",  "3MF"),
+        "amf":  ("amf",  "AMF"),
+        "brep": ("brep", "BREP"),
+        "dxf":  ("dxf",  "DXF"),
+        "svg":  ("svg",  "SVG"),
+    }
+    ext, export_type = fmt_map.get(fmt, ("step", "STEP"))
+    try:
+        obj = _get(None)  # current object
+    except Exception as e:
+        _log_err(str(e), traceback.format_exc())
+        return JSONResponse({"error": _scrub(str(e))}, status_code=404)
+    # DXF/SVG are flat 2D vector formats — only meaningful for a 2D Sketch. A 3D
+    # solid/assembly would just dump a messy projection of all edges, so refuse it.
+    if export_type in ("DXF", "SVG") and not isinstance(obj, Sketch):
+        return JSONResponse(
+            {"error": "DXF/SVG export is only available for 2D sketches"},
+            status_code=400,
+        )
+    import tempfile
+    path = os.path.join(tempfile.gettempdir(), f"model.{ext}")
+    try:
+        if isinstance(obj, Assembly):
+            if export_type == "STEP":
+                # STEP preserves the assembly: part names, colors, hierarchy.
+                obj.export(path, exportType="STEP")
+            else:
+                # Mesh/BREP formats can't hold hierarchy; flatten to a Compound
+                # (parts kept as separate solids, locations applied).
+                cq.exporters.export(obj.toCompound(), path, exportType=export_type)
+        else:
+            # Workplane/Shape/Sketch all expose .val(); Sketch.val() is a Compound.
+            shape = obj.val() if hasattr(obj, "val") else obj
+            cq.exporters.export(shape, path, exportType=export_type)
+    except Exception as e:
+        _log_err(str(e), traceback.format_exc())
+        return JSONResponse({"error": _scrub(f"export failed: {e}")}, status_code=500)
+    return FileResponse(path, filename=f"model.{ext}")
+
+
+@mcp.custom_route("/model", methods=["GET"])
+async def _model(request):
+    from starlette.responses import JSONResponse, Response
+    sess = _get_session(request.query_params.get("session"))
+    if sess.viewer["payload"] is None:
+        return JSONResponse({"error": "no model yet"}, status_code=404)
+    return Response(json.dumps(sess.viewer["payload"]), media_type="application/json")
+
+
+@mcp.custom_route("/version", methods=["GET"])
+async def _version(request):
+    from starlette.responses import JSONResponse
+    sess = _get_session(request.query_params.get("session"))
+    return JSONResponse({"version": sess.viewer["version"],
+                         "obj_type": sess.viewer.get("obj_type")})
+
+
+@mcp.custom_route("/backend", methods=["POST"])
+async def _backend(request):
+    """Measurement tools (distance/properties). The frontend posts viewer
+    state changes (activeTool + selectedShapeIDs); we return the computed
+    backend_response for viewer.handleBackendResponse(). ?session=<id>."""
+    from starlette.responses import JSONResponse
+    mb = _get_session(request.query_params.get("session")).measure_backend
+    if mb is None:
+        return JSONResponse({}, status_code=503)
+    try:
+        changes = await request.json()
+        resp = mb.handle_event(changes, _MessageType.UPDATES)
+    except Exception as e:
+        _log_err(str(e), traceback.format_exc())
+        return JSONResponse({"error": _scrub(str(e))}, status_code=500)
+    return JSONResponse(resp or {})
+
+
+# =============================================================================
 # ENTRY POINT
 # =============================================================================
+# Default transport is stdio (local use + CI unchanged). Set MCP_TRANSPORT=http
+# to serve the streamable-HTTP /mcp endpoint plus /health and /export.
+
+class _AuthASGI:
+    """Pure-ASGI auth wrapper. Gates only the /mcp endpoint; passes everything
+    else (incl. lifespan + streaming) straight through so it never buffers the
+    streamable-HTTP response."""
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope.get("type") == "http" and scope.get("path", "").startswith("/mcp"):
+            headers = dict(scope.get("headers") or [])
+            auth = headers.get(b"authorization", b"").decode()
+            expected = os.environ.get("MCP_TOKEN")
+            if expected and auth != f"Bearer {expected}":
+                from starlette.responses import JSONResponse
+                await JSONResponse({"error": "unauthorized"}, status_code=401)(scope, receive, send)
+                return
+            # No server→client push; 405 the optional inbound SSE so clients skip it.
+            if scope.get("method") == "GET":
+                from starlette.responses import PlainTextResponse
+                await PlainTextResponse("Method Not Allowed", status_code=405)(scope, receive, send)
+                return
+        await self.app(scope, receive, send)
+
+
+def _run_http():
+    import uvicorn, logging
+    # Drop only the benign 405'd inbound-SSE GET /mcp probes; keep 401s etc.
+    class _DropMcpGet(logging.Filter):
+        def filter(self, record):
+            a = record.args
+            return not (a and len(a) >= 5 and a[1] == "GET"
+                        and str(a[2]).startswith("/mcp") and a[4] == 405)
+    logging.getLogger("uvicorn.access").addFilter(_DropMcpGet())
+    # Render injects PORT; fall back to MCP_PORT for manual local runs.
+    mcp.settings.host = os.environ.get("MCP_HOST", "0.0.0.0")
+    mcp.settings.port = int(os.environ.get("PORT", os.environ.get("MCP_PORT", "9000")))
+    app = _AuthASGI(mcp.streamable_http_app())
+    uvicorn.run(app, host=mcp.settings.host, port=mcp.settings.port)
+
 
 if __name__ == "__main__":
-    mcp.run(transport="stdio")
+    if os.environ.get("MCP_TRANSPORT", "stdio") == "http":
+        _VIEWER_MODE = "http"
+        # Each session seeds its own placeholder lazily (see _get_session), so the
+        # viewer is never blank without a global boot-time model.
+        _run_http()
+    else:
+        # stdio: push models to the standalone ocp_vscode viewer (run separately
+        # via `python -m ocp_vscode`) on :3939. No placeholder/init needed.
+        _VIEWER_MODE = "stdio"
+        mcp.run(transport="stdio")

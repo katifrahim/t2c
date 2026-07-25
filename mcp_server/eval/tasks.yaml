@@ -1,0 +1,206 @@
+# deterministic + LLM-judge : npx promptfoo@latest eval -j 1 --no-cache
+# deterministic + human-judge (not tested): npx promptfoo@latest eval -j 1 --grader file://humanjudge.mjs --no-cache
+# viewer: npx promptfoo@latest view
+# -j 1: run tasks one at a time (serial)
+# -o file.json: also write the full results (transcripts, scores, metadata) to a file
+# use "--filter-pattern "<desc quote>" " to run the tests on specific tasks only
+# # `id` names the saved STEP files (artifacts/<model>/<id>.step).
+# `metric` is the capability tested (a leaderboard column)
+
+# Each task = a plain-user prompt (what to make + how it should LOOK) + an rubric for LLM judge
+
+# CONSISTENCY: no separate task — re-run one task a few times and watch the spread:
+#   npx promptfoo@latest eval --repeat 3 --filter-pattern "Pipe tee" -> the filter comes from task description
+
+# 2D sketching & pattern
+- description: Gear — flat 2D profile for laser cutting
+  vars:
+    id: gear
+    instruction: >-
+      Design a flat gear outline to laser-cut from a sheet (a 2D shape, not a solid), about 60 mm across with 20 evenly spaced teeth and a round axle hole in the middle.
+  assert:
+    - type: llm-rubric
+      metric: Sketch2D
+      value: |
+        Score EACH numbered success criterion below as 1 (clearly met) or 0 (not met). The
+        overall score = (criteria met) / (total criteria); pass if that average >= 0.7.
+        1. The result is a flat 2D profile / outline, NOT a 3D solid.
+        2. It is roughly 60 mm across.
+        3. It has about 20 teeth, evenly spaced around the rim.
+        4. There is a round axle hole at the centre.
+
+# Pattern: rectangular array
+- description: LEGO brick — studs array + hollow underside
+  vars:
+    id: lego
+    instruction: >-
+      Make a toy building brick like a 2x4 LEGO: a hollow rectangular block with 8 round studs on top in 2 rows of 4 (~8 mm apart) and a hollow underside that presses onto another brick.
+  assert:
+    - type: llm-rubric
+      metric: Patterns
+      value: |
+        Score EACH numbered success criterion below as 1 (clearly met) or 0 (not met). The
+        overall score = (criteria met) / (total criteria); pass if that average >= 0.7.
+        1. There is a rectangular block body.
+        2. There are exactly 8 round studs on top.
+        3. The studs are in a 2x4 grid at roughly 8 mm spacing.
+        4. The underside is hollowed out (not a solid block).
+
+# Perpendicular placement
+- description: Pipe tee — perpendicular branch orientation
+  vars:
+    id: pipe_tee
+    instruction: >-
+      Make a T-shaped pipe fitting: a straight pipe with a third pipe branching sideways at a right angle from its middle, all three openings hollow, outer width about 30 mm.
+  assert:
+    - type: llm-rubric
+      metric: Spatial
+      value: |
+        Score EACH numbered success criterion below as 1 (clearly met) or 0 (not met). The
+        overall score = (criteria met) / (total criteria); pass if that average >= 0.7.
+        1. There is a straight main pipe plus a branch pipe (a T shape).
+        2. The branch meets the main pipe at about 90°, from its middle.
+        3. All three ends are hollow / open (not solid rods).
+        4. The outer width is roughly 30 mm.
+
+# Math + rotations
+- description: Tilted slab — two ordered rotations in space
+  vars:
+    id: tilted_slab
+    instruction: >-
+      Make a flat rectangular slab and tilt it in space: first spin it 25° anticlockwise while it lies flat, then tip it up 45° anticlockwise from there, resting at that final tilted angle.
+  assert:
+    - type: llm-rubric
+      metric: MathRotation
+      value: |
+        Score EACH numbered success criterion below as 1 (clearly met) or 0 (not met). The
+        overall score = (criteria met) / (total criteria); pass if that average >= 0.7.
+        1. The object is a flat rectangular slab.
+        2. A first rotation of 25° anticlockwise about the vertical axis is applied (while flat).
+        3. A second rotation of 45° anticlockwise, tipping it up about a horizontal axis, is applied AFTER the first.
+        4. The final orientation is tilted in all three axes (its bounding box is not axis-aligned), consistent with both rotations in that order.
+
+# Multi-part: movable joint
+- description: Door hinge — pivoting leaves with mount holes
+  vars:
+    id: hinge
+    instruction: >-
+      Make a door hinge about 80 mm tall that can open and close: two flat leaves joined by a pin down the middle, shown slightly open, each leaf with a couple of screw holes.
+  assert:
+    - type: llm-rubric
+      metric: MovableJoint
+      value: |
+        Score EACH numbered success criterion below as 1 (clearly met) or 0 (not met). The
+        overall score = (criteria met) / (total criteria); pass if that average >= 0.7.
+        1. There are two separate leaves (distinct parts, not one fused solid).
+        2. A central pin runs down the middle that both leaves share as their pivot axis.
+        3. The hinge is shown slightly open (the two leaves at an angle, not coplanar).
+        4. Each leaf has mounting holes.
+        5. It is roughly 80 mm tall.
+
+# Multi-part: assembly placement
+- description: Toy car — wheels on axles, hood, cabin with windows
+  vars:
+    id: toy_car
+    instruction: >-
+      Make a toy car with a body, a raised hood at the front and a cabin behind it with side windows, four round wheels, and the wheels on each side joined by an axle under the body.
+  assert:
+    - type: llm-rubric
+      metric: AssemblyPlacement
+      value: |
+        Score EACH numbered success criterion below as 1 (clearly met) or 0 (not met). The
+        overall score = (criteria met) / (total criteria); pass if that average >= 0.7.
+        1. There is a car body.
+        2. There is a raised hood at the front, lower than the cabin.
+        3. There is a cabin with windows on its sides.
+        4. There are exactly four round wheels near the four corners, with axles horizontal (across the car).
+        5. There are two axles, each joining the left and right wheels of one pair, under the body.
+
+# Multi-part: integration of different part types
+- description: Windsor chair — seat, splayed legs, spindle back
+  vars:
+    id: windsor_chair
+    instruction: >-
+      Make a Windsor-style dining chair: a solid seat, four legs splayed outward underneath, and a back of several thin vertical spindles rising into a curved top rail.
+  assert:
+    - type: llm-rubric
+      metric: MultiPartIntegration
+      value: |
+        Score EACH numbered success criterion below as 1 (clearly met) or 0 (not met). The
+        overall score = (criteria met) / (total criteria); pass if that average >= 0.7.
+        1. There is a seat.
+        2. There are four legs that splay outward (angled, not straight vertical) under the seat.
+        3. There are several thin vertical spindles rising from the back of the seat.
+        4. There is a curved top rail connecting the tops of the spindles.
+
+# Pattern: polar array
+- description: Alloy wheel — five spokes, hub, bolt circle
+  vars:
+    id: alloy_wheel
+    instruction: >-
+      Design a five-spoke alloy car wheel: a round outer rim with five spokes reaching in to a centre hub, and five bolt holes in a circle around the hub.
+  assert:
+    - type: llm-rubric
+      metric: PolarArray
+      value: |
+        Score EACH numbered success criterion below as 1 (clearly met) or 0 (not met). The
+        overall score = (criteria met) / (total criteria); pass if that average >= 0.7.
+        1. There is a round outer rim ring.
+        2. There are exactly five spokes, evenly spaced, connecting the rim to a central hub.
+        3. There is a central hub.
+        4. There are five bolt holes arranged in a circle around the hub.
+
+# Curved geometry
+- description: Pump impeller — six curved, twisting blades
+  vars:
+    id: impeller
+    instruction: >-
+      Make a water-pump impeller: a central round hub with 6 curved blades that spiral outward and twist as they go, evenly spaced around the hub.
+  assert:
+    - type: llm-rubric
+      metric: CurvedGeometry
+      value: |
+        Score EACH numbered success criterion below as 1 (clearly met) or 0 (not met). The
+        overall score = (criteria met) / (total criteria); pass if that average >= 0.7.
+        1. There is a central round hub.
+        2. There are exactly 6 blades around the hub, evenly spaced.
+        3. The blades are curved / twisting (not flat straight fins).
+
+# Twisted geometry + taper
+- description: Hexagonal vase — twisting, tapering, hollow
+  vars:
+    id: hex_vase
+    instruction: >-
+      Make a hexagonal flower vase that twists as it rises, hollow with an open top, its closed base twice as wide as the top opening.
+  assert:
+    - type: llm-rubric
+      metric: TwistTaper
+      value: |
+        Score EACH numbered success criterion below as 1 (clearly met) or 0 (not met). The
+        overall score = (criteria met) / (total criteria); pass if that average >= 0.7.
+        1. The body is six-sided (hexagonal).
+        2. It visibly twists from bottom to top.
+        3. It is hollow inside, with an open top and a closed bottom.
+        4. It tapers so the base is roughly twice as wide as the top opening.
+
+# Colors
+- description: Toy house — features + per-part colours
+  vars:
+    id: toy_house
+    instruction: >-
+      Make a small toy house, hollow inside: four walls with a triangular roof, a chimney, a front door, two front windows and one window on each side; walls peach, roof red, chimney grey.
+  assert:
+    - type: llm-rubric
+      metric: PartColours
+      value: |
+        Score EACH numbered success criterion below as 1 (clearly met) or 0 (not met). The
+        overall score = (criteria met) / (total criteria); pass if that average >= 0.7.
+        1. There is a house body of four walls, hollow (empty) inside.
+        2. There is a triangular roof on top.
+        3. There is a chimney on the roof.
+        4. There is a door on the front.
+        5. There are two windows on the front.
+        6. There is one window on each side (two side windows total).
+        7. The walls / house body are coloured peach.
+        8. The roof is coloured red.
+        9. The chimney is coloured grey.
