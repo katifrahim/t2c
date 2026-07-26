@@ -53,7 +53,13 @@ export default function LoginPage() {
         router.push("/");
         router.refresh();
       } else if (mode === "signup") {
-        const { data, error } = await supabase.auth.signUp({ email, password });
+        const { data, error } = await supabase.auth.signUp({
+          email,
+          password,
+          // Route the confirmation link through /auth/callback so the PKCE code is
+          // exchanged for a session (auto-login), landing the user in the app.
+          options: { emailRedirectTo: `${window.location.origin}/auth/callback?next=/` },
+        });
         if (error) return setError(error.message);
         if (!data.session) {
           setNotice("Check your email to confirm your account, then sign in.");
