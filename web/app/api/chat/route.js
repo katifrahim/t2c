@@ -318,7 +318,10 @@ export async function POST(req) {
       .maybeSingle();
     creditsRemaining = bal?.credits_remaining ?? null;
     if (creditsRemaining != null && creditsRemaining < MIN_RESERVE) {
-      return noticeResponse("**You're out of credits.**");
+      // Render as a markdown blockquote: the chat styles it as a calm, muted
+      // callout (thin left bar + gray text) — distinct from a normal reply without
+      // shouting. Two trailing spaces = a hard line break so line 2 sits under line 1.
+      return noticeResponse("> You're out of credits.  \n> Reach out to get more.");
     }
   }
 
