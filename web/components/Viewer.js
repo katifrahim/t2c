@@ -2,6 +2,7 @@
 import { useEffect, useRef, useState } from "react";
 import { LoaderIcon } from "lucide-react";
 import { useSessionStore } from "@/lib/session-store";
+import { useViewerThemeStore } from "@/lib/viewer-theme-store";
 
 // Ported verbatim from ocp_vscode's viewer.html so the look/toolbar (studio
 // background, zebra/measure/explode tools, etc.) match the standalone viewer.
@@ -34,7 +35,7 @@ const minWidth = 450;
 const renderOptionKeys = ["ambient_intensity", "direct_intensity", "metalness", "roughness", "default_edgecolor", "default_opacity", "normal_len"];
 const viewerOptionKeys = ["axes", "axes0", "black_edges", "grid", "collapse", "ortho", "ticks", "center_grid", "grid_font_size", "timeit", "tools", "glass", "up", "transparent", "control", "pan_speed", "zoom_speed", "rotate_speed", "clip_slider_0", "clip_slider_1", "clip_slider_2", "clip_normal_0", "clip_normal_1", "clip_normal_2", "clip_intersection", "clip_planes", "clip_object_colors", "zebra_count", "zebra_opacity", "zebra_direction", "zebra_color_scheme", "zebra_mapping_mode", "studio_environment", "studio_env_intensity", "studio_env_rotation", "studio_background", "studio_tone_mapping", "studio_exposure", "studio_shadow_intensity", "studio_shadow_softness", "studio_ao_intensity", "studio_texture_mapping", "studio_4k_env_maps"];
 
-function getDisplayOptions(config, w, h) {
+function getDisplayOptions(config, w, h, theme) {
   const glass = preset(config, "glass", displayDefaultOptions.glass);
   const tools = preset(config, "tools", displayDefaultOptions.tools);
   const treeWidth = preset(config, "tree_width", displayDefaultOptions.treeWidth);
@@ -43,7 +44,7 @@ function getDisplayOptions(config, w, h) {
     glass, treeWidth, tools,
     cadWidth: Math.max(minWidth - tw, w - tw - 20),
     height: h - 65,
-    theme: config?.theme || displayDefaultOptions.theme,
+    theme: theme || config?.theme || displayDefaultOptions.theme,
     keymap: preset(config, "modifier_keys", displayDefaultOptions.keymap),
     newTreeBehavior: preset(config, "new_tree_behavior", viewerDefaultOptions.newTreeBehavior),
     measureTools: displayDefaultOptions.measureTools,
@@ -88,6 +89,28 @@ export default function Viewer() {
   // Blank white until the backend/MCP server delivers the first model; show a
   // loader in the viewer area until then.
   const [hasModel, setHasModel] = useState(false);
+  // Light/dark background of the 3D scene (three-cad-viewer's own theme). The
+  // toggle lives in the chat top bar; we read/apply it via a shared store.
+  const theme = useViewerThemeStore((s) => s.theme);
+  const setTheme = useViewerThemeStore((s) => s.setTheme);
+  const themeRef = useRef(theme);
+
+  useEffect(() => {
+    const saved = localStorage.getItem("tcv-theme");
+    if (saved === "dark" || saved === "light") {
+      setTheme(saved);
+    } else if (window.matchMedia?.("(prefers-color-scheme: dark)").matches) {
+      // No saved choice: follow the OS like main's "browser" default did, so the
+      // viewer background (and part contrast) matches what it was before.
+      setTheme("dark");
+    }
+  }, [setTheme]);
+
+  // Apply theme changes to the live viewer without a rebuild (keeps the camera).
+  useEffect(() => {
+    themeRef.current = theme;
+    try { ref.current.viewer?.setTheme(theme); } catch {}
+  }, [theme]);
 
   // On chat/session switch: keep the current scene on screen (no blanking) and
   // force the next poll to re-render this session's model — or its placeholder
@@ -151,7 +174,7 @@ export default function Viewer() {
       const config = payload.config || {};
       const w = container.clientWidth || 800;
       const h = container.clientHeight || 600;
-      const displayOptions = getDisplayOptions(config, w, h);
+      const displayOptions = getDisplayOptions(config, w, h, themeRef.current);
       const renderOptions = buildOptions(renderOptionKeys, config, renderDefaultOptions);
       const viewerOptions = buildOptions(viewerOptionKeys, config, viewerDefaultOptions);
 
@@ -201,7 +224,7 @@ export default function Viewer() {
       const config = (ref.current.payload && ref.current.payload.config) || {};
       const w = container.clientWidth || 800;
       const h = container.clientHeight || 600;
-      const d = getDisplayOptions(config, w, h);
+      const d = getDisplayOptions(config, w, h, themeRef.current);
       try {
         viewer.resizeCadView(d.cadWidth, d.treeWidth, d.height, d.glass);
         if (viewer.gridHelper) {
@@ -239,6 +262,7 @@ export default function Viewer() {
           background: "var(--tcv-bg-color)",
         }}
       />
+
       {!hasModel && (
         <div
           style={{

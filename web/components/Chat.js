@@ -7,7 +7,7 @@ import {
   useAui,
   useAuiState,
 } from "@assistant-ui/react";
-import { MenuIcon, PlusIcon, DownloadIcon, LogOutIcon, Trash2Icon } from "lucide-react";
+import { MenuIcon, PlusIcon, DownloadIcon, LogOutIcon, Trash2Icon, MoonIcon, SunIcon } from "lucide-react";
 import {
   TooltipProvider,
   Tooltip,
@@ -29,6 +29,7 @@ import ChatProvider from "@/components/ChatProvider";
 import { MODELS } from "@/lib/models";
 import { useModelStore } from "@/lib/model-store";
 import { useSessionStore } from "@/lib/session-store";
+import { useViewerThemeStore } from "@/lib/viewer-theme-store";
 import { createClient, SUPABASE_CONFIGURED } from "@/lib/supabase/client";
 
 const EXPORT_FORMATS = [
@@ -101,6 +102,8 @@ function TopBar({ onToggleHistory, historyOpen }) {
   const model = useModelStore((s) => s.model);
   const setModel = useModelStore((s) => s.setModel);
   const sessionId = useSessionStore((s) => s.sessionId);
+  const viewerTheme = useViewerThemeStore((s) => s.theme);
+  const toggleViewerTheme = useViewerThemeStore((s) => s.toggleTheme);
   const runtime = useAssistantRuntime();
   const aui = useAui();
 
@@ -171,6 +174,10 @@ function TopBar({ onToggleHistory, historyOpen }) {
         <PlusIcon size={16} />
       </TopBarButton>
 
+      <TopBarButton tooltip="Viewer theme" onClick={toggleViewerTheme}>
+        {viewerTheme === "dark" ? <SunIcon size={16} /> : <MoonIcon size={16} />}
+      </TopBarButton>
+
       <div style={{ position: "relative" }}>
         <TopBarButton tooltip="Download model" onClick={openDownloadMenu} active={menuOpen}>
           <DownloadIcon size={16} />
@@ -211,12 +218,8 @@ function TopBar({ onToggleHistory, historyOpen }) {
             </AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter>
-            <AlertDialogCancel className="cursor-pointer">Cancel</AlertDialogCancel>
-            <AlertDialogAction
-              variant="outline"
-              onClick={signOut}
-              className="cursor-pointer hover:border-destructive/40 hover:bg-destructive/10 hover:text-destructive"
-            >
+            <AlertDialogCancel className="h-10">Cancel</AlertDialogCancel>
+            <AlertDialogAction onClick={signOut} className="h-10">
               Sign out
             </AlertDialogAction>
           </AlertDialogFooter>
