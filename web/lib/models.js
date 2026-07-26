@@ -18,9 +18,9 @@ export const MODELS = [
   { id: "z-ai/glm-5.2", label: "GLM-5.2 (Best + Expensive)", context: 1048576 },
   { id: "openai/gpt-oss-120b", label: "GPT-OSS 120B (Good)", context: 131072 }, // Ctx window: 131k toks
   // Vision-capable (accept image input) — verified against live /api/v1/models.
-  { id: "xiaomi/mimo-v2.5", label: "Xiaomi Mimo V2.5 (Decent)", context: 1048576, vision: true }, // Ctx window: 1m toks
-  { id: "qwen/qwen3.5-flash-02-23", label: "Qwen3.5 Flash (Fast + Vision)", context: 1000000, vision: true }, // Ctx window: 1m toks
-  { id: "google/gemini-3.1-flash-lite", label: "Gemini 3.1 Flash (Strong + Vision)", context: 1048576, vision: true }, // Ctx window: 1m toks
+  { id: "xiaomi/mimo-v2.5", label: "Xiaomi Mimo V2.5 (Decent + Vision)", context: 1048576, vision: true }, // Ctx window: 1m toks
+  { id: "google/gemini-2.5-flash", label: "Gemini 2.5 Flash (Strong + Vision)", context: 1048576, vision: true }, // Ctx window: 1m toks
+  { id: "openai/gpt-5-mini", label: "GPT-5 Mini (Fast + Vision)", context: 400000, vision: true }, // Ctx window: 400k toks
 ];
 
 // Default: DeepSeek V4 Flash — cheap and a 1M-token context so long/complex
@@ -33,8 +33,8 @@ export const MODEL_PRICING = {
   "openai/gpt-oss-120b": { input: 0.03e-6, output: 0.15e-6 },
   "deepseek/deepseek-v4-flash": { input: 0.09e-6, output: 0.18e-6 },
   "xiaomi/mimo-v2.5": { input: 0.105e-6, output: 0.28e-6 },
-  "qwen/qwen3.5-flash-02-23": { input: 0.07e-6, output: 0.26e-6 },
-  "google/gemini-3.1-flash-lite": { input: 0.25e-6, output: 1.5e-6 },
+  "google/gemini-2.5-flash": { input: 0.3e-6, output: 2.5e-6 },
+  "openai/gpt-5-mini": { input: 0.25e-6, output: 2.0e-6 },
 };
 
 // 1 credit = $0.001, so $2.50 of usage → 2500 credits.

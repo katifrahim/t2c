@@ -164,7 +164,7 @@ function TopBar({ onToggleHistory, historyOpen }) {
               onMouseLeave={(e) => (e.currentTarget.style.borderColor = "#e0e0e0")}
             >
               {MODELS.map((m) => (
-                <option key={m.id} value={m.id}>{m.vision ? `${m.label} 👁` : m.label}</option>
+                <option key={m.id} value={m.id}>{m.label}</option>
               ))}
             </select>
           }

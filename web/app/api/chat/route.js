@@ -300,7 +300,7 @@ function friendlyError(e) {
   // Backstop for a "vision" model whose routed provider still refuses the image
   // (the pre-send guard catches the common text-only case).
   if (low.includes("image") && (low.includes("not support") || low.includes("modalit") || low.includes("no endpoints")))
-    return "This model can't read images. Please switch to a vision-capable model (marked 👁) and try again.";
+    return "This model can't read images. Please switch to a model labeled \"Vision\" and try again.";
   return raw;
 }
 
@@ -355,7 +355,7 @@ export async function POST(req) {
   const selectedModel = model || DEFAULT_MODEL;
   if (!MODELS.find((m) => m.id === selectedModel)?.vision && hasImagePart(messages)) {
     return noticeResponse(
-      "This model can't read images. Please switch to a vision-capable model (marked 👁) and try again.",
+      "This model can't read images. Please switch to a model labeled \"Vision\" and try again.",
     );
   }
 
