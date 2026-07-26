@@ -5,6 +5,8 @@ import { create } from "zustand";
 // separate trees.
 export const useViewerThemeStore = create((set) => ({
   theme: "light",
+  // Init-only (restore from storage / OS default); does NOT persist. Use
+  // toggleTheme for user actions so the choice is written to localStorage.
   setTheme: (theme) => set({ theme }),
   toggleTheme: () =>
     set((s) => {

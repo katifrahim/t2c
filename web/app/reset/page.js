@@ -1,5 +1,5 @@
 "use client";
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import Link from "next/link";
 import { EyeIcon, EyeOffIcon, Loader2Icon } from "lucide-react";
@@ -21,7 +21,11 @@ const GRID = {
 // useless, so we gate the form on that session existing.
 export default function ResetPage() {
   const router = useRouter();
-  const supabase = useMemo(() => createClient(), []);
+  // Create the browser client exactly once (useRef, not useMemo — useMemo may
+  // re-run its factory, which we must not do for a stateful client).
+  const supabaseRef = useRef(null);
+  if (!supabaseRef.current) supabaseRef.current = createClient();
+  const supabase = supabaseRef.current;
   const [ready, setReady] = useState(null); // null = checking, true = valid link, false = no session
   const [password, setPassword] = useState("");
   const [showPassword, setShowPassword] = useState(false);

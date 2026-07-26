@@ -28,16 +28,14 @@ export default function Landing() {
           Turn plain text into 3D CAD models
         </h1>
 
-        <p className="max-w-[24rem] text-base text-pretty text-foreground/65">
-          Describe a part in words and watch it come to life.
-          Ready for 3D printing, CNC, laser cutting & more.
-          <br />
-          <br/>
-          No modelling knowledge required.
-          <br />
-          <br />
-          100% Free!
-        </p>
+        <div className="flex max-w-[24rem] flex-col gap-4 text-base text-pretty text-foreground/65">
+          <p>
+            Describe a part in words and watch it come to life.
+            Ready for 3D printing, CNC, laser cutting & more.
+          </p>
+          <p>No modelling knowledge required.</p>
+          <p>100% Free!</p>
+        </div>
 
         <Link
           href="/login"

@@ -46,8 +46,9 @@ export async function updateSession(request) {
     url.pathname = "/login";
     return NextResponse.redirect(url);
   }
-  // Already signed in but on /login → send to the app.
-  if (loggedIn && onLogin) {
+  // Already signed in but on /login or /reset → the reset form is meaningless
+  // with an active (non-recovery) session, so send both to the app.
+  if (loggedIn && (onLogin || onReset)) {
     const url = request.nextUrl.clone();
     url.pathname = "/";
     return NextResponse.redirect(url);
