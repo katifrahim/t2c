@@ -318,7 +318,7 @@ export async function POST(req) {
       .maybeSingle();
     creditsRemaining = bal?.credits_remaining ?? null;
     if (creditsRemaining != null && creditsRemaining < MIN_RESERVE) {
-      return noticeResponse("You're out of credits.");
+      return noticeResponse("**You're out of credits.**");
     }
   }
 
