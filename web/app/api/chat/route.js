@@ -263,6 +263,23 @@ function errorMessage(e) {
   return e.error?.message ?? e.message ?? JSON.stringify(e);
 }
 
+// User-facing version of an error. OpenRouter/upstream failures (rate limits,
+// provider 5xx) arrive with cryptic messages; map the common ones to a clear,
+// tech-agnostic sentence so the chat surfaces a useful reason instead of jargon
+// (and never leaks the provider name). Unknown errors fall through to the raw text.
+function friendlyError(e) {
+  const raw = errorMessage(e);
+  const status = String(e?.statusCode ?? e?.status ?? e?.error?.code ?? e?.code ?? "");
+  const low = raw.toLowerCase();
+  if (status === "429" || low.includes("rate limit") || low.includes("rate-limit"))
+    return "The model is busy right now (too many requests). Please wait a moment and try again.";
+  if (["500", "502", "503", "504"].includes(status) || low.includes("upstream") || low.includes("timed out") || low.includes("timeout"))
+    return "The model had a temporary error. Please try again in a moment.";
+  if (status === "402" || low.includes("insufficient"))
+    return "The service is temporarily unavailable. Please try again shortly.";
+  return raw;
+}
+
 export async function POST(req) {
   const { messages, system, tools, model, id, sessionId } = await req.json();
   // assistant-ui's transport sends the thread's remoteId as `id`; that IS the
@@ -448,7 +465,7 @@ export async function POST(req) {
       // like { error: { message } } or { code, message }, not Error instances.
       onError: (error) => {
         console.error("chat stream error:", error); // server-side (Vercel logs) only
-        return errorMessage(error);
+        return friendlyError(error);
       },
       // Report which model actually answered. For "openrouter/free" (the auto
       // router) this is the resolved model OpenRouter picked, not the router id.
