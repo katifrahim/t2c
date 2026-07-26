@@ -46,14 +46,17 @@ function useThreadRuntime() {
   const aui = useAui();
   const chat = useChat({ id, transport });
 
+  const refreshCredits = () => {
+    // A turn just settled. The charge runs server-side as the stream closes, so
+    // refresh shortly after to catch the new balance; the 5s poll is the backstop.
+    setTimeout(() => useCreditStore.getState().refresh(), 1500);
+  };
   const runtime = useAISDKRuntime(chat, {
     sendAutomaticallyWhen: lastAssistantMessageIsCompleteWithToolCalls,
-    onFinish: () => {
-      // A turn just completed. The charge runs server-side in after() (a beat after
-      // the stream closes), so refresh shortly after to catch the new balance; the
-      // 5s poll in CreditPill is the backstop.
-      setTimeout(() => useCreditStore.getState().refresh(), 1500);
-    },
+    // Refresh on both success and stop/error — a stopped turn still bills for the
+    // work done before it halted, so the balance must update either way.
+    onFinish: refreshCredits,
+    onError: refreshCredits,
   });
 
   if (transport instanceof AssistantChatTransport) {
