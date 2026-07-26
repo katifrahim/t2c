@@ -39,12 +39,18 @@ function turnCost({ steps, totalUsage, model }) {
 
 // A one-shot assistant message stream — used to refuse a turn (out of credits)
 // without calling the model, so the user reliably sees the reason in the chat.
+// The start-step/finish-step wrap the notice in its OWN step: without it, when a
+// refusal lands mid auto-continue, the notice text is appended to a message whose
+// last step still holds resolved tool calls, so lastAssistantMessageIsCompleteWith-
+// ToolCalls stays true and the client auto-continues forever (notice spam).
 function noticeResponse(text) {
   const stream = createUIMessageStream({
     execute: ({ writer }) => {
+      writer.write({ type: "start-step" });
       writer.write({ type: "text-start", id: "notice" });
       writer.write({ type: "text-delta", id: "notice", delta: text });
       writer.write({ type: "text-end", id: "notice" });
+      writer.write({ type: "finish-step" });
     },
   });
   return createUIMessageStreamResponse({ stream });
@@ -312,9 +318,7 @@ export async function POST(req) {
       .maybeSingle();
     creditsRemaining = bal?.credits_remaining ?? null;
     if (creditsRemaining != null && creditsRemaining < MIN_RESERVE) {
-      return noticeResponse(
-        "You're out of credits. Your free beta credits have run out — reach out to get more to keep designing.",
-      );
+      return noticeResponse("You're out of credits.");
     }
   }
 
