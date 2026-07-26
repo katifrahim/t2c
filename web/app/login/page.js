@@ -107,25 +107,6 @@ export default function LoginPage() {
             </div>
           )}
 
-          {mode !== "forgot" && (
-            <>
-              <Button
-                type="button"
-                variant="outline"
-                onClick={google}
-                className="mt-6 h-11 w-full gap-2.5 text-sm font-medium"
-              >
-                <GoogleG />
-                Continue with Google
-              </Button>
-              <div className="my-6 flex items-center gap-3 text-xs text-muted-foreground">
-                <div className="h-px flex-1 bg-border" />
-                or
-                <div className="h-px flex-1 bg-border" />
-              </div>
-            </>
-          )}
-
           <form onSubmit={submit} className="mt-6 space-y-4">
             <div className="space-y-1.5">
               <Label htmlFor="email">Email</Label>
@@ -201,6 +182,25 @@ export default function LoginPage() {
               )}
             </Button>
           </form>
+
+          {mode !== "forgot" && (
+            <>
+              <div className="my-6 flex items-center gap-3 text-xs text-muted-foreground">
+                <div className="h-px flex-1 bg-border" />
+                or
+                <div className="h-px flex-1 bg-border" />
+              </div>
+              <Button
+                type="button"
+                variant="outline"
+                onClick={google}
+                className="h-11 w-full gap-2.5 text-sm font-medium"
+              >
+                <GoogleG />
+                Continue with Google
+              </Button>
+            </>
+          )}
 
           <div className="mt-6 text-center text-sm text-muted-foreground">
             {mode === "forgot" ? (
