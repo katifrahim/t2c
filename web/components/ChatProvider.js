@@ -44,17 +44,26 @@ function useThreadRuntime() {
 
   const id = useAuiState((s) => s.threadListItem.id);
   const aui = useAui();
-  const chat = useChat({ id, transport });
 
-  const runtime = useAISDKRuntime(chat, {
+  const refreshCredits = () => {
+    // A turn just settled (success or stop/error) — the server bills as the stream
+    // closes, so refresh shortly after to catch the new balance; the 5s poll backs it up.
+    setTimeout(() => useCreditStore.getState().refresh(), 1500);
+  };
+  // These callbacks MUST live on useChat: useAISDKRuntime silently drops
+  // sendAutomaticallyWhen / onFinish / onError (they aren't in its option set), which
+  // is why auto-continue never fired and post-turn credit refresh never ran.
+  const chat = useChat({
+    id,
+    transport,
+    // Auto-continue when a turn ends mid-task (tool calls resolved, no final answer
+    // yet) so long builds finish without the user typing "continue".
     sendAutomaticallyWhen: lastAssistantMessageIsCompleteWithToolCalls,
-    onFinish: () => {
-      // A turn just completed. The charge runs server-side in after() (a beat after
-      // the stream closes), so refresh shortly after to catch the new balance; the
-      // 5s poll in CreditPill is the backstop.
-      setTimeout(() => useCreditStore.getState().refresh(), 1500);
-    },
+    onFinish: refreshCredits,
+    onError: refreshCredits,
   });
+
+  const runtime = useAISDKRuntime(chat);
 
   if (transport instanceof AssistantChatTransport) {
     transport.setRuntime(runtime);

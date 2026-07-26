@@ -63,6 +63,11 @@ insert into public.user_credits (user_id)
 -- SECURITY DEFINER lets it write user_credits despite RLS; it uses auth.uid()
 -- internally so a caller can only ever charge their own account. Returns the
 -- new remaining balance.
+--
+-- NOTE: langfuse.sql SUPERSEDES this — it drops this 6-arg version and creates a
+-- 7-arg charge_usage(..., p_trace_id) that the app actually calls. Always run
+-- langfuse.sql AFTER credits.sql. Do NOT re-run credits.sql on its own afterwards,
+-- or both overloads co-exist and the RPC call becomes ambiguous.
 create or replace function public.charge_usage(
   p_chat_id uuid,
   p_model   text,
@@ -85,8 +90,10 @@ begin
     v_uid, p_chat_id, p_model, p_input, p_output, p_input + p_output, p_cost, p_credits
   );
 
+  -- greatest(0, ...) floors the balance so a turn that overspends can never drive
+  -- it negative (the app also stops turns before they exhaust the balance).
   update public.user_credits
-     set credits_remaining = credits_remaining - p_credits,
+     set credits_remaining = greatest(0, credits_remaining - p_credits),
          updated_at = now()
    where user_id = v_uid
    returning credits_remaining into v_balance;
