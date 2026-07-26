@@ -62,7 +62,7 @@ export default function LoginPage() {
         });
         if (error) return setError(error.message);
         if (!data.session) {
-          setNotice("Check your email to confirm your account, then sign in.");
+          setNotice("Check your email to confirm your account.");
           setMode("signin");
         } else {
           router.push("/");
@@ -73,7 +73,7 @@ export default function LoginPage() {
           redirectTo: `${window.location.origin}/reset`,
         });
         if (error) return setError(error.message);
-        setNotice("Check your email for a link to reset your password.");
+        setNotice("Check your email to reset your password.");
       }
     } finally {
       setBusy(false);
