@@ -63,6 +63,11 @@ insert into public.user_credits (user_id)
 -- SECURITY DEFINER lets it write user_credits despite RLS; it uses auth.uid()
 -- internally so a caller can only ever charge their own account. Returns the
 -- new remaining balance.
+--
+-- NOTE: langfuse.sql SUPERSEDES this — it drops this 6-arg version and creates a
+-- 7-arg charge_usage(..., p_trace_id) that the app actually calls. Always run
+-- langfuse.sql AFTER credits.sql. Do NOT re-run credits.sql on its own afterwards,
+-- or both overloads co-exist and the RPC call becomes ambiguous.
 create or replace function public.charge_usage(
   p_chat_id uuid,
   p_model   text,

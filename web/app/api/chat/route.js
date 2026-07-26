@@ -146,6 +146,7 @@ function makeCleanupTransform(stats) {
 async function saveSnapshot({ supabase, uid, session, backendUrl, token }) {
   if (!supabase || !uid || !session || session.startsWith("__LOCALID")) return;
   for (let attempt = 0; attempt < 2; attempt++) {
+    if (attempt > 0) await new Promise((r) => setTimeout(r, 500)); // let a transient blip clear
     try {
       const resp = await fetch(`${backendUrl}/session/export?session=${encodeURIComponent(session)}`, {
         headers: token ? { Authorization: `Bearer ${token}` } : {},
@@ -239,8 +240,9 @@ export const maxDuration = 300;
 
 // Stop a turn a bit before the serverless cap and let the client auto-continue,
 // turning a would-be hard-kill into a graceful, resumable stop. Default 240s sits
-// under the 300s Fluid Compute cap with margin for the final step + settle; most
-// builds finish well under it in a single turn. Lower it only if your cap is lower.
+// under the 300s Fluid Compute cap; the 60s margin also absorbs one in-flight step
+// overshooting, since stopWhen is only checked BETWEEN steps (a single long model
+// generation can't be cut mid-stream). Most builds finish under it in one turn.
 const TURN_SOFT_LIMIT_MS = Number(process.env.TURN_SOFT_LIMIT_MS ?? 240000);
 
 // Template literal: content is flush-left so no code indentation leaks into the prompt.
@@ -282,8 +284,10 @@ function friendlyError(e) {
     return "The model is busy right now (too many requests). Please wait a moment and try again.";
   if (["500", "502", "503", "504"].includes(status) || low.includes("upstream") || low.includes("timed out") || low.includes("timeout"))
     return "The model had a temporary error. Please try again in a moment.";
+  // 402 / "insufficient" is our upstream account, not a transient blip — don't
+  // imply it self-heals; point the user at us.
   if (status === "402" || low.includes("insufficient"))
-    return "The service is temporarily unavailable. Please try again shortly.";
+    return "The service is temporarily unavailable. If this keeps happening, please contact us.";
   return raw;
 }
 
