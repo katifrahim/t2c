@@ -1,6 +1,7 @@
 "use client";
 import { useState } from "react";
 import { useRouter } from "next/navigation";
+import Link from "next/link";
 import { EyeIcon, EyeOffIcon, Loader2Icon, ArrowLeftIcon } from "lucide-react";
 import { createClient, SUPABASE_CONFIGURED } from "@/lib/supabase/client";
 import { Button } from "@/components/ui/button";
@@ -200,7 +201,7 @@ export default function LoginPage() {
               <button
                 type="button"
                 onClick={() => switchMode("signin")}
-                className="inline-flex cursor-pointer items-center gap-1 font-medium text-foreground hover:underline"
+                className="inline-flex cursor-pointer items-center gap-1 hover:underline"
               >
                 <ArrowLeftIcon className="size-3.5" />
                 Back to sign in
@@ -227,6 +228,14 @@ export default function LoginPage() {
                   Sign in
                 </button>
               </>
+            )}
+            {mode !== "forgot" && (
+              <div className="mt-3">
+                <Link href="/" className="inline-flex items-center gap-1 hover:underline">
+                  <ArrowLeftIcon className="size-3.5" />
+                  Back to home
+                </Link>
+              </div>
             )}
           </div>
       </div>

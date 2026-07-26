@@ -1,6 +1,8 @@
+PRODUCT.md
 .DS_Store
 .vscode/
 .playwright-mcp/
 .env
 .env*.local
 .claude/
+.impeccable/

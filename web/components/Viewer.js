@@ -1,7 +1,8 @@
 "use client";
 import { useEffect, useRef, useState } from "react";
-import { LoaderIcon, MoonIcon, SunIcon } from "lucide-react";
+import { LoaderIcon } from "lucide-react";
 import { useSessionStore } from "@/lib/session-store";
+import { useViewerThemeStore } from "@/lib/viewer-theme-store";
 
 // Ported verbatim from ocp_vscode's viewer.html so the look/toolbar (studio
 // background, zebra/measure/explode tools, etc.) match the standalone viewer.
@@ -88,22 +89,28 @@ export default function Viewer() {
   // Blank white until the backend/MCP server delivers the first model; show a
   // loader in the viewer area until then.
   const [hasModel, setHasModel] = useState(false);
-  // Light/dark background of the 3D scene (three-cad-viewer's own theme).
-  const [theme, setThemeState] = useState("light");
-  const themeRef = useRef("light");
+  // Light/dark background of the 3D scene (three-cad-viewer's own theme). The
+  // toggle lives in the chat top bar; we read/apply it via a shared store.
+  const theme = useViewerThemeStore((s) => s.theme);
+  const setTheme = useViewerThemeStore((s) => s.setTheme);
+  const themeRef = useRef(theme);
 
   useEffect(() => {
     const saved = localStorage.getItem("tcv-theme");
-    if (saved === "dark" || saved === "light") { themeRef.current = saved; setThemeState(saved); }
-  }, []);
+    if (saved === "dark" || saved === "light") {
+      setTheme(saved);
+    } else if (window.matchMedia?.("(prefers-color-scheme: dark)").matches) {
+      // No saved choice: follow the OS like main's "browser" default did, so the
+      // viewer background (and part contrast) matches what it was before.
+      setTheme("dark");
+    }
+  }, [setTheme]);
 
-  function toggleTheme() {
-    const next = themeRef.current === "dark" ? "light" : "dark";
-    themeRef.current = next;
-    setThemeState(next);
-    try { localStorage.setItem("tcv-theme", next); } catch {}
-    try { ref.current.viewer?.setTheme(next); } catch {}
-  }
+  // Apply theme changes to the live viewer without a rebuild (keeps the camera).
+  useEffect(() => {
+    themeRef.current = theme;
+    try { ref.current.viewer?.setTheme(theme); } catch {}
+  }, [theme]);
 
   // On chat/session switch: keep the current scene on screen (no blanking) and
   // force the next poll to re-render this session's model — or its placeholder
@@ -255,15 +262,6 @@ export default function Viewer() {
           background: "var(--tcv-bg-color)",
         }}
       />
-      <button
-        type="button"
-        onClick={toggleTheme}
-        aria-label={theme === "dark" ? "Use light background" : "Use dark background"}
-        title={theme === "dark" ? "Light background" : "Dark background"}
-        className="absolute right-3 bottom-3 z-20 grid size-8 cursor-pointer place-items-center rounded-md border border-border bg-background/90 text-foreground shadow-sm backdrop-blur transition-colors hover:bg-muted"
-      >
-        {theme === "dark" ? <SunIcon size={16} /> : <MoonIcon size={16} />}
-      </button>
 
       {!hasModel && (
         <div

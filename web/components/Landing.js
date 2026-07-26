@@ -10,9 +10,9 @@ const BLUEPRINT = {
 };
 
 const EXAMPLES = [
-  { title: "Twisted Hexagonal Vase", desc: "LLM: Sonnet 4.6 High", img: "/examples/twisted-hexa-vase.jpeg" },
-  { title: "Deriaz Turbine Runner", desc: "LLM: Sonnet 4.6 High", img: "/examples/deriaz-turbine-runner.jpeg" },
-  { title: "Full Francis Turbine Assembly", desc: "LLM: Opus 4.8 High", img: "/examples/francis-turbine.jpeg" },
+  { title: "Twisted Hexagonal Vase", desc: "LLM: GPT OSS", img: "/examples/twisted-hexa-vase.jpeg" },
+  { title: "Deriaz Turbine Runner", desc: "LLM: DeepSeek V4 Flash", img: "/examples/deriaz-turbine-runner.jpeg" },
+  { title: "Full Francis Turbine Assembly", desc: "LLM: GLM 5.2", img: "/examples/francis-turbine.jpeg" },
 ];
 
 // Own scroll container + select-text: the globally-loaded three-cad-viewer.css
