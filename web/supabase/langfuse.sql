@@ -30,8 +30,10 @@ begin
     v_uid, p_chat_id, p_model, p_input, p_output, p_input + p_output, p_cost, p_credits, p_trace_id
   );
 
+  -- greatest(0, ...) floors the balance so a turn that overspends can never drive
+  -- it negative (the app also stops turns before they exhaust the balance).
   update public.user_credits
-     set credits_remaining = credits_remaining - p_credits,
+     set credits_remaining = greatest(0, credits_remaining - p_credits),
          updated_at = now()
    where user_id = v_uid
    returning credits_remaining into v_balance;
