@@ -6,8 +6,10 @@ import {
   useAssistantRuntime,
   useAui,
   useAuiState,
+  useThreadListItem,
+  useThreadListItemRuntime,
 } from "@assistant-ui/react";
-import { MenuIcon, PlusIcon, DownloadIcon, LogOutIcon, Trash2Icon, MoonIcon, SunIcon } from "lucide-react";
+import { MenuIcon, PlusIcon, DownloadIcon, LogOutIcon, Trash2Icon, PencilIcon, MoonIcon, SunIcon } from "lucide-react";
 import {
   TooltipProvider,
   Tooltip,
@@ -230,26 +232,70 @@ function TopBar({ onToggleHistory, historyOpen }) {
 }
 
 function ThreadListItem() {
+  const runtime = useThreadListItemRuntime();
+  const currentTitle = useThreadListItem((s) => s.title);
+  const [editing, setEditing] = useState(false);
+  const [draft, setDraft] = useState("");
+
+  const startEditing = () => {
+    setDraft(currentTitle ?? "");
+    setEditing(true);
+  };
+
+  const save = () => {
+    const next = draft.trim();
+    if (next && next !== currentTitle) runtime.rename(next);
+    setEditing(false);
+  };
+
   return (
     <ThreadListItemPrimitive.Root
       style={{ display: "flex", alignItems: "center", gap: 6, padding: "2px 8px", borderBottom: "1px solid #f2f2f2", background: "transparent" }}
       onMouseEnter={(e) => (e.currentTarget.style.background = "#f5f5f5")}
       onMouseLeave={(e) => (e.currentTarget.style.background = "transparent")}
     >
-      <ThreadListItemPrimitive.Trigger
-        style={{ flex: 1, minWidth: 0, textAlign: "left", padding: "8px 6px", border: "none", background: "transparent", cursor: "pointer", fontSize: 13, color: "#222", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}
-      >
-        <ThreadListItemPrimitive.Title fallback="New chat" />
-      </ThreadListItemPrimitive.Trigger>
-      <ThreadListItemPrimitive.Delete
-        title="Delete chat"
-        aria-label="Delete chat"
-        style={{ border: "none", background: "none", cursor: "pointer", color: "#bbb", padding: 4, borderRadius: 6, display: "inline-flex" }}
-        onMouseEnter={(e) => { e.currentTarget.style.color = "#dc2626"; e.currentTarget.style.background = "#fef2f2"; }}
-        onMouseLeave={(e) => { e.currentTarget.style.color = "#bbb"; e.currentTarget.style.background = "none"; }}
-      >
-        <Trash2Icon size={15} />
-      </ThreadListItemPrimitive.Delete>
+      {editing ? (
+        <input
+          autoFocus
+          value={draft}
+          onChange={(e) => setDraft(e.target.value)}
+          onFocus={(e) => e.currentTarget.select()}
+          onBlur={save}
+          onKeyDown={(e) => {
+            if (e.key === "Enter") save();
+            else if (e.key === "Escape") setEditing(false);
+          }}
+          style={{ flex: 1, minWidth: 0, padding: "7px 6px", fontSize: 13, color: "#222", border: "1px solid #d4d4d4", borderRadius: 6, outline: "none" }}
+        />
+      ) : (
+        <>
+          <ThreadListItemPrimitive.Trigger
+            style={{ flex: 1, minWidth: 0, textAlign: "left", padding: "8px 6px", border: "none", background: "transparent", cursor: "pointer", fontSize: 13, color: "#222", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}
+          >
+            <ThreadListItemPrimitive.Title fallback="New chat" />
+          </ThreadListItemPrimitive.Trigger>
+          <button
+            type="button"
+            title="Rename chat"
+            aria-label="Rename chat"
+            onClick={startEditing}
+            style={{ border: "none", background: "none", cursor: "pointer", color: "#bbb", padding: 4, borderRadius: 6, display: "inline-flex" }}
+            onMouseEnter={(e) => { e.currentTarget.style.color = "#2563eb"; e.currentTarget.style.background = "#eff6ff"; }}
+            onMouseLeave={(e) => { e.currentTarget.style.color = "#bbb"; e.currentTarget.style.background = "none"; }}
+          >
+            <PencilIcon size={15} />
+          </button>
+          <ThreadListItemPrimitive.Delete
+            title="Delete chat"
+            aria-label="Delete chat"
+            style={{ border: "none", background: "none", cursor: "pointer", color: "#bbb", padding: 4, borderRadius: 6, display: "inline-flex" }}
+            onMouseEnter={(e) => { e.currentTarget.style.color = "#dc2626"; e.currentTarget.style.background = "#fef2f2"; }}
+            onMouseLeave={(e) => { e.currentTarget.style.color = "#bbb"; e.currentTarget.style.background = "none"; }}
+          >
+            <Trash2Icon size={15} />
+          </ThreadListItemPrimitive.Delete>
+        </>
+      )}
     </ThreadListItemPrimitive.Root>
   );
 }
