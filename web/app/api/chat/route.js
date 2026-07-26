@@ -321,7 +321,7 @@ export async function POST(req) {
       // Render as a markdown blockquote: the chat styles it as a calm, muted
       // callout (thin left bar + gray text) — distinct from a normal reply without
       // shouting. Two trailing spaces = a hard line break so line 2 sits under line 1.
-      return noticeResponse("> You're out of credits.  \n> Reach out to get more.");
+      return noticeResponse("> You're out of credits.  \n> Contact us to get more.");
     }
   }
 
