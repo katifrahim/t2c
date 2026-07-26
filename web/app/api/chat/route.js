@@ -231,10 +231,11 @@ function withTrace(fn) {
 // never get hard-killed mid-stream — the client then auto-continues the build.
 export const maxDuration = 300;
 
-// Stop a turn this long before the cap and let the client auto-continue (see
-// P0-4). Default 55s is safe even if Fluid Compute isn't enabled (60s cap); once
-// it's on, raise TURN_SOFT_LIMIT_MS toward ~250000 to reduce continuations.
-const TURN_SOFT_LIMIT_MS = Number(process.env.TURN_SOFT_LIMIT_MS ?? 55000);
+// Stop a turn a bit before the serverless cap and let the client auto-continue,
+// turning a would-be hard-kill into a graceful, resumable stop. Default 240s sits
+// under the 300s Fluid Compute cap with margin for the final step + settle; most
+// builds finish well under it in a single turn. Lower it only if your cap is lower.
+const TURN_SOFT_LIMIT_MS = Number(process.env.TURN_SOFT_LIMIT_MS ?? 240000);
 
 // Template literal: content is flush-left so no code indentation leaks into the prompt.
 const SYSTEM_PROMPT = `You are a CAD modeling assistant. You build and modify 2D & 3D parametric models by calling the available tools. After building, briefly tell the user what you made — keep it short. If unsure about something, ask the user specific clarification questions instead of guessing.
