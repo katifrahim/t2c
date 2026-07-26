@@ -7,12 +7,12 @@
 
 ## Git Pull Protocol
 
-- Before every `git pull`: run `git fetch origin` first, then `git diff <branch> origin/<branch>` to check for differences. If the local branch has commits not present on remote, inform the user and ask for permission before pulling.
+- Before every `git pull`: run `git fetch origin` first, then `git diff --stat <branch> origin/<branch>` to check for differences. If the local branch has commits not present on remote, inform the user and ask for permission before pulling.
 
 ## Branching
 
 - Before creating a new branch: first `git checkout main`, then follow the Git Pull Protocol above, then `git checkout -b <branch>`. Never branch off a feature branch unless explicitly asked.
-- After the user merges a PR and confirms it, delete the branch locally with `git branch -d <branch>`.
+- After the user merges a PR and confirms it, delete the branch locally with `git branch -d <branch>`, then run `git fetch --prune` to drop stale remote-tracking refs.
 
 ## CI Tests
 
