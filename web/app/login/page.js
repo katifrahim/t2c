@@ -62,7 +62,7 @@ export default function LoginPage() {
         });
         if (error) return setError(error.message);
         if (!data.session) {
-          setNotice("Check your email to confirm your account, then sign in.");
+          setNotice("Check your email to confirm your account.");
           setMode("signin");
         } else {
           router.push("/");
@@ -73,7 +73,7 @@ export default function LoginPage() {
           redirectTo: `${window.location.origin}/reset`,
         });
         if (error) return setError(error.message);
-        setNotice("Check your email for a link to reset your password.");
+        setNotice("Check your email to reset your password.");
       }
     } finally {
       setBusy(false);
@@ -105,25 +105,6 @@ export default function LoginPage() {
               Auth isn’t configured yet. Add your Supabase keys to{" "}
               <code className="font-mono">web/.env.local</code> and restart.
             </div>
-          )}
-
-          {mode !== "forgot" && (
-            <>
-              <Button
-                type="button"
-                variant="outline"
-                onClick={google}
-                className="mt-6 h-11 w-full gap-2.5 text-sm font-medium"
-              >
-                <GoogleG />
-                Continue with Google
-              </Button>
-              <div className="my-6 flex items-center gap-3 text-xs text-muted-foreground">
-                <div className="h-px flex-1 bg-border" />
-                or
-                <div className="h-px flex-1 bg-border" />
-              </div>
-            </>
           )}
 
           <form onSubmit={submit} className="mt-6 space-y-4">
@@ -201,6 +182,25 @@ export default function LoginPage() {
               )}
             </Button>
           </form>
+
+          {mode !== "forgot" && (
+            <>
+              <div className="my-6 flex items-center gap-3 text-xs text-muted-foreground">
+                <div className="h-px flex-1 bg-border" />
+                or
+                <div className="h-px flex-1 bg-border" />
+              </div>
+              <Button
+                type="button"
+                variant="outline"
+                onClick={google}
+                className="h-11 w-full gap-2.5 text-sm font-medium"
+              >
+                <GoogleG />
+                Continue with Google
+              </Button>
+            </>
+          )}
 
           <div className="mt-6 text-center text-sm text-muted-foreground">
             {mode === "forgot" ? (
