@@ -191,6 +191,15 @@ async function chargeUsage({ supabase, uid, session, model, totalUsage, traceId,
   }
 }
 
+// True if any message carries an image attachment. The client sends images as
+// file parts with an image/* media type. OpenRouter rejects the WHOLE request if
+// any message has an image and the model is text-only, so we check every message.
+function hasImagePart(messages) {
+  return (messages ?? []).some((m) =>
+    (m?.parts ?? []).some((p) => p?.type === "file" && p?.mediaType?.startsWith("image/")),
+  );
+}
+
 // Plain text of the newest user message — used as the trace's top-level input so
 // the Langfuse trace list is readable at a glance.
 function lastUserText(messages) {
@@ -288,6 +297,10 @@ function friendlyError(e) {
   // imply it self-heals; point the user at us.
   if (status === "402" || low.includes("insufficient"))
     return "The service is temporarily unavailable. If this keeps happening, please contact us.";
+  // Backstop for a "vision" model whose routed provider still refuses the image
+  // (the pre-send guard catches the common text-only case).
+  if (low.includes("image") && (low.includes("not support") || low.includes("modalit") || low.includes("no endpoints")))
+    return "This model can't read images. Please switch to a vision-capable model (marked 👁) and try again.";
   return raw;
 }
 
@@ -335,6 +348,17 @@ export async function POST(req) {
   const budgetUsd =
     creditsRemaining != null ? Math.max(0, (creditsRemaining - MIN_RESERVE) / CREDITS_PER_USD) : null;
 
+  // Only vision-capable models accept image input; text-only models make
+  // OpenRouter reject the whole request. Refuse early — before opening the MCP
+  // client or calling the model — with a clear, unbilled notice so the user
+  // switches models instead of seeing a cryptic provider error.
+  const selectedModel = model || DEFAULT_MODEL;
+  if (!MODELS.find((m) => m.id === selectedModel)?.vision && hasImagePart(messages)) {
+    return noticeResponse(
+      "This model can't read images. Please switch to a vision-capable model (marked 👁) and try again.",
+    );
+  }
+
   // One MCP client per request, connected to the t2c FastMCP server over
   // streamable HTTP. Closed when the response finishes (see onFinish/onError).
   // X-Session-Id scopes all CAD state to this chat so users never collide.
@@ -354,7 +378,6 @@ export async function POST(req) {
     apiKey: process.env.OPENROUTER_API_KEY,
   });
 
-  const selectedModel = model || DEFAULT_MODEL;
   // Per-model reasoning effort (e.g. the premium "High" models). OpenRouter takes
   // this as a request parameter, not part of the model id.
   const reasoning = MODELS.find((m) => m.id === selectedModel)?.reasoning;
