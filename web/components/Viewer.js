@@ -282,6 +282,45 @@ export default function Viewer() {
           } catch { /* ignore */ }
         });
       } catch { /* ignore */ }
+
+      // Touch drag for the measure/properties popup: the library drags it via a
+      // panel mousedown + document mousemove/mouseup, none of which a finger drag
+      // produces. Translate a one-finger drag on the panel into those mouse events
+      // (clientX/Y position the panel; movementX/Y drive its edge-clamping).
+      try {
+        const panels = container.querySelectorAll(
+          ".tcv_distance_measurement_panel, .tcv_properties_measurement_panel"
+        );
+        panels.forEach((panel) => {
+          panel.style.touchAction = "none";
+          panel.addEventListener("touchstart", (e) => {
+            if (e.touches.length !== 1) return;
+            const t0 = e.touches[0];
+            panel.dispatchEvent(new MouseEvent("mousedown", { clientX: t0.clientX, clientY: t0.clientY, button: 0 }));
+            e.preventDefault();
+            let prev = { x: t0.clientX, y: t0.clientY };
+            const move = (ev) => {
+              if (ev.touches.length !== 1) return;
+              const t = ev.touches[0];
+              document.dispatchEvent(new MouseEvent("mousemove", {
+                clientX: t.clientX, clientY: t.clientY,
+                movementX: t.clientX - prev.x, movementY: t.clientY - prev.y,
+              }));
+              prev = { x: t.clientX, y: t.clientY };
+              ev.preventDefault();
+            };
+            const end = () => {
+              document.dispatchEvent(new MouseEvent("mouseup", { button: 0 }));
+              document.removeEventListener("touchmove", move);
+              document.removeEventListener("touchend", end);
+              document.removeEventListener("touchcancel", end);
+            };
+            document.addEventListener("touchmove", move, { passive: false });
+            document.addEventListener("touchend", end);
+            document.addEventListener("touchcancel", end);
+          }, { passive: false });
+        });
+      } catch { /* ignore */ }
     }
 
     async function poll() {
