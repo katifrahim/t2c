@@ -20,7 +20,7 @@ const nextConfig = {
   ],
   // Allow the dev server to be reached over the LAN (Next 15 blocks cross-origin
   // dev requests otherwise). Add any other host/IP you serve from here.
-  allowedDevOrigins: ["10.18.198.6"],
+  allowedDevOrigins: ["10.18.198.6", "192.168.0.101"],
   async rewrites() {
     const backend = process.env.BACKEND_URL || "http://localhost:8080";
     return [
