@@ -17,16 +17,20 @@ import { useIsMobile } from "@/lib/use-is-mobile";
 // WebGL viewer or resets the chat; the Viewer re-fits via its own ResizeObserver.
 function MobileWorkspace() {
   const [pane, setPane] = useState("chat"); // start on Chat: first action is to type a prompt
+  // Full-bleed segmented toggle: the active pane is a solid block matching its
+  // content (white for chat, muted for the 3D viewer chrome), the inactive one is
+  // muted — no rounding, gaps, or padding, so it reads as one left/right toggle.
   const tab = (id, label) => (
     <button
       type="button"
       onClick={() => setPane(id)}
       aria-pressed={pane === id}
       className={cn(
-        "flex-1 rounded-md py-1.5 text-sm font-medium transition-colors",
+        "flex-1 py-2 text-sm font-medium transition-colors",
+        id === "viewer" && "border-r", // thin divider between the two segments
         pane === id
-          ? "bg-background text-foreground shadow-sm"
-          : "text-muted-foreground"
+          ? "bg-background text-foreground"
+          : "bg-muted text-muted-foreground"
       )}
     >
       {label}
@@ -34,8 +38,8 @@ function MobileWorkspace() {
   );
   return (
     <div className="flex h-dvh w-full flex-col">
-      <div className="flex shrink-0 gap-1 border-b bg-muted p-1">
-        {tab("viewer", "3D")}
+      <div className="flex shrink-0 border-b">
+        {tab("viewer", "View")}
         {tab("chat", "Chat")}
       </div>
       <div className="relative min-h-0 flex-1">
@@ -74,11 +78,11 @@ export default function Workspace() {
 
   return (
     <ResizablePanelGroup direction="horizontal" className="h-dvh w-screen">
-      <ResizablePanel defaultSize={65} minSize={25}>
+      <ResizablePanel defaultSize="65%" minSize="275px">
         <Viewer />
       </ResizablePanel>
       <ResizableHandle withHandle />
-      <ResizablePanel defaultSize={35} minSize={25}>
+      <ResizablePanel defaultSize="35%" minSize="250px">
         <Chat />
       </ResizablePanel>
     </ResizablePanelGroup>

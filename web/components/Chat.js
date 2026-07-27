@@ -159,7 +159,19 @@ function TopBar({ onToggleHistory, historyOpen }) {
               value={model}
               onChange={(e) => setModel(e.target.value)}
               aria-label="Model"
-              style={{ flex: 1, minWidth: 0, fontSize: 13, padding: "5px 8px", border: "1px solid #e0e0e0", borderRadius: 6, background: "#fff", color: "#333", cursor: "pointer" }}
+              style={{
+                flex: 1, minWidth: 0, fontSize: 13,
+                padding: "5px 26px 5px 8px",
+                border: "1px solid #e0e0e0", borderRadius: 6,
+                color: "#333", cursor: "pointer",
+                appearance: "none", WebkitAppearance: "none", MozAppearance: "none",
+                textOverflow: "ellipsis",
+                backgroundColor: "#fff",
+                backgroundImage: "url(\"data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='24' height='24' viewBox='0 0 24 24' fill='none' stroke='%23666666' stroke-width='2.5' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m6 9 6 6 6-6'/%3E%3C/svg%3E\")",
+                backgroundRepeat: "no-repeat",
+                backgroundPosition: "right 8px center",
+                backgroundSize: "14px",
+              }}
               onMouseEnter={(e) => (e.currentTarget.style.borderColor = "#a3a3a3")}
               onMouseLeave={(e) => (e.currentTarget.style.borderColor = "#e0e0e0")}
             >
