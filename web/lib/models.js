@@ -8,8 +8,8 @@
 //     | select(.supported_parameters|index("tools"))
 //     | "\(.id)\t\((.architecture.input_modalities//[])|index("image")!=null)"'
 export const MODELS = [
-  { id: "deepseek/deepseek-v4-flash", label: "DeepSeek V4 Flash (Best + Cheap)", context: 1048576 }, // Ctx window: 1m toks
-  { id: "z-ai/glm-5.2", label: "GLM-5.2 (Best + Expensive)", context: 1048576 }, // Ctx window: 1m toks
+  { id: "deepseek/deepseek-v4-flash", label: "DeepSeek V4 Flash (Best)", context: 1048576 }, // Ctx window: 1m toks
+  { id: "z-ai/glm-5.2", label: "GLM-5.2 (Best)", context: 1048576 }, // Ctx window: 1m toks
   { id: "openai/gpt-oss-120b", label: "GPT-OSS 120B (Good)", context: 131072 }, // Ctx window: 131k toks
   { id: "xiaomi/mimo-v2.5", label: "Xiaomi Mimo V2.5 (Vision)", context: 1048576, vision: true }, // Ctx window: 1m toks
 ];
