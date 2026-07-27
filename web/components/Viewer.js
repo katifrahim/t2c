@@ -250,6 +250,33 @@ export default function Viewer() {
         if (container.clientWidth > 0) collapse();
         else ref.current.onShow = collapse;
       }
+
+      // Touch pick support: the viewer's Raycaster listens only to mouse events and
+      // gates picking on a prior mousemove, so on touch the measure/select tools
+      // (distance, properties, copy id) never register a hit. Translate a single-
+      // finger tap into the same pick the mouse path runs: seed the ray coords from
+      // the tap, resolve the shape, then fire the left-click selection. Gated on an
+      // active tool (raycastMode) and a stationary tap so it never eats a rotation.
+      try {
+        const canvas = display.getCanvas();
+        let down = null;
+        canvas?.addEventListener("pointerdown", (e) => {
+          if (e.pointerType === "mouse" || !e.isPrimary) return;
+          down = { x: e.clientX, y: e.clientY };
+        });
+        canvas?.addEventListener("pointerup", (e) => {
+          if (e.pointerType === "mouse" || !e.isPrimary || !down) return;
+          const moved = Math.hypot(e.clientX - down.x, e.clientY - down.y);
+          down = null;
+          const rc = viewer.raycaster;
+          if (!rc?.raycastMode || moved > 10) return; // no tool active, or a drag/rotate
+          try {
+            rc.onPointerMove(e);        // seed ray coords + mark as moved
+            viewer.handleRaycast();     // resolve the tapped shape → lastObject
+            viewer.handleRaycastEvent({ mouse: "left", shift: e.shiftKey });
+          } catch { /* ignore */ }
+        });
+      } catch { /* ignore */ }
     }
 
     async function poll() {
