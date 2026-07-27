@@ -30,7 +30,6 @@ const renderDefaultOptions = {
 const toCamel = (s) => s.replace(/_([a-z])/g, (_, c) => c.toUpperCase());
 const overrides = { default_edgecolor: "edgeColor", clip_planes: "clipPlaneHelpers", studio_4k_env_maps: "studio4kEnvMaps" };
 const preset = (cfg, k, v) => (cfg == null || cfg[k] == null ? v : cfg[k]);
-const minWidth = 450;
 
 const renderOptionKeys = ["ambient_intensity", "direct_intensity", "metalness", "roughness", "default_edgecolor", "default_opacity", "normal_len"];
 const viewerOptionKeys = ["axes", "axes0", "black_edges", "grid", "collapse", "ortho", "ticks", "center_grid", "grid_font_size", "timeit", "tools", "glass", "up", "transparent", "control", "pan_speed", "zoom_speed", "rotate_speed", "clip_slider_0", "clip_slider_1", "clip_slider_2", "clip_normal_0", "clip_normal_1", "clip_normal_2", "clip_intersection", "clip_planes", "clip_object_colors", "zebra_count", "zebra_opacity", "zebra_direction", "zebra_color_scheme", "zebra_mapping_mode", "studio_environment", "studio_env_intensity", "studio_env_rotation", "studio_background", "studio_tone_mapping", "studio_exposure", "studio_shadow_intensity", "studio_shadow_softness", "studio_ao_intensity", "studio_texture_mapping", "studio_4k_env_maps"];
@@ -40,9 +39,18 @@ function getDisplayOptions(config, w, h, theme) {
   const tools = preset(config, "tools", displayDefaultOptions.tools);
   const treeWidth = preset(config, "tree_width", displayDefaultOptions.treeWidth);
   const tw = glass || !tools ? 0 : treeWidth;
+  // three-cad-viewer sizes itself in absolute px (container width = cadWidth + 2).
+  // The old `minWidth` (450px) floor made the widget wider than a phone viewport,
+  // pushing the model off-center and letting the page scroll. Drop the floor so the
+  // canvas fits its container at every width (no mobile branch — that created a hard
+  // 500px discontinuity). The -20 keeps a small right margin so the toolbar's
+  // right-aligned group isn't shoved against the viewport edge (where the wrapper's
+  // overflow:hidden would clip it). The -65 height reserve stays: the toolbar sits
+  // above the canvas, so without it the bottom of the scene (axes legend) is cut.
+  const cadWidth = Math.max(240, w - tw - 20);
   return {
     glass, treeWidth, tools,
-    cadWidth: Math.max(minWidth - tw, w - tw - 20),
+    cadWidth,
     height: h - 65,
     theme: theme || config?.theme || displayDefaultOptions.theme,
     keymap: preset(config, "modifier_keys", displayDefaultOptions.keymap),
@@ -130,6 +138,36 @@ export default function Viewer() {
       link.href = HREF;
       document.head.appendChild(link);
     }
+  }, []);
+
+  // Mobile overrides: on narrow screens the viewer already groups toolbar items into
+  // collapsible categories (≤760px), but expanding them can still overflow the width.
+  // Let the toolbar itself scroll horizontally (the library's default `overflow-x:
+  // clip` hides the overflow) so every tool stays reachable without wrapping onto the
+  // canvas. Kept to just the toolbar — the 3D view never scrolls.
+  useEffect(() => {
+    const ID = "tcv-mobile-overrides";
+    if (document.getElementById(ID)) return;
+    const style = document.createElement("style");
+    style.id = ID;
+    style.textContent = `
+      @media (max-width: 760px) {
+        .tcv-scope .tcv_cad_toolbar {
+          flex-wrap: nowrap;
+          overflow-x: auto;
+          overflow-y: hidden;
+          overscroll-behavior-x: contain;
+          -webkit-overflow-scrolling: touch;
+        }
+        /* margin-left:auto on the last group creates phantom scrollable width
+           inside an overflow container — neutralize it so the toolbar only scrolls
+           on genuine overflow (an expanded category), not when collapsed. */
+        .tcv-scope .tcv_cad_toolbar > *:last-child {
+          margin-left: 0;
+        }
+      }
+    `;
+    document.head.appendChild(style);
   }, []);
 
   useEffect(() => {
@@ -252,7 +290,7 @@ export default function Viewer() {
   }, []);
 
   return (
-    <div style={{ position: "relative", width: "100%", height: "100%" }}>
+    <div style={{ position: "relative", width: "100%", height: "100%", overflow: "hidden" }}>
       <div
         ref={containerRef}
         className="tcv-scope"
