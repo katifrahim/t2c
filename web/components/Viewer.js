@@ -215,6 +215,11 @@ export default function Viewer() {
       const displayOptions = getDisplayOptions(config, w, h, themeRef.current);
       const renderOptions = buildOptions(renderOptionKeys, config, renderDefaultOptions);
       const viewerOptions = buildOptions(viewerOptionKeys, config, viewerDefaultOptions);
+      // Mobile: TrackballControls has poor multi-touch handling (two-finger
+      // zoom/pan is jumpy). OrbitControls has purpose-built touch gestures
+      // (1 finger rotate, 2 finger pinch-zoom + pan), so use it on phones.
+      // Desktop keeps trackball (free-roll rotation preferred with a mouse).
+      if (window.innerWidth < 768) viewerOptions.control = "orbit";
 
       const display = new TCV.Display(container, displayOptions);
       const viewer = new TCV.Viewer(display, displayOptions, notify, null);
