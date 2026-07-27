@@ -7,12 +7,23 @@ create table if not exists public.chats (
   id         uuid primary key default gen_random_uuid(),
   user_id    uuid not null references auth.users (id) on delete cascade,
   title      text,
+  -- fractional-indexing key; sidebar sorts by position asc. MUST use "C" collation
+  -- so Postgres sorts by byte/code-point order (matching the key generator); the
+  -- default locale collation is case-insensitive and reorders uppercase keys.
+  position   text collate "C",
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now()
 );
 
+alter table public.chats add column if not exists position text collate "C";
+-- Fix the collation on tables created before position was "C"-collated.
+alter table public.chats alter column position type text collate "C";
+
 create index if not exists chats_user_updated
   on public.chats (user_id, updated_at desc);
+
+create index if not exists chats_user_position
+  on public.chats (user_id, position);
 
 alter table public.chats enable row level security;
 
