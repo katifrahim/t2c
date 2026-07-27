@@ -13,6 +13,7 @@ import { useSupabaseThreadListAdapter } from "@/lib/thread-list-adapter";
 import { useModelStore } from "@/lib/model-store";
 import { useCreditStore } from "@/lib/credit-store";
 import { useSessionStore } from "@/lib/session-store";
+import { useThreadOrderStore } from "@/lib/thread-order-store";
 
 // Keep a stable transport reference while its config (model) changes underneath,
 // mirroring assistant-ui's internal useChatThreadRuntime.
@@ -95,12 +96,25 @@ function SessionSync() {
   return null;
 }
 
+// Keep the sidebar order store reconciled with the runtime's thread list. Lives
+// here (always mounted) rather than in the panel, so optimistic prompt-bumps land
+// even while the panel is closed and survive it being reopened.
+function ThreadOrderSync() {
+  const threadIds = useAuiState((s) => s.threads.threadIds);
+  const sync = useThreadOrderStore((s) => s.sync);
+  useEffect(() => {
+    sync(threadIds);
+  }, [threadIds, sync]);
+  return null;
+}
+
 export default function ChatProvider({ children }) {
   const adapter = useSupabaseThreadListAdapter();
   const runtime = useRemoteThreadListRuntime({ runtimeHook: useThreadRuntime, adapter });
   return (
     <AssistantRuntimeProvider runtime={runtime}>
       <SessionSync />
+      <ThreadOrderSync />
       {children}
     </AssistantRuntimeProvider>
   );

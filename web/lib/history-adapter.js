@@ -1,3 +1,5 @@
+import { useThreadOrderStore } from "@/lib/thread-order-store";
+
 // assistant-ui ThreadHistoryAdapter backed by Supabase. Injected per-thread via
 // the thread-list adapter's unstable_Provider, so it reads the active thread's
 // remoteId (the Supabase chat id) from the aui store at load/append time.
@@ -24,6 +26,9 @@ export function makeHistoryAdapter(aui) {
       async append(item) {
         const id = remoteId();
         if (!id) return;
+        // A new prompt floats this chat to the top of the sidebar — update the
+        // client order now (the POST below persists the same bump server-side).
+        if (item.message.role === "user") useThreadOrderStore.getState().bumpToTop(id);
         await fetch(`/api/threads/${id}/messages`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
@@ -32,6 +37,7 @@ export function makeHistoryAdapter(aui) {
             parent_id: item.parentId,
             format: fmt.format,
             content: fmt.encode(item),
+            role: item.message.role,
           }),
         }).catch(() => {});
       },

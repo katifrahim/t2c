@@ -1,15 +1,31 @@
 "use client";
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import {
-  ThreadListPrimitive,
   ThreadListItemPrimitive,
+  ThreadListItemByIndexProvider,
   useAssistantRuntime,
   useAui,
   useAuiState,
   useThreadListItem,
   useThreadListItemRuntime,
 } from "@assistant-ui/react";
-import { MenuIcon, PlusIcon, DownloadIcon, LogOutIcon, Trash2Icon, PencilIcon, MoonIcon, SunIcon } from "lucide-react";
+import { MenuIcon, PlusIcon, DownloadIcon, LogOutIcon, Trash2Icon, PencilIcon, GripVerticalIcon, MoonIcon, SunIcon } from "lucide-react";
+import {
+  DndContext,
+  PointerSensor,
+  TouchSensor,
+  useSensor,
+  useSensors,
+  closestCenter,
+} from "@dnd-kit/core";
+import {
+  SortableContext,
+  useSortable,
+  arrayMove,
+  verticalListSortingStrategy,
+} from "@dnd-kit/sortable";
+import { CSS } from "@dnd-kit/utilities";
+import { restrictToVerticalAxis, restrictToParentElement } from "@dnd-kit/modifiers";
 import {
   TooltipProvider,
   Tooltip,
@@ -31,6 +47,7 @@ import ChatProvider from "@/components/ChatProvider";
 import { MODELS } from "@/lib/models";
 import { useModelStore } from "@/lib/model-store";
 import { useSessionStore } from "@/lib/session-store";
+import { useThreadOrderStore } from "@/lib/thread-order-store";
 import { useViewerThemeStore } from "@/lib/viewer-theme-store";
 import { createClient, SUPABASE_CONFIGURED } from "@/lib/supabase/client";
 
@@ -243,11 +260,13 @@ function TopBar({ onToggleHistory, historyOpen }) {
   );
 }
 
-function ThreadListItem() {
+function ThreadListItem({ id }) {
   const runtime = useThreadListItemRuntime();
   const currentTitle = useThreadListItem((s) => s.title);
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState("");
+  const { attributes, listeners, setNodeRef, setActivatorNodeRef, transform, transition, isDragging } =
+    useSortable({ id });
 
   const startEditing = () => {
     setDraft(currentTitle ?? "");
@@ -261,62 +280,133 @@ function ThreadListItem() {
   };
 
   return (
-    <ThreadListItemPrimitive.Root
-      style={{ display: "flex", alignItems: "center", gap: 6, padding: "2px 8px", borderBottom: "1px solid #f2f2f2", background: "transparent" }}
-      onMouseEnter={(e) => (e.currentTarget.style.background = "#f5f5f5")}
-      onMouseLeave={(e) => (e.currentTarget.style.background = "transparent")}
+    <div
+      ref={setNodeRef}
+      style={{ transform: CSS.Transform.toString(transform), transition, opacity: isDragging ? 0.4 : 1, zIndex: isDragging ? 1 : "auto" }}
     >
-      {editing ? (
-        <input
-          autoFocus
-          value={draft}
-          onChange={(e) => setDraft(e.target.value)}
-          onFocus={(e) => e.currentTarget.select()}
-          onBlur={save}
-          onKeyDown={(e) => {
-            if (e.key === "Enter") save();
-            else if (e.key === "Escape") setEditing(false);
-          }}
-          style={{ flex: 1, minWidth: 0, padding: "7px 6px", fontSize: 13, color: "#222", border: "1px solid #d4d4d4", borderRadius: 6, outline: "none" }}
-        />
-      ) : (
-        <>
-          <ThreadListItemPrimitive.Trigger
-            style={{ flex: 1, minWidth: 0, textAlign: "left", padding: "8px 6px", border: "none", background: "transparent", cursor: "pointer", fontSize: 13, color: "#222", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}
-          >
-            <ThreadListItemPrimitive.Title fallback="New chat" />
-          </ThreadListItemPrimitive.Trigger>
-          <button
-            type="button"
-            title="Rename chat"
-            aria-label="Rename chat"
-            onClick={startEditing}
-            style={{ border: "none", background: "none", cursor: "pointer", color: "#bbb", padding: 4, borderRadius: 6, display: "inline-flex" }}
-            onMouseEnter={(e) => { e.currentTarget.style.color = "#2563eb"; e.currentTarget.style.background = "#eff6ff"; }}
-            onMouseLeave={(e) => { e.currentTarget.style.color = "#bbb"; e.currentTarget.style.background = "none"; }}
-          >
-            <PencilIcon size={15} />
-          </button>
-          <ThreadListItemPrimitive.Delete
-            title="Delete chat"
-            aria-label="Delete chat"
-            style={{ border: "none", background: "none", cursor: "pointer", color: "#bbb", padding: 4, borderRadius: 6, display: "inline-flex" }}
-            onMouseEnter={(e) => { e.currentTarget.style.color = "#dc2626"; e.currentTarget.style.background = "#fef2f2"; }}
-            onMouseLeave={(e) => { e.currentTarget.style.color = "#bbb"; e.currentTarget.style.background = "none"; }}
-          >
-            <Trash2Icon size={15} />
-          </ThreadListItemPrimitive.Delete>
-        </>
-      )}
-    </ThreadListItemPrimitive.Root>
+      <ThreadListItemPrimitive.Root
+        style={{ display: "flex", alignItems: "center", gap: 6, padding: "2px 8px", borderBottom: "1px solid #f2f2f2", background: isDragging ? "#f5f5f5" : "transparent" }}
+        onMouseEnter={(e) => (e.currentTarget.style.background = "#f5f5f5")}
+        onMouseLeave={(e) => (e.currentTarget.style.background = "transparent")}
+      >
+        <button
+          type="button"
+          ref={setActivatorNodeRef}
+          {...attributes}
+          {...listeners}
+          title="Drag to reorder"
+          aria-label="Drag to reorder"
+          style={{ border: "none", background: "none", color: "#ccc", padding: 2, display: "inline-flex", cursor: isDragging ? "grabbing" : "grab", touchAction: "none" }}
+        >
+          <GripVerticalIcon size={15} />
+        </button>
+        {editing ? (
+          <input
+            autoFocus
+            value={draft}
+            onChange={(e) => setDraft(e.target.value)}
+            onFocus={(e) => e.currentTarget.select()}
+            onBlur={save}
+            onKeyDown={(e) => {
+              if (e.key === "Enter") save();
+              else if (e.key === "Escape") setEditing(false);
+            }}
+            style={{ flex: 1, minWidth: 0, padding: "7px 6px", fontSize: 13, color: "#222", border: "1px solid #d4d4d4", borderRadius: 6, outline: "none" }}
+          />
+        ) : (
+          <>
+            <ThreadListItemPrimitive.Trigger
+              style={{ flex: 1, minWidth: 0, textAlign: "left", padding: "8px 6px", border: "none", background: "transparent", cursor: "pointer", fontSize: 13, color: "#222", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}
+            >
+              <ThreadListItemPrimitive.Title fallback="New chat" />
+            </ThreadListItemPrimitive.Trigger>
+            <button
+              type="button"
+              title="Rename chat"
+              aria-label="Rename chat"
+              onClick={startEditing}
+              style={{ border: "none", background: "none", cursor: "pointer", color: "#bbb", padding: 4, borderRadius: 6, display: "inline-flex" }}
+              onMouseEnter={(e) => { e.currentTarget.style.color = "#111"; }}
+              onMouseLeave={(e) => { e.currentTarget.style.color = "#bbb"; }}
+            >
+              <PencilIcon size={15} />
+            </button>
+            <ThreadListItemPrimitive.Delete
+              title="Delete chat"
+              aria-label="Delete chat"
+              style={{ border: "none", background: "none", cursor: "pointer", color: "#bbb", padding: 4, borderRadius: 6, display: "inline-flex" }}
+              onMouseEnter={(e) => { e.currentTarget.style.color = "#dc2626"; }}
+              onMouseLeave={(e) => { e.currentTarget.style.color = "#bbb"; }}
+            >
+              <Trash2Icon size={15} />
+            </ThreadListItemPrimitive.Delete>
+          </>
+        )}
+      </ThreadListItemPrimitive.Root>
+    </div>
   );
 }
 
+// Persist a single move: the server derives the new fractional key from the
+// dropped chat's new neighbours (either may be null at a list end).
+function persistReorder(movedId, above, below) {
+  fetch(`/api/threads/${movedId}`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ above, below }),
+  }).catch(() => {});
+}
+
 function ThreadListPanel() {
+  // The runtime's threadIds are needed to render each item (index into its list).
+  // The display order comes from the persistent store (kept in sync by
+  // ThreadOrderSync and bumped optimistically on new prompts), so opening the
+  // panel shows the already-correct order with no fetch and no flash.
+  const threadIds = useAuiState((s) => s.threads.threadIds);
+  const order = useThreadOrderStore((s) => s.order);
+  const setOrder = useThreadOrderStore((s) => s.setOrder);
+
+  // Store order, limited to threads the runtime can render, with any brand-new
+  // local chats (not yet in the store) shown on top.
+  const rendered = useMemo(() => {
+    const base = order ?? threadIds;
+    const runtime = new Set(threadIds);
+    const known = base.filter((id) => runtime.has(id));
+    const seen = new Set(known);
+    const fresh = threadIds.filter((id) => !seen.has(id));
+    return [...fresh, ...known];
+  }, [order, threadIds]);
+
+  const sensors = useSensors(useSensor(PointerSensor), useSensor(TouchSensor));
+
+  const onDragEnd = ({ active, over }) => {
+    if (!over || active.id === over.id) return;
+    const from = rendered.indexOf(active.id);
+    const to = rendered.indexOf(over.id);
+    if (from === -1 || to === -1) return;
+    const next = arrayMove(rendered, from, to);
+    const i = next.indexOf(active.id);
+    persistReorder(active.id, next[i - 1] ?? null, next[i + 1] ?? null);
+    setOrder(next);
+  };
+
   return (
-    <ThreadListPrimitive.Root style={{ flex: 1, minHeight: 0, overflowY: "auto", padding: "4px 0" }}>
-      <ThreadListPrimitive.Items components={{ ThreadListItem }} />
-    </ThreadListPrimitive.Root>
+    <div style={{ flex: 1, minHeight: 0, overflowY: "auto", padding: "4px 0" }}>
+      <DndContext
+        sensors={sensors}
+        collisionDetection={closestCenter}
+        modifiers={[restrictToVerticalAxis, restrictToParentElement]}
+        onDragEnd={onDragEnd}
+      >
+        <SortableContext items={rendered} strategy={verticalListSortingStrategy}>
+          {rendered.map((remoteId) => (
+            <ThreadListItemByIndexProvider key={remoteId} index={threadIds.indexOf(remoteId)} archived={false}>
+              <ThreadListItem id={remoteId} />
+            </ThreadListItemByIndexProvider>
+          ))}
+        </SortableContext>
+      </DndContext>
+    </div>
   );
 }
 
