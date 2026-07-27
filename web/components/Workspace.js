@@ -95,6 +95,7 @@ export default function Workspace() {
   return (
     <ResizablePanelGroup direction="horizontal" className="h-dvh w-screen">
       <ResizablePanel defaultSize="65%" minSize="350px"> 
+        <Viewer />
       </ResizablePanel>
       <ResizableHandle withHandle />
       <ResizablePanel defaultSize="35%" minSize="350px">
