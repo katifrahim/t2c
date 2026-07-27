@@ -355,7 +355,7 @@ export async function POST(req) {
   const selectedModel = model || DEFAULT_MODEL;
   if (!MODELS.find((m) => m.id === selectedModel)?.vision && hasImagePart(messages)) {
     return noticeResponse(
-      "This model can't read images. Please switch to a model labeled \"Vision\" and try again.",
+      "> This model can't read images.  \n> Please switch to a model labeled \"Vision\" and try again.",
     );
   }
 
