@@ -331,6 +331,21 @@ export default function Viewer() {
           }, { passive: false });
         });
       } catch { /* ignore */ }
+
+      // Mobile: the toolbar "..." category expands on mouseenter (hover). On touch a
+      // tap fires the synthesized mouseenter (expand) AND a click that falls through
+      // onto the tool the expand just revealed, selecting it. Make the tap expand-only
+      // by cancelling the compatibility click, then trigger the library's own expand.
+      if (window.innerWidth < 768) {
+        try {
+          container.querySelectorAll(".tcv_ellipsis").forEach((el) => {
+            el.addEventListener("touchend", (e) => {
+              e.preventDefault();
+              el.dispatchEvent(new MouseEvent("mouseenter"));
+            }, { passive: false });
+          });
+        } catch { /* ignore */ }
+      }
     }
 
     async function poll() {
