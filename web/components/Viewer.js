@@ -228,6 +228,28 @@ export default function Viewer() {
       }
       ref.current.viewer = viewer;
       setHasModel(true);
+
+      // Mobile: start with the Tools panel collapsed to declutter the small screen.
+      // Caveat: showToolsPanel(false) also hides the tree, the orientation marker
+      // (X/Y/Z legend) and the explode slider (the library groups them), so re-show
+      // the marker to keep the legend. Render the tree while it's still visible first
+      // — the library only re-renders the tree on a tab switch, not on expand, so a
+      // tree built/collapsed while zero-sized would show empty when re-expanded. If
+      // the pane is currently hidden (built while on the Chat tab), defer to the
+      // hidden→visible transition in handleResize.
+      ref.current.onShow = null;
+      if (window.innerWidth < 768) {
+        const collapse = () => {
+          try {
+            viewer.treeview?.update();
+            display.showToolsPanel(false);
+            viewer.rendered?.orientationMarker?.setVisible(true);
+            viewer.update(true, false);
+          } catch { /* ignore */ }
+        };
+        if (container.clientWidth > 0) collapse();
+        else ref.current.onShow = collapse;
+      }
     }
 
     async function poll() {
@@ -270,6 +292,15 @@ export default function Viewer() {
           viewer.gridHelper.update(viewer.getCameraZoom(), true);
         }
         viewer.update(true, true);
+        // Hidden→visible transition (mobile 3D/Chat toggle): a tree built while the
+        // container was display:none renders empty, so refresh it now that it has a
+        // real size, and run any deferred mobile Tools-collapse.
+        const visible = container.clientWidth > 0;
+        if (visible && !ref.current.prevVisible) {
+          viewer.treeview?.update();
+          if (ref.current.onShow) { ref.current.onShow(); ref.current.onShow = null; }
+        }
+        ref.current.prevVisible = visible;
       } catch { /* ignore */ }
     }
 
