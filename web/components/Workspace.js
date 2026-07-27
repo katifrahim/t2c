@@ -94,13 +94,13 @@ export default function Workspace() {
 
   return (
     <ResizablePanelGroup direction="horizontal" className="h-dvh w-screen">
-      <ResizablePanel defaultSize="65%" minSize="275px">
-        <Viewer />
+      <ResizablePanel defaultSize="65%" minSize="350px"> 
       </ResizablePanel>
       <ResizableHandle withHandle />
-      <ResizablePanel defaultSize="35%" minSize="250px">
+      <ResizablePanel defaultSize="35%" minSize="350px">
         <Chat />
       </ResizablePanel>
     </ResizablePanelGroup>
   );
+  // sum of minSize of both panels must be <= 768px (mobile breakpoint width)
 }
