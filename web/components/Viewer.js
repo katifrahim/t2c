@@ -223,6 +223,20 @@ export default function Viewer() {
 
       const display = new TCV.Display(container, displayOptions);
       const viewer = new TCV.Viewer(display, displayOptions, notify, null);
+      // Mobile: keep the X/Y/Z orientation legend visible regardless of the Tools
+      // panel state. The library ties the marker to the panel — showToolsPanel(flag)
+      // hides it when collapsed — so wrap showToolsPanel to always restore the marker
+      // on phones. Covers every toggle path (initial collapse and user taps).
+      if (window.innerWidth < 768) {
+        const showToolsPanel = display.showToolsPanel.bind(display);
+        display.showToolsPanel = (flag) => {
+          showToolsPanel(flag);
+          try {
+            viewer.rendered?.orientationMarker?.setVisible(true);
+            viewer.update(true, false);
+          } catch { /* ignore */ }
+        };
+      }
       viewer.render(payload.data, renderOptions, viewerOptions);
       viewer.glassMode(displayOptions.glass);
       viewer.showTools(displayOptions.tools);
@@ -235,21 +249,17 @@ export default function Viewer() {
       setHasModel(true);
 
       // Mobile: start with the Tools panel collapsed to declutter the small screen.
-      // Caveat: showToolsPanel(false) also hides the tree, the orientation marker
-      // (X/Y/Z legend) and the explode slider (the library groups them), so re-show
-      // the marker to keep the legend. Render the tree while it's still visible first
-      // — the library only re-renders the tree on a tab switch, not on expand, so a
-      // tree built/collapsed while zero-sized would show empty when re-expanded. If
-      // the pane is currently hidden (built while on the Chat tab), defer to the
-      // hidden→visible transition in handleResize.
+      // (The wrapped showToolsPanel above keeps the X/Y/Z legend visible.) Render the
+      // tree while it's still visible first — the library only re-renders the tree on
+      // a tab switch, not on expand, so a tree built/collapsed while zero-sized would
+      // show empty when re-expanded. If the pane is currently hidden (built while on
+      // the Chat tab), defer to the hidden→visible transition in handleResize.
       ref.current.onShow = null;
       if (window.innerWidth < 768) {
         const collapse = () => {
           try {
             viewer.treeview?.update();
             display.showToolsPanel(false);
-            viewer.rendered?.orientationMarker?.setVisible(true);
-            viewer.update(true, false);
           } catch { /* ignore */ }
         };
         if (container.clientWidth > 0) collapse();
