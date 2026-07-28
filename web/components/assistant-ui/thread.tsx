@@ -274,6 +274,8 @@ const SaveTemplateButton: FC = () => {
       a.download = `template-${remoteId}${data.verified === false ? "-CHECK" : ""}.json`;
       a.click();
       URL.revokeObjectURL(url);
+      // The capture ran a billed turn — refresh the credit pill so the new balance shows.
+      useCreditStore.getState().refresh();
     } finally {
       setBusy(false);
     }
