@@ -1,6 +1,7 @@
 import { createMCPClient } from "@ai-sdk/mcp";
 import { createOpenRouter } from "@openrouter/ai-sdk-provider";
-import { generateText, stepCountIs } from "ai";
+import { generateObject, generateText, stepCountIs } from "ai";
+import { z } from "zod";
 import { DEFAULT_MODEL, MODEL_PRICING, CREDITS_PER_USD } from "@/lib/models";
 import { createClient } from "@/lib/supabase/server";
 import {
@@ -34,6 +35,52 @@ function turnCost({ steps, totalUsage }) {
   const p = MODEL_PRICING[DEFAULT_MODEL];
   if (p && totalUsage) return (totalUsage.inputTokens ?? 0) * p.input + (totalUsage.outputTokens ?? 0) * p.output;
   return 0;
+}
+
+// Same $ basis for a single (non-agentic) call like the metadata draft below.
+function callCost({ usage, providerMetadata }) {
+  const c = providerMetadata?.openrouter?.usage?.cost ?? providerMetadata?.openrouter?.cost;
+  if (typeof c === "number") return c;
+  const p = MODEL_PRICING[DEFAULT_MODEL];
+  if (p && usage) return (usage.inputTokens ?? 0) * p.input + (usage.outputTokens ?? 0) * p.output;
+  return 0;
+}
+
+const META_SYSTEM = `You write a short catalog entry for a reusable CAD template so a user can later find it by describing what they want to build.
+Given a reference of how a model was built, output:
+- title: 1-3 words naming the object (e.g. "Hex Bolt", "Wall Bracket").
+- description: one plain-language sentence describing what the object is and its notable features — the kind of phrasing a user would type when searching. Do NOT mention tools, code, or implementation.`;
+
+const MetaSchema = z.object({
+  title: z.string().max(40),
+  description: z.string().max(300),
+});
+
+// Draft a title + description for the captured template from the build reference.
+// Best-effort: on any failure return blanks so the review popup still opens and the
+// user can fill them in. Returns { title, description, cost, inputTokens, outputTokens }.
+async function draftMetadata({ transcript, openrouter }) {
+  try {
+    const { object, usage, providerMetadata } = await generateObject({
+      model: openrouter(DEFAULT_MODEL, {
+        provider: { ignore: ["Groq", "groq"], require_parameters: true },
+      }),
+      providerOptions: { openrouter: { usage: { include: true } } },
+      schema: MetaSchema,
+      system: META_SYSTEM,
+      prompt: `REFERENCE (how the model was built):\n\n${transcript}`,
+    });
+    return {
+      title: object.title ?? "",
+      description: object.description ?? "",
+      cost: callCost({ usage, providerMetadata }),
+      inputTokens: usage?.inputTokens ?? 0,
+      outputTokens: usage?.outputTokens ?? 0,
+    };
+  } catch (e) {
+    console.error("capture-template metadata draft failed:", e);
+    return { title: "", description: "", cost: 0, inputTokens: 0, outputTokens: 0 };
+  }
 }
 
 // Rebuild the model once in a fresh scratch session; return steps + usage.
@@ -124,6 +171,12 @@ export async function POST(_req, { params }) {
 
   if (!template.length) return Response.json({ error: "no model built" }, { status: 422 });
 
+  // Draft a title + description for the review popup, and fold its cost into the bill.
+  const meta = await draftMetadata({ transcript, openrouter });
+  cost += meta.cost;
+  inputTokens += meta.inputTokens;
+  outputTokens += meta.outputTokens;
+
   // Bill the capture to the user's credits (only a productive capture is charged).
   // charge_usage is a SECURITY DEFINER RPC keyed off auth.uid() that floors the
   // balance at 0, so the authenticated client can only charge its own account.
@@ -144,5 +197,12 @@ export async function POST(_req, { params }) {
     }
   }
 
-  return Response.json({ template, verified, count: template.length, credits });
+  return Response.json({
+    template,
+    verified,
+    count: template.length,
+    credits,
+    title: meta.title,
+    description: meta.description,
+  });
 }
