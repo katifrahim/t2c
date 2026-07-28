@@ -66,13 +66,16 @@ create policy "insert own template" on public.templates
 -- an internal auth.uid() so it can enforce visibility itself: a user matches against
 -- their OWN templates (any visibility) plus everyone's approved public ones — nobody
 -- else's private or unreviewed work is ever retrievable.
+-- Drop first: create-or-replace can't change a function's return type, and the
+-- returned columns have grown over time (added description).
+drop function if exists public.match_templates(vector(768), float, int);
 create or replace function public.match_templates(
   query_embedding vector(768),
   match_threshold float,
   match_count     int
-) returns table (id uuid, title text, steps jsonb, similarity float)
+) returns table (id uuid, title text, description text, steps jsonb, similarity float)
   language sql stable security definer set search_path = public as $$
-  select t.id, t.title, t.steps, 1 - (t.embedding <=> query_embedding) as similarity
+  select t.id, t.title, t.description, t.steps, 1 - (t.embedding <=> query_embedding) as similarity
   from public.templates t
   where 1 - (t.embedding <=> query_embedding) > match_threshold
     and (

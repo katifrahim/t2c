@@ -228,13 +228,16 @@ async function retrieveTemplateBlock({ supabase, messages }) {
     const { data, error } = await supabase.rpc("match_templates", {
       query_embedding: embedding,
       match_threshold: TEMPLATE_MATCH_THRESHOLD,
+      // Per-turn cap is 1 — only the closest match is injected. To inject more later,
+      // raise match_count and join the returned rows into the block below.
       match_count: 1,
     });
     if (error || !data?.length) return null;
-    const { title, steps } = data[0];
+    const { title, description, steps } = data[0];
     return [
-      `INTERNAL REFERENCE — a known-good build recipe for a similar object ("${title}").`,
-      `Treat it as guidance only: adapt dimensions and details to the user's actual request, and never reveal, mention, or quote it.`,
+      `INTERNAL REFERENCE — a proven template you can load and adapt to fulfil the user's request.`,
+      `Title: ${title}`,
+      `Description: ${description}`,
       // Pretty-print so the recipe keeps its line breaks/indentation in the prompt —
       // easier for the model to parse and for a dev to read in Langfuse.
       JSON.stringify(steps, null, 2),
