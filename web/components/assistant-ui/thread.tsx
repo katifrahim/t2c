@@ -40,11 +40,13 @@ import {
 import {
   ArrowDownIcon,
   ArrowUpIcon,
+  BookmarkIcon,
   CheckIcon,
   ChevronLeftIcon,
   ChevronRightIcon,
   CopyIcon,
   DownloadIcon,
+  Loader2Icon,
   MicIcon,
   MoreHorizontalIcon,
   PencilIcon,
@@ -55,6 +57,7 @@ import {
   createContext,
   useContext,
   useEffect,
+  useState,
   type ComponentType,
   type FC,
   type PropsWithChildren,
@@ -243,10 +246,68 @@ const CreditPill: FC = () => {
   );
 };
 
+// Saves the current chat's model as a reusable template .json. Asks the server to
+// rebuild ONLY the final model from scratch in an isolated session, then downloads
+// that clean tool-call sequence. An unverified result gets a "-CHECK" filename so
+// it's obvious the rebuild couldn't be confirmed against the live model.
+const SaveTemplateButton: FC = () => {
+  const remoteId = useAuiState((s) => s.threadListItem.remoteId);
+  const [busy, setBusy] = useState(false);
+
+  const save = async () => {
+    if (!remoteId || busy) return;
+    setBusy(true);
+    try {
+      const res = await fetch(`/api/threads/${remoteId}/capture-template`, { method: "POST" });
+      const data = await res.json().catch(() => null);
+      if (!res.ok || !data?.template?.length) {
+        console.warn("save as template failed:", data?.error ?? res.status);
+        return; // nothing to save / rebuild failed
+      }
+      if (data.verified === false) console.warn("template not verified against live model");
+
+      const url = URL.createObjectURL(
+        new Blob([JSON.stringify(data.template, null, 2)], { type: "application/json" }),
+      );
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `template-${remoteId}${data.verified === false ? "-CHECK" : ""}.json`;
+      a.click();
+      URL.revokeObjectURL(url);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  if (!remoteId) return null;
+  return (
+    <TooltipIconButton
+      tooltip={busy ? "Building template…" : "Save as template"}
+      side="bottom"
+      type="button"
+      variant="ghost"
+      size="icon"
+      disabled={busy}
+      className="aui-composer-save-template size-7 rounded-full"
+      aria-label="Save as template"
+      onClick={save}
+    >
+      {busy ? (
+        <Loader2Icon className="size-4 animate-spin" />
+      ) : (
+        <BookmarkIcon className="size-4" />
+      )}
+    </TooltipIconButton>
+  );
+};
+
 const ComposerAction: FC = () => {
   return (
     <div className="aui-composer-action-wrapper relative flex items-center justify-between">
-      <ComposerAddAttachment />
+      <div className="flex items-center gap-1.5">
+        <ComposerAddAttachment />
+        <SaveTemplateButton />
+      </div>
       <CreditPill />
       <div className="flex items-center gap-1.5">
         <AuiIf condition={(s) => s.thread.capabilities.dictation}>
