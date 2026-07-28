@@ -377,16 +377,9 @@ const SaveTemplateButton: FC = () => {
         onOpenChange={() => {}}
       >
         <DialogContent showCloseButton={false} className="gap-5">
-          <DialogHeader>
-            <div className="flex items-center gap-3">
-              <span className="bg-muted text-muted-foreground flex size-9 shrink-0 items-center justify-center rounded-lg">
-                <BookmarkIcon className="size-4.5" />
-              </span>
-              <div className="flex flex-col gap-1">
-                <DialogTitle>Save as template</DialogTitle>
-                <DialogDescription>Set how this template is found and shared.</DialogDescription>
-              </div>
-            </div>
+          <DialogHeader className="items-center text-center">
+            <DialogTitle>Save as template</DialogTitle>
+            <DialogDescription>Set how this template is found and shared.</DialogDescription>
           </DialogHeader>
 
           <div className="flex flex-col gap-4">
