@@ -85,7 +85,8 @@ function danglingPrefix(s) {
   return max;
 }
 
-const EMPTY_NOTICE = "I didn't get a response that time. Please send your message again.";
+const EMPTY_NOTICE = "> Sorry, something went wrong.  \n> Please resend message or switch models.";
+// Rendered as a blockquote to match the out-of-credits notice styling.
 
 // A streamText transform that (1) strips leaked tool-call markup from text and
 // (2) if the whole turn produced nothing visible (empty output, or pure leak),
