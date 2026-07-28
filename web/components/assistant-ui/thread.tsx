@@ -271,6 +271,7 @@ const SaveTemplateButton: FC = () => {
   const [verified, setVerified] = useState<boolean | null>(null);
   const [title, setTitle] = useState("");
   const [description, setDescription] = useState("");
+  const [visibility, setVisibility] = useState<"private" | "public">("private");
 
   const busy = status === "capturing" || status === "storing";
   const canSave = !!title.trim() && !!description.trim();
@@ -293,6 +294,7 @@ const SaveTemplateButton: FC = () => {
       setVerified(data.verified ?? null);
       setTitle(data.title ?? "");
       setDescription(data.description ?? "");
+      setVisibility("private");
       setStatus("review");
     } catch (e) {
       console.warn("save as template failed:", e);
@@ -308,7 +310,7 @@ const SaveTemplateButton: FC = () => {
       const res = await fetch("/api/templates", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ title: title.trim(), description: description.trim(), steps, verified }),
+        body: JSON.stringify({ title: title.trim(), description: description.trim(), steps, verified, visibility }),
       });
       if (!res.ok) {
         console.warn("store template failed:", res.status);
@@ -400,6 +402,34 @@ const SaveTemplateButton: FC = () => {
                 maxLength={300}
                 disabled={status === "storing"}
               />
+            </div>
+            <div className="flex flex-col gap-1.5">
+              <Label>Visibility</Label>
+              <div className="flex gap-2">
+                <Button
+                  type="button"
+                  size="sm"
+                  variant={visibility === "private" ? "default" : "outline"}
+                  onClick={() => setVisibility("private")}
+                  disabled={status === "storing"}
+                >
+                  Private
+                </Button>
+                <Button
+                  type="button"
+                  size="sm"
+                  variant={visibility === "public" ? "default" : "outline"}
+                  onClick={() => setVisibility("public")}
+                  disabled={status === "storing"}
+                >
+                  Public
+                </Button>
+              </div>
+              <p className="text-muted-foreground text-xs">
+                {visibility === "public"
+                  ? "Public templates are reviewed before others can use them."
+                  : "Private templates are only available to you."}
+              </p>
             </div>
             {verified === false && (
               <p className="text-muted-foreground text-xs">
