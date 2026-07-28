@@ -21,6 +21,16 @@ import {
 } from "@/components/assistant-ui/tool-group";
 import { TooltipIconButton } from "@/components/assistant-ui/tooltip-icon-button";
 import { Button } from "@/components/ui/button";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
 import { cn } from "@/lib/utils";
 import {
   ActionBarMorePrimitive,
@@ -52,6 +62,7 @@ import {
   PencilIcon,
   RefreshCwIcon,
   SquareIcon,
+  XIcon,
 } from "lucide-react";
 import {
   createContext,
@@ -246,60 +257,166 @@ const CreditPill: FC = () => {
   );
 };
 
-// Saves the current chat's model as a reusable template .json. Asks the server to
-// rebuild ONLY the final model from scratch in an isolated session, then downloads
-// that clean tool-call sequence. An unverified result gets a "-CHECK" filename so
-// it's obvious the rebuild couldn't be confirmed against the live model.
+// Saves the current chat's model as a reusable template in the shared library. The
+// server rebuilds ONLY the final model from scratch and drafts a title/description;
+// a popup lets the user review/edit those before we embed + store the clean tool-call
+// sequence for RAG. The bookmark reflects progress: spinner while working, red ✕ on a
+// failed capture (click to retry), green ✓ once stored.
 const SaveTemplateButton: FC = () => {
   const remoteId = useAuiState((s) => s.threadListItem.remoteId);
-  const [busy, setBusy] = useState(false);
+  const [status, setStatus] = useState<
+    "idle" | "capturing" | "review" | "storing" | "ok" | "error"
+  >("idle");
+  const [steps, setSteps] = useState<unknown[]>([]);
+  const [verified, setVerified] = useState<boolean | null>(null);
+  const [title, setTitle] = useState("");
+  const [description, setDescription] = useState("");
 
-  const save = async () => {
+  const busy = status === "capturing" || status === "storing";
+  const canSave = !!title.trim() && !!description.trim();
+
+  // Step 1: rebuild the model into a clean template + draft its metadata.
+  const capture = async () => {
     if (!remoteId || busy) return;
-    setBusy(true);
+    setStatus("capturing");
     try {
       const res = await fetch(`/api/threads/${remoteId}/capture-template`, { method: "POST" });
       const data = await res.json().catch(() => null);
+      // The capture ran a billed turn — refresh the credit pill regardless of outcome.
+      useCreditStore.getState().refresh();
       if (!res.ok || !data?.template?.length) {
         console.warn("save as template failed:", data?.error ?? res.status);
-        return; // nothing to save / rebuild failed
+        setStatus("error");
+        return;
       }
-      if (data.verified === false) console.warn("template not verified against live model");
-
-      const url = URL.createObjectURL(
-        new Blob([JSON.stringify(data.template, null, 2)], { type: "application/json" }),
-      );
-      const a = document.createElement("a");
-      a.href = url;
-      a.download = `template-${remoteId}${data.verified === false ? "-CHECK" : ""}.json`;
-      a.click();
-      URL.revokeObjectURL(url);
-      // The capture ran a billed turn — refresh the credit pill so the new balance shows.
-      useCreditStore.getState().refresh();
-    } finally {
-      setBusy(false);
+      setSteps(data.template);
+      setVerified(data.verified ?? null);
+      setTitle(data.title ?? "");
+      setDescription(data.description ?? "");
+      setStatus("review");
+    } catch (e) {
+      console.warn("save as template failed:", e);
+      setStatus("error");
     }
   };
 
+  // Step 2: embed + store the reviewed template in the shared library.
+  const store = async () => {
+    if (status !== "review" || !canSave) return;
+    setStatus("storing");
+    try {
+      const res = await fetch("/api/templates", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ title: title.trim(), description: description.trim(), steps, verified }),
+      });
+      if (!res.ok) {
+        console.warn("store template failed:", res.status);
+        setStatus("review"); // keep the popup open so the user can retry
+        return;
+      }
+      setStatus("ok");
+    } catch (e) {
+      console.warn("store template failed:", e);
+      setStatus("review");
+    }
+  };
+
+  // Let the green tick settle back to the default bookmark after a beat.
+  useEffect(() => {
+    if (status !== "ok") return;
+    const t = setTimeout(() => setStatus("idle"), 2500);
+    return () => clearTimeout(t);
+  }, [status]);
+
   if (!remoteId) return null;
+
+  const icon = busy ? (
+    <Loader2Icon className="size-4 animate-spin" />
+  ) : status === "ok" ? (
+    <CheckIcon className="size-4 text-green-600" />
+  ) : status === "error" ? (
+    <XIcon className="size-4 text-red-600" />
+  ) : (
+    <BookmarkIcon className="size-4" />
+  );
+
+  const tooltip =
+    status === "capturing" ? "Building template…"
+    : status === "storing" ? "Saving template…"
+    : status === "error" ? "Couldn't build a template — click to retry"
+    : status === "ok" ? "Template saved"
+    : "Save as template";
+
   return (
-    <TooltipIconButton
-      tooltip={busy ? "Building template…" : "Save as template"}
-      side="bottom"
-      type="button"
-      variant="ghost"
-      size="icon"
-      disabled={busy}
-      className="aui-composer-save-template size-7 rounded-full"
-      aria-label="Save as template"
-      onClick={save}
-    >
-      {busy ? (
-        <Loader2Icon className="size-4 animate-spin" />
-      ) : (
-        <BookmarkIcon className="size-4" />
-      )}
-    </TooltipIconButton>
+    <>
+      <TooltipIconButton
+        tooltip={tooltip}
+        side="bottom"
+        type="button"
+        variant="ghost"
+        size="icon"
+        disabled={busy}
+        className="aui-composer-save-template size-7 rounded-full"
+        aria-label="Save as template"
+        onClick={capture}
+      >
+        {icon}
+      </TooltipIconButton>
+
+      <Dialog
+        open={status === "review" || status === "storing"}
+        onOpenChange={(open) => {
+          if (!open && status !== "storing") setStatus("idle");
+        }}
+      >
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Save as template</DialogTitle>
+            <DialogDescription>
+              Review the title and description used to find this template later. Edit as needed.
+            </DialogDescription>
+          </DialogHeader>
+          <div className="flex flex-col gap-3">
+            <div className="flex flex-col gap-1.5">
+              <Label htmlFor="template-title">Title</Label>
+              <Input
+                id="template-title"
+                value={title}
+                onChange={(e) => setTitle(e.target.value)}
+                placeholder="e.g. Hex Bolt"
+                maxLength={40}
+                disabled={status === "storing"}
+              />
+            </div>
+            <div className="flex flex-col gap-1.5">
+              <Label htmlFor="template-description">Description</Label>
+              <Input
+                id="template-description"
+                value={description}
+                onChange={(e) => setDescription(e.target.value)}
+                placeholder="What is it? What are its key features?"
+                maxLength={300}
+                disabled={status === "storing"}
+              />
+            </div>
+            {verified === false && (
+              <p className="text-muted-foreground text-xs">
+                Heads up: we couldn&apos;t fully verify the rebuild matches your model.
+              </p>
+            )}
+          </div>
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setStatus("idle")} disabled={status === "storing"}>
+              Cancel
+            </Button>
+            <Button onClick={store} disabled={!canSave || status === "storing"}>
+              {status === "storing" ? "Saving…" : "Save template"}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+    </>
   );
 };
 
