@@ -16,13 +16,28 @@ create table if not exists public.templates (
   -- The template itself: the verbatim array of MCP tool-call payloads to replay.
   steps       jsonb not null,
   -- Whether the capture's rebuild matched the live model (see template-extract.js).
+  -- This is an AUTOMATIC fidelity check, NOT dev approval (that's review_status).
   verified    boolean not null default false,
+  -- Owner's choice: 'private' is retrievable only by its owner; 'public' is offered
+  -- to everyone, but only once a developer approves it (review_status below).
+  visibility    text not null default 'private' check (visibility in ('private', 'public')),
+  -- Developer moderation for public templates. Private ones ignore this. Reviewed by
+  -- flipping this column in the Supabase dashboard (see the match filter below).
+  review_status text not null default 'pending' check (review_status in ('pending', 'approved', 'rejected')),
   -- Gemini gemini-embedding-001 output, requested at 768 dims and L2-normalized so
   -- cosine distance is meaningful (see lib/embeddings.js). Column dim is fixed:
   -- changing the embedding model/size later means re-embedding every row.
   embedding   vector(768) not null,
   created_at  timestamptz not null default now()
 );
+
+-- Add the visibility/moderation columns to tables created before they existed.
+alter table public.templates
+  add column if not exists visibility text not null default 'private'
+    check (visibility in ('private', 'public'));
+alter table public.templates
+  add column if not exists review_status text not null default 'pending'
+    check (review_status in ('pending', 'approved', 'rejected'));
 
 -- Approximate nearest-neighbour index for cosine similarity (recommended for RAG).
 create index if not exists templates_embedding_hnsw
@@ -40,8 +55,10 @@ create policy "insert own template" on public.templates
   with check (auth.uid() = user_id);
 
 -- Semantic search entry point. PostgREST can't use pgvector operators directly, so
--- retrieval calls this via supabase.rpc('match_templates', ...). SECURITY DEFINER so
--- every user can match against the whole shared library despite the restrictive RLS.
+-- retrieval calls this via supabase.rpc('match_templates', ...). SECURITY DEFINER +
+-- an internal auth.uid() so it can enforce visibility itself: a user matches against
+-- their OWN templates (any visibility) plus everyone's approved public ones — nobody
+-- else's private or unreviewed work is ever retrievable.
 create or replace function public.match_templates(
   query_embedding vector(768),
   match_threshold float,
@@ -51,6 +68,10 @@ create or replace function public.match_templates(
   select t.id, t.title, t.steps, 1 - (t.embedding <=> query_embedding) as similarity
   from public.templates t
   where 1 - (t.embedding <=> query_embedding) > match_threshold
+    and (
+      t.user_id = auth.uid()
+      or (t.visibility = 'public' and t.review_status = 'approved')
+    )
   order by t.embedding <=> query_embedding
   limit match_count;
 $$;
