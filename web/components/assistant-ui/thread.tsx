@@ -366,15 +366,16 @@ const SaveTemplateButton: FC = () => {
 
       <Dialog
         open={status === "review" || status === "storing"}
-        onOpenChange={(open) => {
-          if (!open && status !== "storing") setStatus("idle");
-        }}
+        // Controlled + non-dismissible: ignore backdrop-press and Escape so the popup
+        // only closes via the Cancel button or a successful save (like the sign-out
+        // dialog). All closing is driven by the setStatus calls below.
+        onOpenChange={() => {}}
       >
-        <DialogContent>
+        <DialogContent showCloseButton={false}>
           <DialogHeader>
             <DialogTitle>Save as template</DialogTitle>
             <DialogDescription>
-              Review the title and description used to find this template later. Edit as needed.
+              Please review the following details.
             </DialogDescription>
           </DialogHeader>
           <div className="flex flex-col gap-3">
