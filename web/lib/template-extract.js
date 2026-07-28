@@ -22,22 +22,17 @@ function cadToolName(x) {
   return name && CAD_TOOLS.has(name) ? name : null;
 }
 
-// A single-line step label from free text, capped.
-function label(text, n) {
-  const t = text?.trim();
-  return t ? t.split("\n")[0].slice(0, 120) : `Step ${n}`;
-}
-
 // AI-SDK generateText steps -> the template array: one entry per CAD tool call, in
 // order, with the input copied verbatim (already the exact MCP payload). query_docs
-// and any non-CAD calls are dropped.
+// and any non-CAD calls are dropped. `step` is just the 1-based sequence number
+// ("Step N") — the model's prose is noise, the ordering is the only useful signal.
 export function templateFromSteps(steps) {
   const out = [];
   for (const step of steps ?? []) {
     for (const call of step.toolCalls ?? []) {
       const name = cadToolName(call);
       if (!name) continue;
-      out.push({ step: label(step.text, out.length + 1), toolName: name, input: call.input });
+      out.push({ step: `Step ${out.length + 1}`, toolName: name, input: call.input });
     }
   }
   return out;
