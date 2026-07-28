@@ -21,9 +21,11 @@ create table if not exists public.templates (
   -- Owner's choice: 'private' is retrievable only by its owner; 'public' is offered
   -- to everyone, but only once a developer approves it (review_status below).
   visibility    text not null default 'private' check (visibility in ('private', 'public')),
-  -- Developer moderation for public templates. Private ones ignore this. Reviewed by
-  -- flipping this column in the Supabase dashboard (see the match filter below).
-  review_status text not null default 'pending' check (review_status in ('pending', 'approved', 'rejected')),
+  -- Developer moderation, and ONLY for public templates: NULL when it doesn't apply
+  -- (private), 'pending' once submitted as public, then 'approved'/'rejected'. Keeping
+  -- private rows NULL means `where review_status = 'pending'` is exactly the review
+  -- queue. Reviewed by flipping this column in the Supabase dashboard.
+  review_status text check (review_status in ('pending', 'approved', 'rejected')),
   -- Gemini gemini-embedding-001 output, requested at 768 dims and L2-normalized so
   -- cosine distance is meaningful (see lib/embeddings.js). Column dim is fixed:
   -- changing the embedding model/size later means re-embedding every row.
@@ -36,8 +38,13 @@ alter table public.templates
   add column if not exists visibility text not null default 'private'
     check (visibility in ('private', 'public'));
 alter table public.templates
-  add column if not exists review_status text not null default 'pending'
+  add column if not exists review_status text
     check (review_status in ('pending', 'approved', 'rejected'));
+-- Moderation applies to public templates only: keep private rows NULL so the review
+-- queue (review_status = 'pending') never contains private templates. Idempotent.
+alter table public.templates alter column review_status drop not null;
+alter table public.templates alter column review_status set default null;
+update public.templates set review_status = null where visibility = 'private';
 
 -- Approximate nearest-neighbour index for cosine similarity (recommended for RAG).
 create index if not exists templates_embedding_hnsw

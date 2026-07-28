@@ -38,9 +38,18 @@ export async function POST(req) {
 
   // Insert only (no .select()): the templates table has no RLS select policy, so
   // reads go solely through match_templates(). RLS enforces user_id = auth.uid().
-  const { error } = await supabase
-    .from("templates")
-    .insert({ user_id: uid, title: t, description: d, steps, verified: verified === true, visibility: vis, embedding });
+  // Only public templates enter the review queue; private ones leave review_status
+  // NULL so `review_status = 'pending'` is a clean queue of public submissions.
+  const { error } = await supabase.from("templates").insert({
+    user_id: uid,
+    title: t,
+    description: d,
+    steps,
+    verified: verified === true,
+    visibility: vis,
+    review_status: vis === "public" ? "pending" : null,
+    embedding,
+  });
   if (error) {
     console.error("template insert failed:", error);
     return Response.json({ error: "store failed" }, { status: 500 });
