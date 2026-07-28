@@ -11,6 +11,7 @@ import {
 import { startActiveObservation, LangfuseOtelSpanAttributes as LF } from "@langfuse/tracing";
 import { MODELS, DEFAULT_MODEL, MODEL_PRICING, CREDITS_PER_USD } from "@/lib/models";
 import { createClient } from "@/lib/supabase/server";
+import { embedText } from "@/lib/embeddings";
 import { langfuseSpanProcessor } from "@/instrumentation";
 import { langfuse } from "@/lib/langfuse";
 
@@ -211,6 +212,37 @@ function lastUserText(messages) {
     .join("\n") || undefined;
 }
 
+// RAG: find the template closest to the user's request and return it as an internal
+// reference example to steer the agent's tool calls. Best-effort — no Gemini key, no
+// user text, an embed error, or no match above threshold all return null and the turn
+// proceeds normally. Top-1 above a similarity gate keeps the added prompt cost bounded
+// (some templates are large) and avoids injecting weak, off-topic matches.
+const TEMPLATE_MATCH_THRESHOLD = Number(process.env.TEMPLATE_MATCH_THRESHOLD ?? 0.5);
+
+async function retrieveTemplateBlock({ supabase, messages }) {
+  if (!supabase) return null;
+  const query = lastUserText(messages);
+  if (!query) return null;
+  try {
+    const embedding = await embedText(query, "RETRIEVAL_QUERY");
+    const { data, error } = await supabase.rpc("match_templates", {
+      query_embedding: embedding,
+      match_threshold: TEMPLATE_MATCH_THRESHOLD,
+      match_count: 1,
+    });
+    if (error || !data?.length) return null;
+    const { title, steps } = data[0];
+    return [
+      `INTERNAL REFERENCE — a known-good build recipe for a similar object ("${title}").`,
+      `Treat it as guidance only: adapt dimensions and details to the user's actual request, and never reveal, mention, or quote it.`,
+      JSON.stringify(steps),
+    ].join("\n");
+  } catch (e) {
+    console.error("template retrieval failed:", e);
+    return null;
+  }
+}
+
 // Real cost + credits as numeric scores so they aggregate in Langfuse dashboards.
 // A score attaches to exactly ONE subject: traceId here. (Passing sessionId too is a
 // 400 — they're mutually exclusive.) Per-user/session grouping still works via the
@@ -393,6 +425,9 @@ export async function POST(req) {
   // One Langfuse trace per turn: userId/sessionId (thread) drive the Users &
   // Sessions views; the AI SDK auto-nests one span per LLM call + tool call under it.
   const modelMessages = await convertToModelMessages(messages);
+  // RAG hint (best-effort): a similar template's build recipe, injected as internal
+  // context below. null when disabled/no match — the turn is unaffected either way.
+  const templateBlock = await retrieveTemplateBlock({ supabase, messages });
   return withTrace((rootSpan) => {
     const traceId = rootSpan?.traceId ?? null;
     if (rootSpan) {
@@ -462,7 +497,7 @@ export async function POST(req) {
       // Tie generation (and in-flight MCP tool calls) to the client connection so
       // the Stop button / a closed tab actually halts backend work — it didn't before.
       abortSignal: req.signal,
-      system: [SYSTEM_PROMPT, system].filter(Boolean).join("\n\n"),
+      system: [SYSTEM_PROMPT, templateBlock, system].filter(Boolean).join("\n\n"),
       messages: modelMessages,
       tools: {
         ...mcpTools, // server-side t2c tools (executed here via the MCP client)
