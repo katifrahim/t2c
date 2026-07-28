@@ -140,24 +140,34 @@ export default function Viewer() {
     }
   }, []);
 
-  // Mobile overrides: on narrow screens the viewer already groups toolbar items into
-  // collapsible categories (≤760px), but expanding them can still overflow the width.
-  // Let the toolbar itself scroll horizontally (the library's default `overflow-x:
-  // clip` hides the overflow) so every tool stays reachable without wrapping onto the
-  // canvas. Kept to just the toolbar — the 3D view never scrolls.
+  // Toolbar overflow: the library collapses the toolbar into "..." categories once the
+  // pane (cadWidth) is narrow, but expanding a category can still overflow the pane
+  // width, and the library's default `overflow-x: clip` hides those tools off the right
+  // edge. Let the toolbar scroll horizontally so every tool stays reachable. Scoped to
+  // narrow panes via a *container* query (not @media) so it fires in desktop split-view
+  // too — there the divider shrinks the viewer pane while the viewport stays wide (the
+  // wrapper below sets `container-type: inline-size`). Kept to just the toolbar — the 3D
+  // view never scrolls. Also removes the "?" help button from the toolbar everywhere.
   useEffect(() => {
-    const ID = "tcv-mobile-overrides";
+    const ID = "tcv-toolbar-overrides";
     if (document.getElementById(ID)) return;
     const style = document.createElement("style");
     style.id = ID;
     style.textContent = `
-      @media (max-width: 760px) {
+      .tcv-scope .tcv_tooltip:has(.tcv_button_help) { display: none; }
+
+      @container (max-width: 760px) {
         .tcv-scope .tcv_cad_toolbar {
           flex-wrap: nowrap;
           overflow-x: auto;
           overflow-y: hidden;
           overscroll-behavior-x: contain;
           -webkit-overflow-scrolling: touch;
+          scrollbar-width: none; /* Firefox: scroll stays, bar hidden */
+        }
+        /* Chrome/Safari: hide the scrollbar but keep it scrollable. */
+        .tcv-scope .tcv_cad_toolbar::-webkit-scrollbar {
+          display: none;
         }
         /* margin-left:auto on the last group creates phantom scrollable width
            inside an overflow container — neutralize it so the toolbar only scrolls
@@ -417,7 +427,7 @@ export default function Viewer() {
   }, []);
 
   return (
-    <div style={{ position: "relative", width: "100%", height: "100%", overflow: "hidden" }}>
+    <div style={{ position: "relative", width: "100%", height: "100%", overflow: "hidden", containerType: "inline-size" }}>
       <div
         ref={containerRef}
         className="tcv-scope"
