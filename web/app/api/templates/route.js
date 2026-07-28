@@ -11,12 +11,15 @@ const CONFIGURED = !!process.env.NEXT_PUBLIC_SUPABASE_URL;
 export async function POST(req) {
   if (!CONFIGURED) return Response.json({ error: "not configured" }, { status: 400 });
 
-  const { title, description, steps, verified } = await req.json().catch(() => ({}));
+  const { title, description, steps, verified, visibility } = await req.json().catch(() => ({}));
   const t = (title ?? "").trim();
   const d = (description ?? "").trim();
   if (!t || !d) return Response.json({ error: "title and description required" }, { status: 400 });
   if (!Array.isArray(steps) || steps.length === 0)
     return Response.json({ error: "steps required" }, { status: 400 });
+  // Default to private; public templates start as 'pending' (DB default) until a dev
+  // approves them. Anything but an explicit "public" is treated as private.
+  const vis = visibility === "public" ? "public" : "private";
 
   const supabase = await createClient();
   const { data: claims } = await supabase.auth.getClaims();
@@ -37,7 +40,7 @@ export async function POST(req) {
   // reads go solely through match_templates(). RLS enforces user_id = auth.uid().
   const { error } = await supabase
     .from("templates")
-    .insert({ user_id: uid, title: t, description: d, steps, verified: verified === true, embedding });
+    .insert({ user_id: uid, title: t, description: d, steps, verified: verified === true, visibility: vis, embedding });
   if (error) {
     console.error("template insert failed:", error);
     return Response.json({ error: "store failed" }, { status: 500 });
