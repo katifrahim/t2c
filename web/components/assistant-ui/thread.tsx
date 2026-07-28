@@ -31,6 +31,7 @@ import {
 } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import { Textarea } from "@/components/ui/textarea";
 import { cn } from "@/lib/utils";
 import {
   ActionBarMorePrimitive,
@@ -56,7 +57,9 @@ import {
   ChevronRightIcon,
   CopyIcon,
   DownloadIcon,
+  GlobeIcon,
   Loader2Icon,
+  LockIcon,
   MicIcon,
   MoreHorizontalIcon,
   PencilIcon,
@@ -373,14 +376,20 @@ const SaveTemplateButton: FC = () => {
         // dialog). All closing is driven by the setStatus calls below.
         onOpenChange={() => {}}
       >
-        <DialogContent showCloseButton={false}>
+        <DialogContent showCloseButton={false} className="gap-5">
           <DialogHeader>
-            <DialogTitle>Save as template</DialogTitle>
-            <DialogDescription>
-              Please review the following details.
-            </DialogDescription>
+            <div className="flex items-center gap-3">
+              <span className="bg-muted text-muted-foreground flex size-9 shrink-0 items-center justify-center rounded-lg">
+                <BookmarkIcon className="size-4.5" />
+              </span>
+              <div className="flex flex-col gap-1">
+                <DialogTitle>Save as template</DialogTitle>
+                <DialogDescription>Set how this template is found and shared.</DialogDescription>
+              </div>
+            </div>
           </DialogHeader>
-          <div className="flex flex-col gap-3">
+
+          <div className="flex flex-col gap-4">
             <div className="flex flex-col gap-1.5">
               <Label htmlFor="template-title">Title</Label>
               <Input
@@ -392,51 +401,64 @@ const SaveTemplateButton: FC = () => {
                 disabled={status === "storing"}
               />
             </div>
+
             <div className="flex flex-col gap-1.5">
               <Label htmlFor="template-description">Description</Label>
-              <Input
+              <Textarea
                 id="template-description"
                 value={description}
                 onChange={(e) => setDescription(e.target.value)}
-                placeholder="What is it? What are its key features?"
+                placeholder="What is it, and what are its key features?"
+                rows={3}
                 maxLength={300}
                 disabled={status === "storing"}
               />
             </div>
+
             <div className="flex flex-col gap-1.5">
               <Label>Visibility</Label>
-              <div className="flex gap-2">
-                <Button
-                  type="button"
-                  size="sm"
-                  variant={visibility === "private" ? "default" : "outline"}
-                  onClick={() => setVisibility("private")}
-                  disabled={status === "storing"}
-                >
-                  Private
-                </Button>
-                <Button
-                  type="button"
-                  size="sm"
-                  variant={visibility === "public" ? "default" : "outline"}
-                  onClick={() => setVisibility("public")}
-                  disabled={status === "storing"}
-                >
-                  Public
-                </Button>
+              <div
+                role="radiogroup"
+                className="border-input bg-muted/40 grid grid-cols-2 gap-1 rounded-lg border p-1"
+              >
+                {(["private", "public"] as const).map((v) => {
+                  const active = visibility === v;
+                  const Icon = v === "private" ? LockIcon : GlobeIcon;
+                  return (
+                    <button
+                      key={v}
+                      type="button"
+                      role="radio"
+                      aria-checked={active}
+                      onClick={() => setVisibility(v)}
+                      disabled={status === "storing"}
+                      className={cn(
+                        "flex items-center justify-center gap-1.5 rounded-md px-2.5 py-1.5 text-sm font-medium capitalize transition-colors disabled:pointer-events-none disabled:opacity-60",
+                        active
+                          ? "bg-background text-foreground shadow-sm"
+                          : "text-muted-foreground hover:text-foreground",
+                      )}
+                    >
+                      <Icon className="size-3.5" />
+                      {v}
+                    </button>
+                  );
+                })}
               </div>
               <p className="text-muted-foreground text-xs">
                 {visibility === "public"
-                  ? "Public templates are reviewed before others can use them."
-                  : "Private templates are only available to you."}
+                  ? "Anyone can use it, once we've reviewed it."
+                  : "Only you can use it."}
               </p>
             </div>
+
             {verified === false && (
-              <p className="text-muted-foreground text-xs">
-                Heads up: we couldn&apos;t fully verify the rebuild matches your model.
+              <p className="text-muted-foreground border-border/60 border-l-2 pl-2.5 text-xs">
+                We couldn&apos;t fully confirm this template rebuilds your model.
               </p>
             )}
           </div>
+
           <DialogFooter>
             <Button variant="outline" onClick={() => setStatus("idle")} disabled={status === "storing"}>
               Cancel
