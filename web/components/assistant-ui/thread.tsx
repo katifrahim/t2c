@@ -724,7 +724,10 @@ const AssistantMessage: FC = () => {
                 return (
                   <span
                     data-slot="aui_assistant-message-indicator"
-                    className="animate-pulse font-sans"
+                    // Match the streaming caret's font so the ● renders the same
+                    // size (Geist draws it smaller than system-ui).
+                    className="animate-pulse"
+                    style={{ fontFamily: "ui-sans-serif, system-ui, sans-serif" }}
                     aria-label="Assistant is working"
                   >
                     {"●"}
