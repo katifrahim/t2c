@@ -229,16 +229,142 @@ const ThreadSuggestionItem: FC = () => {
   );
 };
 
+// Starter prompts shown as an animated, typewriter-style placeholder on a new chat —
+// they show what Text2CAD can build instead of describing it. Edit this list freely.
+const STARTER_PROMPTS = [
+  "build a francis turbine assembly.",
+  "build a workbench desk.",
+  "build a cabinet.",
+  "build a roller coaster.",
+  "build a twisted hexagonal vase.",
+];
+
+// True when the user asked for reduced motion — we then skip the typing animation.
+function usePrefersReducedMotion() {
+  const [reduce, setReduce] = useState(false);
+  useEffect(() => {
+    const mq = window.matchMedia("(prefers-reduced-motion: reduce)");
+    const update = () => setReduce(mq.matches);
+    update();
+    mq.addEventListener("change", update);
+    return () => mq.removeEventListener("change", update);
+  }, []);
+  return reduce;
+}
+
+// Caret glyph appended to the placeholder to mimic the text cursor. A real caret is a
+// ~1px bar we can't reproduce exactly in placeholder TEXT, so use a light box-drawing
+// vertical (│) — a thin line — rather than the heavier solid block (▏).
+const CARET = "│";
+
+// Typewriter placeholder: types out each starter prompt, holds, erases, and advances
+// to the next — like someone typing in the box. Runs only while `active`. Returns the
+// current substring plus `paused` (true on the holds, when the caret should blink;
+// false while actively typing/erasing, when a real caret stays solid). Purely
+// decorative: the input keeps a stable aria-label, so screen readers ignore the churn.
+function useTypewriter(active: boolean) {
+  const [text, setText] = useState("");
+  const [paused, setPaused] = useState(false);
+  useEffect(() => {
+    if (!active) {
+      // Reset so a later focus-out restarts cleanly from the first prompt instead of
+      // resuming mid-word from the last text shown before focus.
+      setText("");
+      setPaused(false);
+      return;
+    }
+    let prompt = 0;
+    let chars = 0;
+    let erasing = false;
+    let timer: ReturnType<typeof setTimeout>;
+    const tick = () => {
+      const full = STARTER_PROMPTS[prompt];
+      if (!erasing) {
+        chars++;
+        setText(full.slice(0, chars));
+        setPaused(false);
+        if (chars === full.length) {
+          erasing = true;
+          setPaused(true); // hold → caret blinks
+          timer = setTimeout(tick, 1600);
+          return;
+        }
+        timer = setTimeout(tick, 45 + Math.random() * 45); // human-ish keystrokes
+      } else {
+        chars--;
+        setText(full.slice(0, chars));
+        setPaused(false);
+        if (chars === 0) {
+          erasing = false;
+          prompt = (prompt + 1) % STARTER_PROMPTS.length;
+          setPaused(true); // beat before the next prompt → caret blinks
+          timer = setTimeout(tick, 350);
+          return;
+        }
+        timer = setTimeout(tick, 25);
+      }
+    };
+    timer = setTimeout(tick, 500);
+    return () => clearTimeout(timer);
+  }, [active]);
+  return { text, paused };
+}
+
+// Blinking toggle at ~530ms (a typical caret rate) while `active`.
+function useCaretBlink(active: boolean) {
+  const [on, setOn] = useState(true);
+  useEffect(() => {
+    if (!active) {
+      setOn(true);
+      return;
+    }
+    const id = setInterval(() => setOn((v) => !v), 530);
+    return () => clearInterval(id);
+  }, [active]);
+  return on;
+}
+
+// The composer textarea. Split out so the per-keystroke placeholder animation only
+// re-renders the input, not the whole composer (credit pill, actions, etc.).
+const ComposerInput: FC = () => {
+  const isNewChat = useAuiState(isNewChatView);
+  const isEmpty = useAuiState((s) => s.composer.isEmpty);
+  const reduce = usePrefersReducedMotion();
+  const [focused, setFocused] = useState(false);
+  // Tease prompts only on a fresh, empty, UNFOCUSED chat. The moment the user clicks
+  // in, the animation stops and the field is handed back — their real caret shows and
+  // the placeholder reverts to the plain hint. (No autoFocus, so the preview is
+  // visible on load instead of being pre-empted by focus.)
+  const animate = isNewChat && isEmpty && !reduce && !focused;
+  const { text, paused } = useTypewriter(animate);
+  const blinkOn = useCaretBlink(animate && paused); // blink only on the holds
+  const caretVisible = animate && (paused ? blinkOn : true); // solid while typing
+  const placeholder = animate
+    ? text + (caretVisible ? CARET : "")
+    : isNewChat && isEmpty && reduce
+      ? STARTER_PROMPTS[0] // reduced motion: a static example instead of the animation
+      : "Send a message...";
+  return (
+    <ComposerPrimitive.Input
+      placeholder={placeholder}
+      // While animating (the unfocused preview) hide the browser's real caret so only
+      // our trailing glyph shows. On focus, animate is false, so the real caret returns.
+      className={cn(
+        "aui-composer-input placeholder:text-muted-foreground/80 max-h-32 min-h-10 w-full resize-none bg-transparent px-2.5 py-1 text-base outline-none",
+        animate && "caret-transparent",
+      )}
+      rows={1}
+      aria-label="Message input"
+      onFocus={() => setFocused(true)}
+      onBlur={() => setFocused(false)}
+    />
+  );
+};
+
 const Composer: FC = () => {
   return (
     <ComposerPrimitive.Root className="aui-composer-root relative flex w-full flex-col">
-      <ComposerPrimitive.AttachmentDropzone render={<div data-slot="aui_composer-shell" className="border-border/60 data-[dragging=true]:border-ring focus-within:border-border dark:border-muted-foreground/15 dark:focus-within:border-muted-foreground/30 flex w-full flex-col gap-2 rounded-(--composer-radius) border bg-(--composer-bg) p-(--composer-padding) shadow-[0_4px_16px_-8px_rgba(0,0,0,0.08),0_1px_2px_rgba(0,0,0,0.04)] transition-[border-color,box-shadow] focus-within:shadow-[0_6px_24px_-8px_rgba(0,0,0,0.12),0_1px_2px_rgba(0,0,0,0.05)] data-[dragging=true]:border-dashed data-[dragging=true]:bg-[color-mix(in_oklab,var(--color-accent)_50%,var(--color-background))] dark:shadow-none" />}><ComposerAttachments /><ComposerPrimitive.Input
-                      placeholder="Send a message..."
-                      className="aui-composer-input placeholder:text-muted-foreground/80 max-h-32 min-h-10 w-full resize-none bg-transparent px-2.5 py-1 text-base outline-none"
-                      rows={1}
-                      autoFocus
-                      aria-label="Message input"
-                    /><ComposerAction /></ComposerPrimitive.AttachmentDropzone>
+      <ComposerPrimitive.AttachmentDropzone render={<div data-slot="aui_composer-shell" className="border-border/60 data-[dragging=true]:border-ring focus-within:border-border dark:border-muted-foreground/15 dark:focus-within:border-muted-foreground/30 flex w-full flex-col gap-2 rounded-(--composer-radius) border bg-(--composer-bg) p-(--composer-padding) shadow-[0_4px_16px_-8px_rgba(0,0,0,0.08),0_1px_2px_rgba(0,0,0,0.04)] transition-[border-color,box-shadow] focus-within:shadow-[0_6px_24px_-8px_rgba(0,0,0,0.12),0_1px_2px_rgba(0,0,0,0.05)] data-[dragging=true]:border-dashed data-[dragging=true]:bg-[color-mix(in_oklab,var(--color-accent)_50%,var(--color-background))] dark:shadow-none" />}><ComposerAttachments /><ComposerInput /><ComposerAction /></ComposerPrimitive.AttachmentDropzone>
     </ComposerPrimitive.Root>
   );
 };
