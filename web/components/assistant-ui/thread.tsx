@@ -338,14 +338,16 @@ const SaveTemplateButton: FC = () => {
 
   if (!remoteId) return null;
 
+  // Match the composer's other icons (e.g. the "+"): size-4.5 at stroke-[1.5px], so
+  // the bookmark doesn't read heavier/darker than its neighbors.
   const icon = busy ? (
-    <Loader2Icon className="size-4 animate-spin" />
+    <Loader2Icon className="size-4.5 animate-spin stroke-[1.5px]" />
   ) : status === "ok" ? (
-    <CheckIcon className="size-4 text-green-600" />
+    <CheckIcon className="size-4.5 stroke-[1.5px] text-green-600" />
   ) : status === "error" ? (
-    <XIcon className="size-4 text-red-600" />
+    <XIcon className="size-4.5 stroke-[1.5px] text-red-600" />
   ) : (
-    <BookmarkIcon className="size-4" />
+    <BookmarkIcon className="size-4.5 stroke-[1.5px]" />
   );
 
   const tooltip =
