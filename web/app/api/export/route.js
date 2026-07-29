@@ -1,6 +1,9 @@
 // Proxies model downloads to the backend's token-gated /export endpoint,
 // injecting the Bearer token server-side and streaming the file back to the
 // browser with a download disposition.
+import { captureServer, flushServerAnalytics } from "@/lib/analytics-server";
+import { EVENTS } from "@/lib/analytics-events";
+
 const EXT = {
   stl: "stl",
   "3mf": "3mf",
@@ -40,6 +43,13 @@ export async function GET(req) {
         { status: resp.status },
       );
     }
+    // Authoritative export count (the download actually succeeded) — feeds the
+    // North Star metric. The client also fires model:export_clicked (intent).
+    await captureServer(EVENTS.MODEL_EXPORTED, {
+      format: fmt,
+      chat_id: session && !session.startsWith("__LOCALID") ? session : null,
+    });
+    await flushServerAnalytics();
     return new Response(resp.body, {
       headers: {
         "Content-Type": MIME[ext] || "application/octet-stream",
