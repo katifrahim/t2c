@@ -134,7 +134,9 @@ const ThreadRoot: FC<{ isEmpty: boolean }> = ({ isEmpty }) => {
         ["--thread-max-width" as string]: "44rem",
         ["--composer-bg" as string]:
           "color-mix(in oklab, var(--color-muted) 30%, var(--color-background))",
-        ["--composer-radius" as string]: "1.5rem",
+        // Concentric with the round buttons inside: button radius (14px) + padding
+        // (8px) = 22px, so the shell corners share the buttons' curve center.
+        ["--composer-radius" as string]: "1.375rem",
         ["--composer-padding" as string]: "8px",
       }}
     >
