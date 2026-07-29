@@ -311,7 +311,12 @@ The models you build are for real fabrication:
 - 2D sketches can be exported to DXF, SVG, STEP or BREP for laser, plasma, water-jet or CNC cutting.
 - Every model you generate can also be imported by the user into their CAD software (e.g. Fusion 360, FreeCAD, etc) for manual editing.
 - 3D printing is supported end-to-end: the export drops straight into a slicer that generates the G-code.
-- 3D CNC milling and 2D laser, plasma, water-jet, CNC cutting are design-only — you can make the CAD model, but can't do CAM or the G-code part yet.`;
+- 3D CNC milling and 2D laser, plasma, water-jet, CNC cutting are design-only — you can make the CAD model, but can't do CAM or the G-code part yet.
+
+IMPORTANT NOTES:
+- If, and only if, the user asks for something you GENUINELY CANNOT accomplish with your available tools (a TRULY UNSUPPORTED capability, NOT merely something difficult), call the get_more_tools tool ONCE to report the gap, then plainly tell the user what you can't do. Never call get_more_tools as a routine check. Never call it when your existing tools can accomplish the task. Never call it before actually extensively trying the tools you already have. Never use it as an excuse to be lazy.
+- The internal \`context\` field you fill on each tool call is telemetry only — it is NEVER shown to the user and does NOT count as your reply to the user!
+`;
 
 // Pull a human-readable message out of whatever shape the error arrives in.
 function errorMessage(e) {

@@ -7237,9 +7237,23 @@ def _setup_mcp_analytics():
         return
     try:
         from posthog import Posthog
-        from posthog.mcp import instrument
+        from posthog.mcp import instrument, MCPAnalyticsOptions, MCPAnalyticsContextOptions
         client = Posthog(key, host=os.environ.get("POSTHOG_HOST", "https://us.i.posthog.com"))
-        instrument(mcp, client)
+        # report_missing registers a virtual `get_more_tools` tool the agent calls
+        # when a request needs a capability we don't offer → $mcp_missing_capability
+        # events stamped with the agent's description of the gap (the R&D wishlist).
+        # context keeps per-call intent ($mcp_intent), but its description makes clear
+        # this injected field is internal-only so the model doesn't mistake it for its
+        # user reply and go silent (paired with the OUTPUT RULE in the web system prompt).
+        instrument(mcp, client, options=MCPAnalyticsOptions(
+            report_missing=True,
+            context=MCPAnalyticsContextOptions(
+                description=(
+                    "Internal analytics only — never shown to the user and NOT a substitute for your reply. " 
+                    "In one short phrase, why are you calling this tool?"
+                )
+            ),
+        ))
         atexit.register(client.shutdown)  # flush queued events on process exit
     except Exception as e:
         logging.getLogger(__name__).warning("MCP analytics disabled: %s", e)
