@@ -658,9 +658,8 @@ const AssistantMessage: FC = () => {
     >
       <div
         data-slot="aui_assistant-message-content"
-        // ph-mask: keep the model's (proprietary) CAD output out of session replays.
         // [contain-intrinsic-size:auto_24px] fixes issue #4104, don't change without checking for regressions
-        className="ph-mask text-foreground px-2 leading-relaxed wrap-break-word [contain-intrinsic-size:auto_24px] [content-visibility:auto]"
+        className="text-foreground px-2 leading-relaxed wrap-break-word [contain-intrinsic-size:auto_24px] [content-visibility:auto]"
       >
         <MessagePrimitive.GroupedParts
           groupBy={groupPartByType({
@@ -789,7 +788,7 @@ const UserMessage: FC = () => {
       <UserMessageAttachments />
 
       <div className="aui-user-message-content-wrapper relative col-start-2 min-w-0">
-        <div className="aui-user-message-content peer ph-mask bg-muted text-foreground rounded-xl px-4 py-2 wrap-break-word empty:hidden">
+        <div className="aui-user-message-content peer bg-muted text-foreground rounded-xl px-4 py-2 wrap-break-word empty:hidden">
           <MessagePrimitive.Parts />
         </div>
         <div className="aui-user-action-bar-wrapper absolute start-0 top-1/2 -translate-x-full -translate-y-1/2 pe-2 peer-empty:hidden rtl:translate-x-full">

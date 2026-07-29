@@ -24,9 +24,10 @@ export default function RootLayout({ children }) {
             person_profiles: "identified_only",
             // PostHogPageView captures SPA pageviews; disable the built-in to avoid dupes.
             capture_pageview: false,
-            // Record sessions for UX insight, but never capture proprietary prompt/model
-            // text: all inputs are masked, plus any element tagged .ph-mask.
-            session_recording: { maskAllInputs: true, maskTextSelector: ".ph-mask" },
+            // Record everything for maximum UX/debugging insight — replays are only
+            // accessed by us. Mask just password inputs so credentials never land in
+            // a recording (PostHog masks type=password when maskInputOptions says so).
+            session_recording: { maskAllInputs: false, maskInputOptions: { password: true } },
           }}
           bootstrapFlags
         >
