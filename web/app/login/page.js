@@ -4,6 +4,7 @@ import { useRouter } from "next/navigation";
 import Link from "next/link";
 import { EyeIcon, EyeOffIcon, Loader2Icon, ArrowLeftIcon } from "lucide-react";
 import { createClient, SUPABASE_CONFIGURED } from "@/lib/supabase/client";
+import { track, identify, EVENTS } from "@/lib/analytics";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -48,11 +49,14 @@ export default function LoginPage() {
     try {
       const supabase = createClient();
       if (mode === "signin") {
-        const { error } = await supabase.auth.signInWithPassword({ email, password });
+        const { data, error } = await supabase.auth.signInWithPassword({ email, password });
         if (error) return setError(error.message);
+        identify(data.user?.id, email);
+        track(EVENTS.SIGN_IN_SUCCEEDED);
         router.push("/");
         router.refresh();
       } else if (mode === "signup") {
+        track(EVENTS.SIGN_UP_SUBMITTED);
         const { data, error } = await supabase.auth.signUp({
           email,
           password,
@@ -65,6 +69,8 @@ export default function LoginPage() {
           setNotice("Check your email to confirm your account.");
           setMode("signin");
         } else {
+          identify(data.user?.id, email);
+          track(EVENTS.SIGN_UP_SUCCEEDED);
           router.push("/");
           router.refresh();
         }
@@ -82,6 +88,7 @@ export default function LoginPage() {
 
   async function google() {
     setError(null);
+    track(EVENTS.OAUTH_CLICK, { provider: "google" });
     const supabase = createClient();
     await supabase.auth.signInWithOAuth({
       provider: "google",

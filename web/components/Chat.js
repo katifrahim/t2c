@@ -50,6 +50,7 @@ import { useSessionStore } from "@/lib/session-store";
 import { useThreadOrderStore } from "@/lib/thread-order-store";
 import { useViewerThemeStore } from "@/lib/viewer-theme-store";
 import { createClient, SUPABASE_CONFIGURED } from "@/lib/supabase/client";
+import { track, resetIdentity, EVENTS } from "@/lib/analytics";
 
 const EXPORT_FORMATS = [
   { fmt: "stl", label: "STL" },
@@ -131,6 +132,7 @@ function TopBar({ onToggleHistory, historyOpen }) {
   const [confirmSignOut, setConfirmSignOut] = useState(false);
 
   function newChat() {
+    track(EVENTS.NEW_CHAT);
     try {
       runtime.switchToNewThread();
     } catch {
@@ -149,6 +151,7 @@ function TopBar({ onToggleHistory, historyOpen }) {
   }
 
   function download(fmt) {
+    track(EVENTS.EXPORT_CLICKED, { format: fmt, is_sketch: isSketch });
     setMenuOpen(false);
     const a = document.createElement("a");
     a.href = `/api/export?fmt=${fmt}&session=${sessionId}`;
@@ -159,6 +162,7 @@ function TopBar({ onToggleHistory, historyOpen }) {
   }
 
   async function signOut() {
+    resetIdentity(); // clear PostHog identity so the next user isn't merged in
     await createClient().auth.signOut();
     window.location.href = "/";
   }
@@ -174,7 +178,7 @@ function TopBar({ onToggleHistory, historyOpen }) {
           render={
             <select
               value={model}
-              onChange={(e) => setModel(e.target.value)}
+              onChange={(e) => { setModel(e.target.value); track(EVENTS.MODEL_SWITCHED, { model: e.target.value }); }}
               aria-label="Model"
               style={{
                 flex: 1, minWidth: 0, fontSize: 13,

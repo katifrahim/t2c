@@ -1,5 +1,7 @@
+"use client";
 import Link from "next/link";
 import { ArrowRightIcon, ImageIcon } from "lucide-react";
+import { track, EVENTS } from "@/lib/analytics";
 
 // Full-page blueprint grid — no fade.
 const BLUEPRINT = {
@@ -39,6 +41,7 @@ export default function Landing() {
 
         <Link
           href="/login"
+          onClick={() => track(EVENTS.GET_STARTED_CLICK)}
           className="inline-flex h-11 cursor-pointer items-center justify-center gap-2 rounded-lg bg-primary px-6 text-base font-medium text-primary-foreground outline-none transition-all hover:bg-primary/80 focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50 active:translate-y-px"
         >
           Get started
