@@ -21,6 +21,17 @@ import {
 } from "@/components/assistant-ui/tool-group";
 import { TooltipIconButton } from "@/components/assistant-ui/tooltip-icon-button";
 import { Button } from "@/components/ui/button";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
+import { Textarea } from "@/components/ui/textarea";
 import { cn } from "@/lib/utils";
 import {
   ActionBarMorePrimitive,
@@ -40,21 +51,27 @@ import {
 import {
   ArrowDownIcon,
   ArrowUpIcon,
+  BookmarkIcon,
   CheckIcon,
   ChevronLeftIcon,
   ChevronRightIcon,
   CopyIcon,
   DownloadIcon,
+  GlobeIcon,
+  Loader2Icon,
+  LockIcon,
   MicIcon,
   MoreHorizontalIcon,
   PencilIcon,
   RefreshCwIcon,
   SquareIcon,
+  XIcon,
 } from "lucide-react";
 import {
   createContext,
   useContext,
   useEffect,
+  useState,
   type ComponentType,
   type FC,
   type PropsWithChildren,
@@ -117,7 +134,9 @@ const ThreadRoot: FC<{ isEmpty: boolean }> = ({ isEmpty }) => {
         ["--thread-max-width" as string]: "44rem",
         ["--composer-bg" as string]:
           "color-mix(in oklab, var(--color-muted) 30%, var(--color-background))",
-        ["--composer-radius" as string]: "1.5rem",
+        // Concentric with the round buttons inside: button radius (14px) + padding
+        // (8px) = 22px, so the shell corners share the buttons' curve center.
+        ["--composer-radius" as string]: "1.375rem",
         ["--composer-padding" as string]: "8px",
       }}
     >
@@ -184,8 +203,9 @@ const ThreadScrollToBottom: FC = () => {
 const ThreadWelcome: FC = () => {
   return (
     <div className="aui-thread-welcome-root mb-6 flex flex-col items-center px-4 text-center">
-      <h1 className="aui-thread-welcome-message-inner fade-in slide-in-from-bottom-1 animate-in fill-mode-both text-2xl font-normal duration-200">
-        Text2CAD AI
+      <h1 className="aui-thread-welcome-message-inner fade-in slide-in-from-bottom-1 animate-in fill-mode-both text-3xl duration-200">
+        <span className="font-wordmark">Text2CAD</span>
+        <span className="text-muted-foreground ml-1.5 font-sans font-normal">AI</span>
       </h1>
     </div>
   );
@@ -209,16 +229,142 @@ const ThreadSuggestionItem: FC = () => {
   );
 };
 
+// Starter prompts shown as an animated, typewriter-style placeholder on a new chat —
+// they show what Text2CAD can build instead of describing it. Edit this list freely.
+const STARTER_PROMPTS = [
+  "build a francis turbine assembly.",
+  "build a workbench desk.",
+  "build a cabinet.",
+  "build a roller coaster.",
+  "build a twisted hexagonal vase.",
+];
+
+// True when the user asked for reduced motion — we then skip the typing animation.
+function usePrefersReducedMotion() {
+  const [reduce, setReduce] = useState(false);
+  useEffect(() => {
+    const mq = window.matchMedia("(prefers-reduced-motion: reduce)");
+    const update = () => setReduce(mq.matches);
+    update();
+    mq.addEventListener("change", update);
+    return () => mq.removeEventListener("change", update);
+  }, []);
+  return reduce;
+}
+
+// Caret glyph appended to the placeholder to mimic the text cursor. A real caret is a
+// ~1px bar we can't reproduce exactly in placeholder TEXT, so use a light box-drawing
+// vertical (│) — a thin line — rather than the heavier solid block (▏).
+const CARET = "│";
+
+// Typewriter placeholder: types out each starter prompt, holds, erases, and advances
+// to the next — like someone typing in the box. Runs only while `active`. Returns the
+// current substring plus `paused` (true on the holds, when the caret should blink;
+// false while actively typing/erasing, when a real caret stays solid). Purely
+// decorative: the input keeps a stable aria-label, so screen readers ignore the churn.
+function useTypewriter(active: boolean) {
+  const [text, setText] = useState("");
+  const [paused, setPaused] = useState(false);
+  useEffect(() => {
+    if (!active) {
+      // Reset so a later focus-out restarts cleanly from the first prompt instead of
+      // resuming mid-word from the last text shown before focus.
+      setText("");
+      setPaused(false);
+      return;
+    }
+    let prompt = 0;
+    let chars = 0;
+    let erasing = false;
+    let timer: ReturnType<typeof setTimeout>;
+    const tick = () => {
+      const full = STARTER_PROMPTS[prompt];
+      if (!erasing) {
+        chars++;
+        setText(full.slice(0, chars));
+        setPaused(false);
+        if (chars === full.length) {
+          erasing = true;
+          setPaused(true); // hold → caret blinks
+          timer = setTimeout(tick, 1600);
+          return;
+        }
+        timer = setTimeout(tick, 45 + Math.random() * 45); // human-ish keystrokes
+      } else {
+        chars--;
+        setText(full.slice(0, chars));
+        setPaused(false);
+        if (chars === 0) {
+          erasing = false;
+          prompt = (prompt + 1) % STARTER_PROMPTS.length;
+          setPaused(true); // beat before the next prompt → caret blinks
+          timer = setTimeout(tick, 350);
+          return;
+        }
+        timer = setTimeout(tick, 25);
+      }
+    };
+    timer = setTimeout(tick, 500);
+    return () => clearTimeout(timer);
+  }, [active]);
+  return { text, paused };
+}
+
+// Blinking toggle at ~530ms (a typical caret rate) while `active`.
+function useCaretBlink(active: boolean) {
+  const [on, setOn] = useState(true);
+  useEffect(() => {
+    if (!active) {
+      setOn(true);
+      return;
+    }
+    const id = setInterval(() => setOn((v) => !v), 530);
+    return () => clearInterval(id);
+  }, [active]);
+  return on;
+}
+
+// The composer textarea. Split out so the per-keystroke placeholder animation only
+// re-renders the input, not the whole composer (credit pill, actions, etc.).
+const ComposerInput: FC = () => {
+  const isNewChat = useAuiState(isNewChatView);
+  const isEmpty = useAuiState((s) => s.composer.isEmpty);
+  const reduce = usePrefersReducedMotion();
+  const [focused, setFocused] = useState(false);
+  // Tease prompts only on a fresh, empty, UNFOCUSED chat. The moment the user clicks
+  // in, the animation stops and the field is handed back — their real caret shows and
+  // the placeholder reverts to the plain hint. (No autoFocus, so the preview is
+  // visible on load instead of being pre-empted by focus.)
+  const animate = isNewChat && isEmpty && !reduce && !focused;
+  const { text, paused } = useTypewriter(animate);
+  const blinkOn = useCaretBlink(animate && paused); // blink only on the holds
+  const caretVisible = animate && (paused ? blinkOn : true); // solid while typing
+  const placeholder = animate
+    ? text + (caretVisible ? CARET : "")
+    : isNewChat && isEmpty && reduce
+      ? STARTER_PROMPTS[0] // reduced motion: a static example instead of the animation
+      : "Send a message...";
+  return (
+    <ComposerPrimitive.Input
+      placeholder={placeholder}
+      // While animating (the unfocused preview) hide the browser's real caret so only
+      // our trailing glyph shows. On focus, animate is false, so the real caret returns.
+      className={cn(
+        "aui-composer-input placeholder:text-muted-foreground/80 max-h-32 min-h-10 w-full resize-none bg-transparent px-2.5 py-1 text-base outline-none",
+        animate && "caret-transparent",
+      )}
+      rows={1}
+      aria-label="Message input"
+      onFocus={() => setFocused(true)}
+      onBlur={() => setFocused(false)}
+    />
+  );
+};
+
 const Composer: FC = () => {
   return (
     <ComposerPrimitive.Root className="aui-composer-root relative flex w-full flex-col">
-      <ComposerPrimitive.AttachmentDropzone render={<div data-slot="aui_composer-shell" className="border-border/60 data-[dragging=true]:border-ring focus-within:border-border dark:border-muted-foreground/15 dark:focus-within:border-muted-foreground/30 flex w-full flex-col gap-2 rounded-(--composer-radius) border bg-(--composer-bg) p-(--composer-padding) shadow-[0_4px_16px_-8px_rgba(0,0,0,0.08),0_1px_2px_rgba(0,0,0,0.04)] transition-[border-color,box-shadow] focus-within:shadow-[0_6px_24px_-8px_rgba(0,0,0,0.12),0_1px_2px_rgba(0,0,0,0.05)] data-[dragging=true]:border-dashed data-[dragging=true]:bg-[color-mix(in_oklab,var(--color-accent)_50%,var(--color-background))] dark:shadow-none" />}><ComposerAttachments /><ComposerPrimitive.Input
-                      placeholder="Send a message..."
-                      className="aui-composer-input placeholder:text-muted-foreground/80 max-h-32 min-h-10 w-full resize-none bg-transparent px-2.5 py-1 text-base outline-none"
-                      rows={1}
-                      autoFocus
-                      aria-label="Message input"
-                    /><ComposerAction /></ComposerPrimitive.AttachmentDropzone>
+      <ComposerPrimitive.AttachmentDropzone render={<div data-slot="aui_composer-shell" className="border-border/60 data-[dragging=true]:border-ring focus-within:border-border dark:border-muted-foreground/15 dark:focus-within:border-muted-foreground/30 flex w-full flex-col gap-2 rounded-(--composer-radius) border bg-(--composer-bg) p-(--composer-padding) shadow-[0_4px_16px_-8px_rgba(0,0,0,0.08),0_1px_2px_rgba(0,0,0,0.04)] transition-[border-color,box-shadow] focus-within:shadow-[0_6px_24px_-8px_rgba(0,0,0,0.12),0_1px_2px_rgba(0,0,0,0.05)] data-[dragging=true]:border-dashed data-[dragging=true]:bg-[color-mix(in_oklab,var(--color-accent)_50%,var(--color-background))] dark:shadow-none" />}><ComposerAttachments /><ComposerInput /><ComposerAction /></ComposerPrimitive.AttachmentDropzone>
     </ComposerPrimitive.Root>
   );
 };
@@ -243,10 +389,221 @@ const CreditPill: FC = () => {
   );
 };
 
+// Saves the current chat's model as a reusable template in the shared library. The
+// server rebuilds ONLY the final model from scratch and drafts a title/description;
+// a popup lets the user review/edit those before we embed + store the clean tool-call
+// sequence for RAG. The bookmark reflects progress: spinner while working, red ✕ on a
+// failed capture (click to retry), green ✓ once stored.
+const SaveTemplateButton: FC = () => {
+  const remoteId = useAuiState((s) => s.threadListItem.remoteId);
+  const [status, setStatus] = useState<
+    "idle" | "capturing" | "review" | "storing" | "ok" | "error"
+  >("idle");
+  const [steps, setSteps] = useState<unknown[]>([]);
+  const [verified, setVerified] = useState<boolean | null>(null);
+  const [title, setTitle] = useState("");
+  const [description, setDescription] = useState("");
+  const [visibility, setVisibility] = useState<"private" | "public">("private");
+
+  const busy = status === "capturing" || status === "storing";
+  const canSave = !!title.trim() && !!description.trim();
+
+  // Step 1: rebuild the model into a clean template + draft its metadata.
+  const capture = async () => {
+    if (!remoteId || busy) return;
+    setStatus("capturing");
+    try {
+      const res = await fetch(`/api/threads/${remoteId}/capture-template`, { method: "POST" });
+      const data = await res.json().catch(() => null);
+      // The capture ran a billed turn — refresh the credit pill regardless of outcome.
+      useCreditStore.getState().refresh();
+      if (!res.ok || !data?.template?.length) {
+        console.warn("save as template failed:", data?.error ?? res.status);
+        setStatus("error");
+        return;
+      }
+      setSteps(data.template);
+      setVerified(data.verified ?? null);
+      setTitle(data.title ?? "");
+      setDescription(data.description ?? "");
+      setVisibility("private");
+      setStatus("review");
+    } catch (e) {
+      console.warn("save as template failed:", e);
+      setStatus("error");
+    }
+  };
+
+  // Step 2: embed + store the reviewed template in the shared library.
+  const store = async () => {
+    if (status !== "review" || !canSave) return;
+    setStatus("storing");
+    try {
+      const res = await fetch("/api/templates", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ title: title.trim(), description: description.trim(), steps, verified, visibility }),
+      });
+      if (!res.ok) {
+        console.warn("store template failed:", res.status);
+        setStatus("review"); // keep the popup open so the user can retry
+        return;
+      }
+      setStatus("ok");
+    } catch (e) {
+      console.warn("store template failed:", e);
+      setStatus("review");
+    }
+  };
+
+  // Let the green tick settle back to the default bookmark after a beat.
+  useEffect(() => {
+    if (status !== "ok") return;
+    const t = setTimeout(() => setStatus("idle"), 2500);
+    return () => clearTimeout(t);
+  }, [status]);
+
+  if (!remoteId) return null;
+
+  // Match the composer's other icons (e.g. the "+"): size-4.5 at stroke-[1.5px], so
+  // the bookmark doesn't read heavier/darker than its neighbors.
+  const icon = busy ? (
+    <Loader2Icon className="size-4.5 animate-spin stroke-[1.5px]" />
+  ) : status === "ok" ? (
+    <CheckIcon className="size-4.5 stroke-[1.5px] text-green-600" />
+  ) : status === "error" ? (
+    <XIcon className="size-4.5 stroke-[1.5px] text-red-600" />
+  ) : (
+    <BookmarkIcon className="size-4.5 stroke-[1.5px]" />
+  );
+
+  const tooltip =
+    status === "capturing" ? "Building template…"
+    : status === "storing" ? "Saving template…"
+    : status === "error" ? "Couldn't build a template — click to retry"
+    : status === "ok" ? "Template saved"
+    : "Save as template";
+
+  return (
+    <>
+      <TooltipIconButton
+        tooltip={tooltip}
+        side="bottom"
+        type="button"
+        variant="ghost"
+        size="icon"
+        disabled={busy}
+        className="aui-composer-save-template size-7 rounded-full"
+        aria-label="Save as template"
+        onClick={capture}
+      >
+        {icon}
+      </TooltipIconButton>
+
+      <Dialog
+        open={status === "review" || status === "storing"}
+        // Controlled + non-dismissible: ignore backdrop-press and Escape so the popup
+        // only closes via the Cancel button or a successful save (like the sign-out
+        // dialog). All closing is driven by the setStatus calls below.
+        onOpenChange={() => {}}
+      >
+        <DialogContent showCloseButton={false} className="gap-5">
+          <DialogHeader className="items-center text-center">
+            <DialogTitle>Save as template</DialogTitle>
+            <DialogDescription>Set how this template is found and shared.</DialogDescription>
+          </DialogHeader>
+
+          <div className="flex flex-col gap-4">
+            <div className="flex flex-col gap-1.5">
+              <Label htmlFor="template-title">Title</Label>
+              <Input
+                id="template-title"
+                value={title}
+                onChange={(e) => setTitle(e.target.value)}
+                placeholder="e.g. Hex Bolt"
+                maxLength={40}
+                disabled={status === "storing"}
+              />
+            </div>
+
+            <div className="flex flex-col gap-1.5">
+              <Label htmlFor="template-description">Description</Label>
+              <Textarea
+                id="template-description"
+                value={description}
+                onChange={(e) => setDescription(e.target.value)}
+                placeholder="What is it, and what are its key features?"
+                rows={3}
+                maxLength={300}
+                disabled={status === "storing"}
+              />
+            </div>
+
+            <div className="flex flex-col gap-1.5">
+              <Label>Visibility</Label>
+              <div
+                role="radiogroup"
+                className="border-input bg-muted/40 grid grid-cols-2 gap-1 rounded-lg border p-1"
+              >
+                {(["private", "public"] as const).map((v) => {
+                  const active = visibility === v;
+                  const Icon = v === "private" ? LockIcon : GlobeIcon;
+                  return (
+                    <button
+                      key={v}
+                      type="button"
+                      role="radio"
+                      aria-checked={active}
+                      onClick={() => setVisibility(v)}
+                      disabled={status === "storing"}
+                      className={cn(
+                        "flex items-center justify-center gap-1.5 rounded-md px-2.5 py-1.5 text-sm font-medium capitalize transition-colors disabled:pointer-events-none disabled:opacity-60",
+                        active
+                          ? "bg-background text-foreground shadow-sm"
+                          : "text-muted-foreground hover:text-foreground",
+                      )}
+                    >
+                      <Icon className="size-3.5" />
+                      {v}
+                    </button>
+                  );
+                })}
+              </div>
+              <p className="text-muted-foreground text-xs">
+                {visibility === "public"
+                  ? "Anyone can use it, once we've reviewed it."
+                  : "Only you can use it."}
+              </p>
+            </div>
+
+            {verified === false && (
+              <p className="text-muted-foreground border-border/60 border-l-2 pl-2.5 text-xs">
+                We couldn&apos;t fully confirm this template rebuilds your model.
+              </p>
+            )}
+          </div>
+
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setStatus("idle")} disabled={status === "storing"}>
+              Cancel
+            </Button>
+            <Button onClick={store} disabled={!canSave || status === "storing"}>
+              {status === "storing" ? "Saving…" : "Save template"}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+    </>
+  );
+};
+
 const ComposerAction: FC = () => {
   return (
     <div className="aui-composer-action-wrapper relative flex items-center justify-between">
-      <ComposerAddAttachment />
+      <div className="flex items-center gap-1.5">
+        <ComposerAddAttachment />
+        <SaveTemplateButton />
+      </div>
       <CreditPill />
       <div className="flex items-center gap-1.5">
         <AuiIf condition={(s) => s.thread.capabilities.dictation}>
