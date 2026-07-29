@@ -559,7 +559,7 @@ const SaveTemplateButton: FC = () => {
                       onClick={() => setVisibility(v)}
                       disabled={status === "storing"}
                       className={cn(
-                        "flex items-center justify-center gap-1.5 rounded-md px-2.5 py-1.5 text-sm font-medium capitalize transition-colors disabled:pointer-events-none disabled:opacity-60",
+                        "flex cursor-pointer items-center justify-center gap-1.5 rounded-md px-2.5 py-1.5 text-sm font-medium capitalize transition-colors disabled:pointer-events-none disabled:opacity-60",
                         active
                           ? "bg-background text-foreground shadow-sm"
                           : "text-muted-foreground hover:text-foreground",
