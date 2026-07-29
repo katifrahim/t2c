@@ -32,6 +32,9 @@ export default function RootLayout({ children }) {
             session_recording: {
               maskAllInputs: false,
               maskInputOptions: { password: true },
+              // fps/quality kept low on purpose: capture runs on the USER's machine
+              // (framebuffer readback + JPEG encode), so higher values add CPU/GPU +
+              // upload bandwidth load to their session. Quota is per-recording, not size.
               captureCanvas: { canvasFps: 4, canvasQuality: "0.6" },
             },
           }}
