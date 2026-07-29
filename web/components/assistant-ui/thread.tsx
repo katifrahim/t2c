@@ -203,8 +203,9 @@ const ThreadScrollToBottom: FC = () => {
 const ThreadWelcome: FC = () => {
   return (
     <div className="aui-thread-welcome-root mb-6 flex flex-col items-center px-4 text-center">
-      <h1 className="aui-thread-welcome-message-inner fade-in slide-in-from-bottom-1 animate-in fill-mode-both text-2xl font-normal duration-200">
-        Text2CAD AI
+      <h1 className="aui-thread-welcome-message-inner fade-in slide-in-from-bottom-1 animate-in fill-mode-both text-3xl duration-200">
+        <span className="font-wordmark">Text2CAD</span>
+        <span className="text-muted-foreground ml-1.5 font-sans font-normal">AI</span>
       </h1>
     </div>
   );
