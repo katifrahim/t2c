@@ -7,8 +7,10 @@ Tools: workplane_api, sketch_api, assembly_api, query_docs, select_model
 from typing import Any, Dict, List, Optional
 from contextvars import ContextVar
 from dataclasses import dataclass, field
+import atexit
 import inspect
 import json
+import logging
 import math
 import os
 import pickle
@@ -7213,7 +7215,38 @@ def _run_http():
     uvicorn.run(app, host=mcp.settings.host, port=mcp.settings.port)
 
 
+# =============================================================================
+# POSTHOG MCP ANALYTICS  (production only)
+# =============================================================================
+# Auto-captures how the AI agent uses the CAD tools — every tool call (name,
+# parameters, response, duration, errors) plus the agent's intent — so we can see
+# which operations it reaches for, what fails, and where it's slow. instrument()
+# hooks FastMCP's dispatch, so all five tools are covered with no per-tool code.
+# Enabled only when POSTHOG_KEY is set (the prod backend), so local/CI runs
+# stay silent and don't spend the free-tier quota. Any failure degrades to a
+# no-op — analytics must never break the CAD server.
+#
+# Test locally (http transport) — install the dep once, then run with the key set:
+#   ./mcp_server/.venv/bin/pip install -e ./mcp_server
+#   MCP_TRANSPORT=http MCP_TOKEN=<mcp-token> PORT=8080 \
+#   POSTHOG_KEY=<phc_project_key> POSTHOG_HOST=https://us.i.posthog.com \
+#   mcp_server/.venv/bin/python mcp_server/src/t2c_mcp.py
+def _setup_mcp_analytics():
+    key = os.environ.get("POSTHOG_KEY")
+    if not key:
+        return
+    try:
+        from posthog import Posthog
+        from posthog.mcp import instrument
+        client = Posthog(key, host=os.environ.get("POSTHOG_HOST", "https://us.i.posthog.com"))
+        instrument(mcp, client)
+        atexit.register(client.shutdown)  # flush queued events on process exit
+    except Exception as e:
+        logging.getLogger(__name__).warning("MCP analytics disabled: %s", e)
+
+
 if __name__ == "__main__":
+    _setup_mcp_analytics()
     if os.environ.get("MCP_TRANSPORT", "stdio") == "http":
         _VIEWER_MODE = "http"
         # Each session seeds its own placeholder lazily (see _get_session), so the
