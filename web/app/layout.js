@@ -27,7 +27,13 @@ export default function RootLayout({ children }) {
             // Record everything for maximum UX/debugging insight — replays are only
             // accessed by us. Mask just password inputs so credentials never land in
             // a recording (PostHog masks type=password when maskInputOptions says so).
-            session_recording: { maskAllInputs: false, maskInputOptions: { password: true } },
+            // captureCanvas records the WebGL 3D viewer (off by default); WebGL frames
+            // may still capture blank unless the canvas keeps its drawing buffer.
+            session_recording: {
+              maskAllInputs: false,
+              maskInputOptions: { password: true },
+              captureCanvas: { canvasFps: 4, canvasQuality: "0.6" },
+            },
           }}
           bootstrapFlags
         >
