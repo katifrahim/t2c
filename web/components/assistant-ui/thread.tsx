@@ -586,10 +586,10 @@ const SaveTemplateButton: FC = () => {
           </div>
 
           <DialogFooter>
-            <Button variant="outline" onClick={() => setStatus("idle")} disabled={status === "storing"}>
+            <Button variant="outline" onClick={() => setStatus("idle")} disabled={status === "storing"} className="h-10">
               Cancel
             </Button>
-            <Button onClick={store} disabled={!canSave || status === "storing"}>
+            <Button onClick={store} disabled={!canSave || status === "storing"} className="h-10">
               {status === "storing" ? "Saving…" : "Save template"}
             </Button>
           </DialogFooter>
