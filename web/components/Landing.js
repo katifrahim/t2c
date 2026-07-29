@@ -2,6 +2,7 @@
 import Link from "next/link";
 import { ArrowRightIcon, ImageIcon } from "lucide-react";
 import { track, EVENTS } from "@/lib/analytics";
+import { useVariant } from "@/lib/flags";
 
 // Full-page blueprint grid — no fade.
 const BLUEPRINT = {
@@ -20,6 +21,15 @@ const EXAMPLES = [
 // Own scroll container + select-text: the globally-loaded three-cad-viewer.css
 // sets `body { overflow: hidden; user-select: none }`, which we override here.
 export default function Landing() {
+  // Sample A/B experiment: create a "landing-headline" experiment in PostHog with a
+  // "test" variant to try alternate copy; goal metric = landing:get_started_click.
+  // Defaults to the control headline until/unless the experiment is running.
+  const headlineVariant = useVariant("landing-headline");
+  const headline =
+    headlineVariant === "test"
+      ? "Turn plain text into 3D CAD models !!!" // test
+      : "Turn plain text into 3D CAD models"; // control
+
   return (
     <div className="relative flex h-screen flex-col overflow-y-auto bg-background text-foreground select-text">
       {/* Blueprint field framing the edges, fading out behind the text */}
@@ -27,7 +37,7 @@ export default function Landing() {
 
       <main className="relative z-10 flex flex-col items-center gap-6 px-6 pt-28 pb-16 text-center">
         <h1 className="max-w-2xl text-4xl font-semibold tracking-tight text-balance sm:text-5xl">
-          Turn plain text into 3D CAD models
+          {headline}
         </h1>
 
         <div className="flex max-w-[24rem] flex-col gap-4 text-base text-pretty text-foreground/65">
