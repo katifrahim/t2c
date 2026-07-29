@@ -509,7 +509,7 @@ const SaveTemplateButton: FC = () => {
         // dialog). All closing is driven by the setStatus calls below.
         onOpenChange={() => {}}
       >
-        <DialogContent showCloseButton={false} className="gap-4">
+        <DialogContent showCloseButton={false} className="gap-3">
           <DialogHeader className="items-center text-center">
             <DialogTitle>Save as template</DialogTitle>
             <DialogDescription>Set how this template is found and shared.</DialogDescription>
