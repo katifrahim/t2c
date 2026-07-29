@@ -12,6 +12,9 @@ const nextConfig = {
   eslint: { ignoreDuringBuilds: true },
   // PostHog sends a trailing slash on its API calls; don't let Next redirect it.
   skipTrailingSlashRedirect: true,
+  // Expose Vercel's deploy env to the client so analytics can gate on "production
+  // only" (see lib/analytics-enabled.js). Empty locally → treated as non-prod.
+  env: { NEXT_PUBLIC_VERCEL_ENV: process.env.VERCEL_ENV || "" },
   // Keep the OpenTelemetry/Langfuse packages out of the bundler so their Node
   // instrumentation loads correctly on the server.
   serverExternalPackages: [

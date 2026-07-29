@@ -3,6 +3,7 @@ import { useEffect, useRef, useState } from "react";
 import { LoaderIcon } from "lucide-react";
 import { useSessionStore } from "@/lib/session-store";
 import { useViewerThemeStore } from "@/lib/viewer-theme-store";
+import { ANALYTICS_ENABLED } from "@/lib/analytics-enabled";
 
 // Ported verbatim from ocp_vscode's viewer.html so the look/toolbar (studio
 // background, zebra/measure/explode tools, etc.) match the standalone viewer.
@@ -80,7 +81,7 @@ function buildOptions(keys, config, defaults) {
 // idempotent. Must run before the viewer creates its renderer.
 function enableCanvasReplayCapture() {
   if (typeof HTMLCanvasElement === "undefined") return;
-  if (!process.env.NEXT_PUBLIC_POSTHOG_KEY) return;
+  if (!ANALYTICS_ENABLED) return;
   const proto = HTMLCanvasElement.prototype;
   if (proto.__t2cReplayPatched) return;
   const orig = proto.getContext;

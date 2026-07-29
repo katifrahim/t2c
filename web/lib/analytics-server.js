@@ -5,8 +5,9 @@
 // with the user's session replay. No-ops when PostHog isn't configured.
 import { createPostHog } from "@posthog/next";
 import { createClient } from "@/lib/supabase/server";
+import { ANALYTICS_ENABLED } from "@/lib/analytics-enabled";
 
-const ENABLED = !!process.env.NEXT_PUBLIC_POSTHOG_KEY;
+const ENABLED = ANALYTICS_ENABLED;
 
 export const { getPostHog } = createPostHog({
   options: { host: process.env.NEXT_PUBLIC_POSTHOG_HOST },

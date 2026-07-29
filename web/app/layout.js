@@ -2,6 +2,7 @@ import { Geist, Space_Mono } from "next/font/google";
 import { PostHogProvider, PostHogPageView } from "@posthog/next";
 import { Analytics } from "@vercel/analytics/next";
 import { SpeedInsights } from "@vercel/speed-insights/next";
+import { ANALYTICS_ENABLED } from "@/lib/analytics-enabled";
 import "./globals.css";
 
 // Geist for all UI/body text; Space Mono as the characterful technical face used
@@ -37,14 +38,24 @@ export default function RootLayout({ children }) {
               // upload bandwidth load to their session. Quota is per-recording, not size.
               captureCanvas: { canvasFps: 4, canvasQuality: "0.6" },
             },
+            // Outside production the SDK still loads (so feature flags work in dev),
+            // but captures nothing — no events, no replays — to protect the free-tier
+            // quota. Flip on locally with NEXT_PUBLIC_ANALYTICS_DEV=true.
+            opt_out_capturing_by_default: !ANALYTICS_ENABLED,
+            disable_session_recording: !ANALYTICS_ENABLED,
+            autocapture: ANALYTICS_ENABLED,
           }}
           bootstrapFlags
         >
           <PostHogPageView />
           {children}
         </PostHogProvider>
-        <Analytics />
-        <SpeedInsights />
+        {ANALYTICS_ENABLED && (
+          <>
+            <Analytics />
+            <SpeedInsights />
+          </>
+        )}
       </body>
     </html>
   );
