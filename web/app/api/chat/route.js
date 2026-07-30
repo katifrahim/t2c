@@ -14,6 +14,8 @@ import { createClient } from "@/lib/supabase/server";
 import { embedText } from "@/lib/embeddings";
 import { langfuseSpanProcessor } from "@/instrumentation";
 import { langfuse } from "@/lib/langfuse";
+import { captureServer, flushServerAnalytics } from "@/lib/analytics-server";
+import { EVENTS } from "@/lib/analytics-events";
 
 const SUPABASE_ON = !!process.env.NEXT_PUBLIC_SUPABASE_URL;
 const LANGFUSE_ON = !!process.env.LANGFUSE_PUBLIC_KEY;
@@ -309,7 +311,12 @@ The models you build are for real fabrication:
 - 2D sketches can be exported to DXF, SVG, STEP or BREP for laser, plasma, water-jet or CNC cutting.
 - Every model you generate can also be imported by the user into their CAD software (e.g. Fusion 360, FreeCAD, etc) for manual editing.
 - 3D printing is supported end-to-end: the export drops straight into a slicer that generates the G-code.
-- 3D CNC milling and 2D laser, plasma, water-jet, CNC cutting are design-only — you can make the CAD model, but can't do CAM or the G-code part yet.`;
+- 3D CNC milling and 2D laser, plasma, water-jet, CNC cutting are design-only — you can make the CAD model, but can't do CAM or the G-code part yet.
+
+IMPORTANT NOTES:
+- If, and only if, the user asks for something you GENUINELY CANNOT accomplish with your available tools (a TRULY UNSUPPORTED capability, NOT merely something difficult), call the get_more_tools tool ONCE to report the gap, then plainly tell the user what you can't do. Never call get_more_tools as a routine check. Never call it when your existing tools can accomplish the task. Never call it before actually extensively trying the tools you already have. Never use it as an excuse to be lazy.
+- The internal \`context\` field you fill on each tool call is telemetry only — it is NEVER shown to the user and does NOT count as your reply to the user!
+`;
 
 // Pull a human-readable message out of whatever shape the error arrives in.
 function errorMessage(e) {
@@ -347,6 +354,12 @@ export async function POST(req) {
   // assistant-ui's transport sends the thread's remoteId as `id`; that IS the
   // chat's persistent session id. Fall back to sessionId for older callers.
   const session = id ?? sessionId;
+  const selectedModel = model || DEFAULT_MODEL;
+  // The chat id for analytics/metering — null for unsynced local-only chats.
+  const chatId = session && !session.startsWith("__LOCALID") ? session : null;
+  // A fresh user prompt (last msg is theirs) vs. a client auto-continue of an
+  // in-progress build (last msg is the assistant's) — used to avoid double-counting.
+  const isNewPrompt = messages?.[messages.length - 1]?.role === "user";
 
   const backendUrl = process.env.BACKEND_URL ?? "http://localhost:8080";
   const token = process.env.MCP_TOKEN;
@@ -373,6 +386,8 @@ export async function POST(req) {
       .maybeSingle();
     creditsRemaining = bal?.credits_remaining ?? null;
     if (creditsRemaining != null && creditsRemaining < MIN_RESERVE) {
+      await captureServer(EVENTS.CREDITS_EXHAUSTED, { credits_remaining: creditsRemaining, chat_id: chatId });
+      await flushServerAnalytics();
       // Render as a markdown blockquote: the chat styles it as a calm, muted
       // callout (thin left bar + gray text) — distinct from a normal reply without
       // shouting. Two trailing spaces = a hard line break so line 2 sits under line 1.
@@ -390,11 +405,21 @@ export async function POST(req) {
   // OpenRouter reject the whole request. Refuse early — before opening the MCP
   // client or calling the model — with a clear, unbilled notice so the user
   // switches models instead of seeing a cryptic provider error.
-  const selectedModel = model || DEFAULT_MODEL;
   if (!MODELS.find((m) => m.id === selectedModel)?.vision && hasImagePart(messages)) {
     return noticeResponse(
       "> This model can't read images.  \n> Please switch to a \"Vision\" model.",
     );
+  }
+
+  // A real new prompt that cleared the credit + image gates. Auto-continues (last
+  // msg is the assistant's) don't re-count — they resume the same submission.
+  if (isNewPrompt) {
+    await captureServer(EVENTS.PROMPT_SUBMITTED, {
+      model: selectedModel,
+      prompt_length: (lastUserText(messages) ?? "").length,
+      has_image: hasImagePart(messages),
+      chat_id: chatId,
+    });
   }
 
   // One MCP client per request, connected to the t2c FastMCP server over
@@ -485,8 +510,27 @@ export async function POST(req) {
       await chargeUsage({ supabase, uid, session, model: selectedModel, totalUsage, traceId, cost, credits });
       await saveSnapshot({ supabase, uid, session, backendUrl, token });
       if (!error) recordScores({ traceId, environment: ENVIRONMENT, cost, credits });
+      // Authoritative turn outcome for product/AI R&D: latency, tool usage, spend,
+      // and a trace_id to jump to the full Langfuse trace. A turn that produced no
+      // visible text or tool result (empty/pure-leak) counts as a failure.
+      const succeeded = !error && productive;
+      const toolCalls = (steps ?? []).reduce((n, s) => n + (s.toolCalls?.length ?? 0), 0);
+      await captureServer(succeeded ? EVENTS.GENERATION_SUCCEEDED : EVENTS.GENERATION_FAILED, {
+        model: selectedModel,
+        duration_ms: Date.now() - startedAt,
+        step_count: steps?.length ?? 0,
+        tool_call_count: toolCalls,
+        total_tokens: totalUsage?.totalTokens ?? 0,
+        cost_usd: cost,
+        credits,
+        trace_id: traceId,
+        is_continuation: !isNewPrompt,
+        chat_id: chatId,
+        ...(succeeded ? {} : { reason: error ? "error" : "empty", ...(error ? { error: errorMessage(error) } : {}) }),
+      });
       if (langfuse) await langfuse.flush();
       if (langfuseSpanProcessor) await langfuseSpanProcessor.forceFlush();
+      await flushServerAnalytics();
     };
 
     const result = streamText({

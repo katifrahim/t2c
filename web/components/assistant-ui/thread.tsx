@@ -6,6 +6,7 @@ import {
   UserMessageAttachments,
 } from "@/components/assistant-ui/attachment";
 import { MarkdownText } from "@/components/assistant-ui/markdown-text";
+import { track, EVENTS } from "@/lib/analytics";
 import {
   Reasoning,
   ReasoningContent,
@@ -449,6 +450,7 @@ const SaveTemplateButton: FC = () => {
         setStatus("review"); // keep the popup open so the user can retry
         return;
       }
+      track(EVENTS.TEMPLATE_SAVED, { visibility });
       setStatus("ok");
     } catch (e) {
       console.warn("store template failed:", e);
@@ -507,7 +509,7 @@ const SaveTemplateButton: FC = () => {
         // dialog). All closing is driven by the setStatus calls below.
         onOpenChange={() => {}}
       >
-        <DialogContent showCloseButton={false} className="gap-5">
+        <DialogContent showCloseButton={false} className="gap-3">
           <DialogHeader className="items-center text-center">
             <DialogTitle>Save as template</DialogTitle>
             <DialogDescription>Set how this template is found and shared.</DialogDescription>
@@ -557,7 +559,7 @@ const SaveTemplateButton: FC = () => {
                       onClick={() => setVisibility(v)}
                       disabled={status === "storing"}
                       className={cn(
-                        "flex items-center justify-center gap-1.5 rounded-md px-2.5 py-1.5 text-sm font-medium capitalize transition-colors disabled:pointer-events-none disabled:opacity-60",
+                        "flex cursor-pointer items-center justify-center gap-1.5 rounded-md px-2.5 py-1.5 text-sm font-medium capitalize transition-colors disabled:pointer-events-none disabled:opacity-60",
                         active
                           ? "bg-background text-foreground shadow-sm"
                           : "text-muted-foreground hover:text-foreground",
@@ -584,10 +586,10 @@ const SaveTemplateButton: FC = () => {
           </div>
 
           <DialogFooter>
-            <Button variant="outline" onClick={() => setStatus("idle")} disabled={status === "storing"}>
+            <Button variant="outline" onClick={() => setStatus("idle")} disabled={status === "storing"} className="h-10">
               Cancel
             </Button>
-            <Button onClick={store} disabled={!canSave || status === "storing"}>
+            <Button onClick={store} disabled={!canSave || status === "storing"} className="h-10">
               {status === "storing" ? "Saving…" : "Save template"}
             </Button>
           </DialogFooter>
@@ -722,7 +724,10 @@ const AssistantMessage: FC = () => {
                 return (
                   <span
                     data-slot="aui_assistant-message-indicator"
-                    className="animate-pulse font-sans"
+                    // Match the streaming caret's font so the ● renders the same
+                    // size (Geist draws it smaller than system-ui).
+                    className="animate-pulse"
+                    style={{ fontFamily: "ui-sans-serif, system-ui, sans-serif" }}
                     aria-label="Assistant is working"
                   >
                     {"●"}

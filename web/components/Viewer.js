@@ -3,6 +3,7 @@ import { useEffect, useRef, useState } from "react";
 import { LoaderIcon } from "lucide-react";
 import { useSessionStore } from "@/lib/session-store";
 import { useViewerThemeStore } from "@/lib/viewer-theme-store";
+import { ANALYTICS_ENABLED } from "@/lib/analytics-enabled";
 
 // Ported verbatim from ocp_vscode's viewer.html so the look/toolbar (studio
 // background, zebra/measure/explode tools, etc.) match the standalone viewer.
@@ -71,6 +72,26 @@ function buildOptions(keys, config, defaults) {
     o[ok] = preset(config, k, defaults[ok]);
   }
   return o;
+}
+
+// PostHog/rrweb session replay snapshots a WebGL canvas by reading it back
+// (toDataURL), which returns blank unless the context preserves its drawing
+// buffer — three.js defaults it off. Force it on for WebGL contexts so the 3D
+// model shows in replays. Gated on PostHog being enabled (minor GPU cost) and
+// idempotent. Must run before the viewer creates its renderer.
+function enableCanvasReplayCapture() {
+  if (typeof HTMLCanvasElement === "undefined") return;
+  if (!ANALYTICS_ENABLED) return;
+  const proto = HTMLCanvasElement.prototype;
+  if (proto.__t2cReplayPatched) return;
+  const orig = proto.getContext;
+  proto.getContext = function (type, attrs) {
+    if (type === "webgl" || type === "webgl2" || type === "experimental-webgl") {
+      attrs = { ...(attrs || {}), preserveDrawingBuffer: true };
+    }
+    return orig.call(this, type, attrs);
+  };
+  proto.__t2cReplayPatched = true;
 }
 
 // Load the vendored ESM via a native module <script> so the bundler doesn't
@@ -183,6 +204,8 @@ export default function Viewer() {
   useEffect(() => {
     let cancelled = false;
     let timer = null;
+    // Patch before the viewer builds its WebGL context (below), so replays capture it.
+    enableCanvasReplayCapture();
 
     // Forward measurement tool events (distance/properties) to the backend and
     // feed the computed result back to the viewer.

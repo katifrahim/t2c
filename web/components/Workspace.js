@@ -37,7 +37,7 @@ function MobileWorkspace() {
       onClick={() => setPane(id)}
       aria-pressed={pane === id}
       className={cn(
-        "flex-1 py-2 text-sm font-medium transition-colors",
+        "flex-1 cursor-pointer py-2 text-sm font-medium transition-colors",
         id === "viewer" && "border-r", // thin divider between the two segments
         pane === id
           ? "bg-background text-foreground"

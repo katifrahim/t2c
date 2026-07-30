@@ -10,6 +10,11 @@ const nextConfig = {
   // so don't let those third-party type/lint errors block the production build.
   typescript: { ignoreBuildErrors: true },
   eslint: { ignoreDuringBuilds: true },
+  // PostHog sends a trailing slash on its API calls; don't let Next redirect it.
+  skipTrailingSlashRedirect: true,
+  // Expose Vercel's deploy env to the client so analytics can gate on "production
+  // only" (see lib/analytics-enabled.js). Empty locally → treated as non-prod.
+  env: { NEXT_PUBLIC_VERCEL_ENV: process.env.VERCEL_ENV || "" },
   // Keep the OpenTelemetry/Langfuse packages out of the bundler so their Node
   // instrumentation loads correctly on the server.
   serverExternalPackages: [
@@ -27,6 +32,10 @@ const nextConfig = {
       { source: "/api/model", destination: `${backend}/model` },
       { source: "/api/version", destination: `${backend}/version` },
       { source: "/api/backend", destination: `${backend}/backend` },
+      // Reverse-proxy PostHog through our origin so its requests are first-party
+      // (survives ad-blockers). Matches the provider's api_host of "/ingest".
+      { source: "/ingest/static/:path*", destination: "https://us-assets.i.posthog.com/static/:path*" },
+      { source: "/ingest/:path*", destination: "https://us.i.posthog.com/:path*" },
     ];
   },
 };
