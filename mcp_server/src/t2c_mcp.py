@@ -440,29 +440,94 @@ def _named_color(name: str) -> "Color":
     raise ValueError(f"Unknown colour name '{name}'. Use a CSS/X11 colour name or {{\"r\",\"g\",\"b\"}}.")
 
 
+# =============================================================================
+# TEXTURED MATERIALS
+# =============================================================================
+# Real surface detail (wood grain, brushed metal, fabric, stone …) via Poly Haven
+# CC0 texture sets, referenced BY URL (loaded straight from Poly Haven's CDN, not
+# embedded in the payload) and projected onto the model with the viewer's triplanar
+# mapping (no UVs needed on CAD geometry). Maps: diff (colour), nor_gl (normal),
+# rough (roughness), ao. Missing maps degrade gracefully (the viewer skips them).
+_TEXTURE_BASE = "https://dl.polyhaven.org/file/ph-assets/Textures/jpg/1k"
+
+# category → (Poly Haven slug, metalness). Slugs verified to exist.
+_TEXTURE_CATALOG = {
+    "wood":             ("wood_table_001", 0.0),
+    "oak":              ("oak_veneer_01", 0.0),
+    "wood_laminate":    ("laminate_floor_02", 0.0),
+    "marble":           ("marble_01", 0.0),
+    "concrete":         ("concrete_wall_008", 0.0),
+    "concrete_floor":   ("concrete_floor_worn_001", 0.0),
+    "brick":            ("brick_wall_006", 0.0),
+    "cobblestone":      ("cobblestone_floor_04", 0.0),
+    "stone":            ("gray_rocks", 0.0),
+    "rubber":           ("rubber_tiles", 0.0),
+    "fabric":           ("denim_fabric", 0.0),
+    "leather":          ("leather_white", 0.0),
+    "metal_plate":      ("metal_plate_02", 1.0),
+    "blue_metal":       ("blue_metal_plate", 1.0),
+    "corrugated_metal": ("corrugated_iron_02", 1.0),
+    "rusty_metal":      ("rusty_metal_02", 0.6),
+}
+_TEXTURE_ALIASES = {
+    "wood_grain": "wood", "timber": "wood", "planks": "oak", "laminate": "wood_laminate",
+    "denim": "fabric", "cloth": "fabric", "textile": "fabric", "tile": "cobblestone",
+    "stone_tiles": "cobblestone", "rock": "stone", "brushed_metal": "metal_plate",
+    "galvanized_metal": "corrugated_metal", "rust": "rusty_metal", "granite": "stone",
+}
+
+
+def _texture_appearance(tag: str) -> dict:
+    """Build a viewer appearance object (reliable createStudioMaterial path) with
+    Poly Haven texture-map URLs from a "tex:<metalness>:<slug>" tag."""
+    _, metalness, slug = tag.split(":", 2)
+    url = lambda suffix: f"{_TEXTURE_BASE}/{slug}/{slug}_{suffix}_1k.jpg"
+    return {
+        "builtin": "plastic-matte",   # carrier; overridden below
+        "color": [1.0, 1.0, 1.0],     # show the texture's own colour, untinted
+        "metalness": float(metalness),
+        "roughness": 1.0,             # let the roughness map drive it fully
+        "map": url("diff"),
+        "normalMap": url("nor_gl"),
+        "roughnessMap": url("rough"),
+        "aoMap": url("ao"),
+    }
+
+
 def _build_material(spec: dict) -> str:
     """Resolve a {"_type": "Material"} spec to a viewer material tag (a str).
 
     The tag is applied to the assembly child directly (see _run) rather than via
     Assembly.add(material=...), which would wrap a str into a CadQuery Material.
     """
+    # Textured material: {"_type": "Material", "texture": "<category|slug>"}
+    tex = spec.get("texture")
+    if tex is not None:
+        cat = _TEXTURE_ALIASES.get(tex, tex)
+        if cat in _TEXTURE_CATALOG:
+            slug, metalness = _TEXTURE_CATALOG[cat]
+        else:
+            slug, metalness = cat, (1.0 if spec.get("metal") else 0.0)  # raw Poly Haven slug
+        return f"tex:{metalness}:{slug}"
+
     name = spec.get("preset") or spec.get("builtin") or spec.get("name")
     if not name:
-        raise ValueError('Material spec needs a "preset" — a material name.')
+        raise ValueError('Material spec needs a "preset" or "texture" — a material name.')
     tag = _MATERIAL_ALIASES.get(name, name)
     if tag not in _VIEWER_BUILTINS:
         raise ValueError(
             f"Unknown material '{name}'. Available: {sorted(_VIEWER_BUILTINS)}; "
-            f"aliases: {sorted(_MATERIAL_ALIASES)}."
+            f"aliases: {sorted(_MATERIAL_ALIASES)}; textures: {sorted(_TEXTURE_CATALOG)}."
         )
     # Opaque non-metals are recoloured from the part's own colour.
     return f"builtin:{tag}" if tag in _LEAF_COLOR_BUILTINS else tag
 
 
-def _inject_builtin_materials(payload: dict) -> None:
-    """Give every "builtin:<name>" tag a colour-stripped appearance entry in the
-    payload's materials map, so the viewer renders the builtin finish with the
-    part's own CAD colour instead of the builtin's baked colour."""
+def _inject_studio_materials(payload: dict) -> None:
+    """Turn our marker material tags into the viewer's materials-map appearance
+    entries: "builtin:<name>" → part-coloured builtin; "tex:<m>:<slug>" → textured
+    appearance with Poly Haven map URLs. Both take the reliable createStudioMaterial
+    path (no black-albedo MaterialX bug)."""
     try:
         shapes = payload["data"]["shapes"]
     except (KeyError, TypeError):
@@ -473,16 +538,20 @@ def _inject_builtin_materials(payload: dict) -> None:
         if not isinstance(node, dict):
             return
         mat = node.get("material")
-        if isinstance(mat, str) and mat.startswith("builtin:"):
+        if isinstance(mat, str) and (mat.startswith("builtin:") or mat.startswith("tex:")):
             tags.add(mat)
         for child in node.get("parts", []) or []:
             walk(child)
 
     walk(shapes)
-    if tags:
-        mats = shapes.setdefault("materials", {})
-        for tag in tags:
+    if not tags:
+        return
+    mats = shapes.setdefault("materials", {})
+    for tag in tags:
+        if tag.startswith("builtin:"):
             mats.setdefault(tag, {"builtin": tag[len("builtin:"):]})
+        else:
+            mats.setdefault(tag, _texture_appearance(tag))
 
 
 def _construct_type(spec: dict) -> Any:
@@ -691,7 +760,7 @@ def _show_tessellate(obj: Any) -> None:
         # progress to stdout; mute both so the stdio JSON-RPC stream stays clean.
         with contextlib.redirect_stderr(io.StringIO()), contextlib.redirect_stdout(io.StringIO()):
             payload, mapping = _ocp_convert(obj)
-        _inject_builtin_materials(payload)  # colour builtin dielectrics from each part's colour
+        _inject_studio_materials(payload)  # resolve builtin/texture material tags → appearance entries
         payload["config"]["reset_camera"] = "iso"  # frame the part on each render
         sess = _sess()
         sess.viewer["payload"] = payload
@@ -1717,13 +1786,25 @@ async def assembly_api(
             - METALS keep their own metallic tint (gold looks gold) — the part colour doesn't recolour
               them, so just choose the metal whose colour you want.
             - GLASS/acrylic are transparent.
-        Do NOT put a "color" or raw PBR numbers inside the material spec — only pick a preset name;
+        Do NOT put a "color" or raw PBR numbers inside a PRESET material spec — only pick a preset name;
         colour always comes from the part's "add" colour.
+
+        TEXTURED surfaces (real grain/weave/detail): {"_type": "Material", "texture": "<name>"}
+            Use these when the surface should show a photographic texture rather than a flat finish.
+            Textures are projected onto the part automatically (no UVs needed) and carry their own
+            colour, so you do NOT set the part "color" for a textured part.
+            Texture names:
+              wood, oak, wood_laminate, marble, concrete, concrete_floor, brick, cobblestone, stone,
+              rubber, fabric (denim), leather, metal_plate, blue_metal, corrugated_metal, rusty_metal
+            Aliases: wood_grain, timber, planks, cloth, textile, tile, rock, granite, brushed_metal,
+              galvanized_metal, rust. Example — a wooden tabletop: "material": {"_type":"Material","texture":"wood"}.
+            (Prefer a solid PRESET for plain plastics/metals/glass; use a TEXTURE only when real surface
+            detail matters — a wooden panel, a brushed-metal plate, a fabric seat, a marble top.)
 
         Guidance: assign materials proactively and sensibly based on what the part physically is
         (metal bracket → steel/aluminum, lens/window → glass-clear, knob → plastic-glossy,
-        tyre → rubber-black, mug → ceramic-white). The user can ask you to change a part's material or
-        colour at any time — just re-issue the model with the updated "material"/"color".
+        tyre → rubber-black, mug → ceramic-white, wooden handle → texture "wood"). The user can ask you
+        to change a part's material or colour at any time — just re-issue the model with the update.
 
     ── Constraint section ─────────────────────────────────────────────────────────────────────────
 
