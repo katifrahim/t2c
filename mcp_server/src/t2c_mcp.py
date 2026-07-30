@@ -421,6 +421,36 @@ _MATERIAL_OVERRIDE_KEYS = (
     "specular_intensity", "thickness",
 )
 
+# The viewer ships its own tuned Studio presets, reached by passing the preset name
+# as a plain-string material tag. This routes through the viewer's reliable
+# `createStudioMaterial` path (used for ordinary parts). By contrast, a
+# threejs_materials.PbrProperties routes through the viewer's MaterialX path, which
+# renders opaque dielectrics (metalness 0) with a black albedo — so for named
+# presets we emit the builtin tag, and only fall back to PbrProperties for
+# explicit/custom PBR values the builtins can't express.
+_VIEWER_BUILTINS = {
+    "chrome", "polished-steel", "polished-aluminum", "gold", "copper", "brass",
+    "stainless-steel", "brushed-aluminum", "cast-iron", "titanium", "galvanized",
+    "plastic-glossy", "plastic-matte", "abs-black", "nylon", "acrylic-clear",
+    "glass-clear", "glass-tinted", "glass-frosted", "rubber-black", "rubber-gray",
+    "rubber-red", "paint-matte", "paint-glossy", "paint-metallic", "car-paint",
+    "ceramic-white", "carbon-fiber", "concrete",
+}
+
+# Our friendly preset names → the viewer's builtin tag.
+_PRESET_TO_BUILTIN = {
+    "gold": "gold", "polished_gold": "gold", "silver": "polished-aluminum",
+    "chrome": "chrome", "steel": "polished-steel", "stainless_steel": "stainless-steel",
+    "aluminum": "polished-aluminum", "brushed_aluminum": "brushed-aluminum",
+    "copper": "copper", "brass": "brass", "titanium": "titanium",
+    "anodized_black": "abs-black", "matte_plastic": "plastic-matte",
+    "glossy_plastic": "plastic-glossy", "abs_plastic": "abs-black",
+    "rubber": "rubber-black", "matte_black": "paint-matte", "ceramic": "ceramic-white",
+    "car_paint": "car-paint", "glass": "glass-clear", "frosted_glass": "glass-frosted",
+    "concrete": "concrete", "carbon_fiber": "carbon-fiber",
+    # "wood" has no builtin equivalent — falls back to PbrProperties.
+}
+
 
 def _material_rgb(c: Any) -> tuple:
     """Resolve a material colour (CadQuery name, {r,g,b}, or [r,g,b]) to a 0–1 RGB tuple."""
@@ -438,14 +468,34 @@ def _material_rgb(c: Any) -> tuple:
 
 
 def _build_material(spec: dict):
-    """Build a threejs_materials.PbrProperties from a {"_type": "Material"} spec."""
-    if PbrProperties is None:
-        raise RuntimeError("threejs_materials is unavailable; cannot build a material.")
+    """Build a material from a {"_type": "Material"} spec.
+
+    Returns EITHER a plain str (a viewer builtin tag, the reliable path) OR a
+    threejs_materials.PbrProperties (custom PBR, the MaterialX path). A str result
+    is applied to the assembly child directly (see _run) rather than through
+    Assembly.add(material=...), which would wrap it in a CadQuery Material.
+    """
+    # Explicit builtin tag: {"_type": "Material", "builtin": "plastic-matte"}
+    builtin = spec.get("builtin")
+    if builtin is not None:
+        if builtin not in _VIEWER_BUILTINS:
+            raise ValueError(f"Unknown builtin '{builtin}'. Available: {sorted(_VIEWER_BUILTINS)}")
+        return builtin
+
     preset = spec.get("preset")
     if preset is not None and preset not in _MATERIAL_PRESETS:
         raise ValueError(
             f"Unknown material preset '{preset}'. Available: {sorted(_MATERIAL_PRESETS)}"
         )
+
+    # A bare preset (no explicit PBR overrides) → the viewer's own tuned builtin,
+    # via the reliable path. Custom values force the PbrProperties fallback.
+    has_overrides = any(spec.get(k) is not None for k in _MATERIAL_OVERRIDE_KEYS) or spec.get("color") is not None
+    if preset in _PRESET_TO_BUILTIN and not has_overrides:
+        return _PRESET_TO_BUILTIN[preset]
+
+    if PbrProperties is None:
+        raise RuntimeError("threejs_materials is unavailable; cannot build a material.")
     kwargs = dict(_MATERIAL_PRESETS.get(preset, {})) if preset else {}
     for k in _MATERIAL_OVERRIDE_KEYS:
         if spec.get(k) is not None:
@@ -797,7 +847,18 @@ def _run(obj: Any, operations: List[dict]) -> Any:
                     resolved_args[2] = p.toTuple()
             obj = method(*resolved_args, **resolved_kwargs)
         elif raw_params:
-            obj = method(**resolve_value(raw_params))
+            resolved_params = resolve_value(raw_params)
+            # A string `material` is a viewer builtin tag. CadQuery's add() would wrap
+            # a str into a Material object (breaking tessellation), so apply it to the
+            # freshly-added child directly instead of passing it through add().
+            builtin_mat = (
+                resolved_params.pop("material")
+                if method_name == "add" and isinstance(resolved_params.get("material"), str)
+                else None
+            )
+            obj = method(**resolved_params)
+            if builtin_mat is not None and getattr(obj, "children", None):
+                obj.children[-1].material = builtin_mat
         else:
             obj = method()
     return obj
@@ -1650,37 +1711,25 @@ async def assembly_api(
             - By default (if you don't set a color for an object) the objects are displayed to the users with a yellowish color in the viewer.
 
     {"_type": "Material", ...} ("material" param of the "add" method):
-        Sets the part's physical PBR surface material (how light interacts with it). Rendered as a
-        realistic metal/plastic/glass/etc. in the viewer's "Studio" mode. Two ways to specify it,
-        which can be combined:
+        Sets the part's physical surface material (metal / plastic / glass / …), rendered
+        realistically in the viewer's "Studio" mode. Named presets map to the viewer's own tuned
+        materials, so PREFER PRESETS.
 
-        method #1 — named preset (recommended): {"_type": "Material", "preset": "<name>"}
-            Available presets:
-              metals   : gold, polished_gold, silver, chrome, steel, stainless_steel, aluminum,
-                         brushed_aluminum, copper, brass, titanium, anodized_black
-              plastics : matte_plastic, glossy_plastic, abs_plastic
-              other    : rubber, matte_black, ceramic, car_paint, glass, frosted_glass, wood, concrete
-            - Metal presets already carry the correct metallic tint — do NOT override their colour.
-            - Dielectric presets (plastic/rubber/ceramic/car_paint/matte_black/wood/concrete) are
-              neutral by default; give them a hue with "color" (see below). Example — a red glossy
-              knob: {"_type": "Material", "preset": "glossy_plastic", "color": {"_type": "Color", "name": "red"}}
-              …or just "color": "red" / "color": {"r":200,"g":30,"b":30}. glass/frosted_glass are clear.
+        Named preset (recommended): {"_type": "Material", "preset": "<name>"}
+            metals   : gold, polished_gold, silver, chrome, steel, stainless_steel, aluminum,
+                       brushed_aluminum, copper, brass, titanium, anodized_black
+            plastics : matte_plastic, glossy_plastic, abs_plastic
+            other    : rubber, matte_black, ceramic, car_paint, glass, frosted_glass, concrete, wood
+            - Each preset already has a tuned, realistic appearance (colour + finish). Just pick the
+              one that matches the part; you don't need to set anything else.
+            - Do NOT put a "color" inside the material spec, and do not add explicit PBR fields to a
+              preset — either one forces a fallback path that currently renders opaque non-metals dark.
+              (Per-part custom colouring of preset materials is being added separately.)
 
-        method #2 — explicit PBR values: {"_type": "Material", "metalness": 0.0-1.0, "roughness": 0.0-1.0, ...}
-            - Supported fields: metalness, roughness, transmission (0-1, glass), ior (~1.5 glass),
-              clearcoat, clearcoat_roughness, opacity, transparent, emissive [r,g,b], emissive_intensity,
-              sheen (fabric), anisotropy (brushed metal), specular_intensity, thickness.
-            - Explicit fields OVERRIDE the preset when both are given, e.g. a shinier steel:
-              {"_type": "Material", "preset": "steel", "roughness": 0.12}
-
-        "color" (optional): the material's base colour — CadQuery colour name (any name from the
-            Color list above), or {"_type": "Color", ...}, or {"r","g","b"} (0-255 or 0-1), or [r,g,b].
-            When a material sets a colour it drives the Studio appearance, so for coloured dielectrics
-            also pass a matching "color" on the "add" call itself so the plain (non-Studio) view agrees.
-
-        Guidance: assign materials proactively and sensibly based on what the part physically is. The
-        user can also ask you to change a part's material at any time — just re-issue the model with the
-        updated "material". Prefer presets; only use explicit values for looks a preset can't express.
+        Guidance: assign materials proactively and sensibly based on what the part physically is
+        (metal bracket → steel/aluminum, lens/window → glass, knob → glossy_plastic, tyre → rubber).
+        The user can ask you to change a part's material at any time — just re-issue the model with the
+        updated "material".
 
     ── Constraint section ─────────────────────────────────────────────────────────────────────────
 
@@ -2195,7 +2244,7 @@ async def assembly_api(
             {"method": "add", "params": {
             "arg": {"_ref": "part1"}, "name": "part1",
             "color": {"_type": "Color", "name": "darkorange"},
-            "material": {"_type": "Material", "preset": "glossy_plastic", "color": {"_type": "Color", "name": "darkorange"}},
+            "material": {"_type": "Material", "preset": "glossy_plastic"},
             "loc": {"_type": "Location", "x": 0, "y": 0, "z": 0}
             }},
             {"method": "add", "params": {
