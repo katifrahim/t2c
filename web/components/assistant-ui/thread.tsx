@@ -234,9 +234,9 @@ const ThreadSuggestionItem: FC = () => {
 // they show what Text2CAD can build instead of describing it. Edit this list freely.
 const STARTER_PROMPTS = [
   "build a francis turbine assembly.",
-  "build a workbench desk.",
+  "build a workbench.",
   "build a cabinet.",
-  "build a roller coaster.",
+  "build a roller coaster train.",
   "build a twisted hexagonal vase.",
 ];
 
