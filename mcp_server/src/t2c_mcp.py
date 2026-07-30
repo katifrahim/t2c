@@ -45,14 +45,6 @@ except Exception:
     OCP_CONVERT_AVAILABLE = False
     _ocp_convert = None
 
-# Per-part PBR materials. ocp_tessellate carries an object's .material through to
-# the payload's `materials` map, which the viewer's Studio mode renders as a
-# MeshPhysicalMaterial. threejs_materials.PbrProperties is a hard dep of
-# ocp_vscode, so it's present whenever _convert is.
-try:
-    from threejs_materials import PbrProperties
-except Exception:
-    PbrProperties = None
 
 # Measurement backend (distance / properties tools). Forcing is_jupyter_cadquery
 # makes its handlers RETURN responses instead of websocket-sending them, so we
@@ -379,130 +371,118 @@ def resolve_value(value: Any) -> Any:
 
 
 # =============================================================================
-# PBR MATERIALS
+# STUDIO MATERIALS
 # =============================================================================
-# Curated real-world PBR presets → threejs_materials.PbrProperties. Values are
-# metallic-roughness (three.js MeshPhysicalMaterial). Metals carry their
-# characteristic tint in `color`; dielectrics default to neutral and expect the
-# caller to set `color` for the desired hue. Seeded from physicallybased.info
-# references, hardcoded for offline reliability.
-_MATERIAL_PRESETS = {
-    # --- metals: color = characteristic tint, metalness = 1 ---
-    "gold":             dict(color=(1.000, 0.766, 0.336), metalness=1.0, roughness=0.25),
-    "polished_gold":    dict(color=(1.000, 0.766, 0.336), metalness=1.0, roughness=0.08),
-    "silver":           dict(color=(0.972, 0.960, 0.915), metalness=1.0, roughness=0.15),
-    "chrome":           dict(color=(0.550, 0.556, 0.554), metalness=1.0, roughness=0.05),
-    "steel":            dict(color=(0.560, 0.570, 0.580), metalness=1.0, roughness=0.35),
-    "stainless_steel":  dict(color=(0.560, 0.570, 0.580), metalness=1.0, roughness=0.22),
-    "aluminum":         dict(color=(0.913, 0.921, 0.925), metalness=1.0, roughness=0.20),
-    "brushed_aluminum": dict(color=(0.913, 0.921, 0.925), metalness=1.0, roughness=0.40, anisotropy=0.5),
-    "copper":           dict(color=(0.955, 0.637, 0.538), metalness=1.0, roughness=0.30),
-    "brass":            dict(color=(0.887, 0.789, 0.434), metalness=1.0, roughness=0.30),
-    "titanium":         dict(color=(0.620, 0.609, 0.590), metalness=1.0, roughness=0.45),
-    "anodized_black":   dict(color=(0.060, 0.060, 0.065), metalness=0.9, roughness=0.45),
-    # --- dielectrics: set `color` for the hue you want ---
-    "matte_plastic":    dict(color=(0.80, 0.80, 0.80), metalness=0.0, roughness=0.70),
-    "glossy_plastic":   dict(color=(0.80, 0.80, 0.80), metalness=0.0, roughness=0.25, clearcoat=0.6, clearcoat_roughness=0.1),
-    "abs_plastic":      dict(color=(0.80, 0.80, 0.80), metalness=0.0, roughness=0.50),
-    "rubber":           dict(color=(0.08, 0.08, 0.08), metalness=0.0, roughness=0.90),
-    "matte_black":      dict(color=(0.045, 0.045, 0.05), metalness=0.0, roughness=0.80),
-    "ceramic":          dict(color=(0.95, 0.95, 0.95), metalness=0.0, roughness=0.35, clearcoat=0.3, clearcoat_roughness=0.1),
-    "car_paint":        dict(color=(0.70, 0.10, 0.10), metalness=0.0, roughness=0.35, clearcoat=1.0, clearcoat_roughness=0.08),
-    "glass":            dict(color=(1.0, 1.0, 1.0), metalness=0.0, roughness=0.02, transmission=1.0, ior=1.5),
-    "frosted_glass":    dict(color=(1.0, 1.0, 1.0), metalness=0.0, roughness=0.35, transmission=1.0, ior=1.5),
-    "wood":             dict(color=(0.42, 0.26, 0.13), metalness=0.0, roughness=0.60),
-    "concrete":         dict(color=(0.62, 0.62, 0.60), metalness=0.0, roughness=0.90),
-}
-
-# Explicit PBR fields the caller may pass to override a preset (PbrProperties.create kwargs).
-_MATERIAL_OVERRIDE_KEYS = (
-    "metalness", "roughness", "ior", "transmission", "clearcoat", "clearcoat_roughness",
-    "opacity", "transparent", "emissive", "emissive_intensity", "sheen", "anisotropy",
-    "specular_intensity", "thickness",
-)
-
-# The viewer ships its own tuned Studio presets, reached by passing the preset name
-# as a plain-string material tag. This routes through the viewer's reliable
-# `createStudioMaterial` path (used for ordinary parts). By contrast, a
-# threejs_materials.PbrProperties routes through the viewer's MaterialX path, which
-# renders opaque dielectrics (metalness 0) with a black albedo — so for named
-# presets we emit the builtin tag, and only fall back to PbrProperties for
-# explicit/custom PBR values the builtins can't express.
+# A part's material is the name of one of the viewer's built-in Studio materials.
+# Passed as a plain-string tag on the part, it routes through the viewer's reliable
+# `createStudioMaterial` path. (Do NOT feed a threejs_materials.PbrProperties: that
+# takes the viewer's MaterialX path, which renders opaque non-metals with a black
+# albedo.) These 29 names are the viewer's full built-in catalogue.
 _VIEWER_BUILTINS = {
+    # metals (keep their own tuned tint)
     "chrome", "polished-steel", "polished-aluminum", "gold", "copper", "brass",
     "stainless-steel", "brushed-aluminum", "cast-iron", "titanium", "galvanized",
-    "plastic-glossy", "plastic-matte", "abs-black", "nylon", "acrylic-clear",
-    "glass-clear", "glass-tinted", "glass-frosted", "rubber-black", "rubber-gray",
-    "rubber-red", "paint-matte", "paint-glossy", "paint-metallic", "car-paint",
-    "ceramic-white", "carbon-fiber", "concrete",
+    # opaque non-metals (recoloured per part — see _LEAF_COLOR_BUILTINS)
+    "plastic-glossy", "plastic-matte", "abs-black", "nylon", "rubber-black",
+    "rubber-gray", "rubber-red", "paint-matte", "paint-glossy", "paint-metallic",
+    "car-paint", "ceramic-white", "concrete", "carbon-fiber",
+    # transparent (keep their own tuned look)
+    "acrylic-clear", "glass-clear", "glass-tinted", "glass-frosted",
 }
 
-# Our friendly preset names → the viewer's builtin tag.
-_PRESET_TO_BUILTIN = {
-    "gold": "gold", "polished_gold": "gold", "silver": "polished-aluminum",
-    "chrome": "chrome", "steel": "polished-steel", "stainless_steel": "stainless-steel",
-    "aluminum": "polished-aluminum", "brushed_aluminum": "brushed-aluminum",
-    "copper": "copper", "brass": "brass", "titanium": "titanium",
-    "anodized_black": "abs-black", "matte_plastic": "plastic-matte",
-    "glossy_plastic": "plastic-glossy", "abs_plastic": "abs-black",
-    "rubber": "rubber-black", "matte_black": "paint-matte", "ceramic": "ceramic-white",
-    "car_paint": "car-paint", "glass": "glass-clear", "frosted_glass": "glass-frosted",
-    "concrete": "concrete", "carbon_fiber": "carbon-fiber",
-    # "wood" has no builtin equivalent — falls back to PbrProperties.
+# Opaque non-metals: the part's OWN colour (its `add` colour) becomes the hue, while
+# the builtin supplies the finish. Emitted as a "builtin:<name>" tag that
+# _inject_builtin_materials turns into a colour-stripped appearance entry so the
+# viewer falls back to the part's CAD colour. Metals/glass keep their builtin look.
+_LEAF_COLOR_BUILTINS = {
+    "plastic-glossy", "plastic-matte", "abs-black", "nylon", "rubber-black",
+    "rubber-gray", "rubber-red", "paint-matte", "paint-glossy", "paint-metallic",
+    "car-paint", "ceramic-white", "concrete",
 }
 
+# Friendly aliases so natural words also resolve to a builtin.
+_MATERIAL_ALIASES = {
+    "steel": "polished-steel", "polished_steel": "polished-steel",
+    "stainless": "stainless-steel", "stainless_steel": "stainless-steel",
+    "aluminum": "polished-aluminum", "aluminium": "polished-aluminum",
+    "polished_aluminum": "polished-aluminum", "silver": "polished-aluminum",
+    "brushed_aluminum": "brushed-aluminum", "cast_iron": "cast-iron",
+    "plastic": "plastic-matte", "matte_plastic": "plastic-matte",
+    "glossy_plastic": "plastic-glossy", "abs": "abs-black", "abs_plastic": "abs-black",
+    "black_plastic": "abs-black", "rubber": "rubber-black", "matte_black": "paint-matte",
+    "paint": "paint-glossy", "matte_paint": "paint-matte", "glossy_paint": "paint-glossy",
+    "metallic_paint": "paint-metallic", "car_paint": "car-paint",
+    "ceramic": "ceramic-white", "carbon_fiber": "carbon-fiber",
+    "glass": "glass-clear", "frosted_glass": "glass-frosted", "tinted_glass": "glass-tinted",
+    "acrylic": "acrylic-clear", "clear_plastic": "acrylic-clear",
+}
 
-def _material_rgb(c: Any) -> tuple:
-    """Resolve a material colour (CadQuery name, {r,g,b}, or [r,g,b]) to a 0–1 RGB tuple."""
-    if isinstance(c, str):
-        return tuple(Color(c).toTuple()[:3])
-    if isinstance(c, dict):
-        r, g, b = c.get("r", 0), c.get("g", 0), c.get("b", 0)
-    elif isinstance(c, (list, tuple)):
-        r, g, b = c[0], c[1], c[2]
-    else:
-        return (0.8, 0.8, 0.8)
-    if max(r, g, b) > 1:  # accept 0–255 ints or 0–1 floats
-        r, g, b = r / 255.0, g / 255.0, b / 255.0
-    return (r, g, b)
+try:
+    import webcolors as _webcolors
+except Exception:
+    _webcolors = None
 
 
-def _build_material(spec: dict):
-    """Build a material from a {"_type": "Material"} spec.
+def _named_color(name: str) -> "Color":
+    """Resolve a colour name to a CadQuery Color. CadQuery/OCCT only knows X11 names
+    (red, steelblue, gray90, …); fall back to the full CSS palette (crimson, silver,
+    navy, darkblue, …) so common colour names the model reaches for just work."""
+    try:
+        return Color(name)
+    except Exception:
+        pass
+    if _webcolors is not None:
+        try:
+            r, g, b = _webcolors.name_to_rgb(name.strip().replace(" ", "").lower())
+            return Color(r / 255.0, g / 255.0, b / 255.0)
+        except ValueError:
+            pass
+    raise ValueError(f"Unknown colour name '{name}'. Use a CSS/X11 colour name or {{\"r\",\"g\",\"b\"}}.")
 
-    Returns EITHER a plain str (a viewer builtin tag, the reliable path) OR a
-    threejs_materials.PbrProperties (custom PBR, the MaterialX path). A str result
-    is applied to the assembly child directly (see _run) rather than through
-    Assembly.add(material=...), which would wrap it in a CadQuery Material.
+
+def _build_material(spec: dict) -> str:
+    """Resolve a {"_type": "Material"} spec to a viewer material tag (a str).
+
+    The tag is applied to the assembly child directly (see _run) rather than via
+    Assembly.add(material=...), which would wrap a str into a CadQuery Material.
     """
-    # Explicit builtin tag: {"_type": "Material", "builtin": "plastic-matte"}
-    builtin = spec.get("builtin")
-    if builtin is not None:
-        if builtin not in _VIEWER_BUILTINS:
-            raise ValueError(f"Unknown builtin '{builtin}'. Available: {sorted(_VIEWER_BUILTINS)}")
-        return builtin
-
-    preset = spec.get("preset")
-    if preset is not None and preset not in _MATERIAL_PRESETS:
+    name = spec.get("preset") or spec.get("builtin") or spec.get("name")
+    if not name:
+        raise ValueError('Material spec needs a "preset" — a material name.')
+    tag = _MATERIAL_ALIASES.get(name, name)
+    if tag not in _VIEWER_BUILTINS:
         raise ValueError(
-            f"Unknown material preset '{preset}'. Available: {sorted(_MATERIAL_PRESETS)}"
+            f"Unknown material '{name}'. Available: {sorted(_VIEWER_BUILTINS)}; "
+            f"aliases: {sorted(_MATERIAL_ALIASES)}."
         )
+    # Opaque non-metals are recoloured from the part's own colour.
+    return f"builtin:{tag}" if tag in _LEAF_COLOR_BUILTINS else tag
 
-    # A bare preset (no explicit PBR overrides) → the viewer's own tuned builtin,
-    # via the reliable path. Custom values force the PbrProperties fallback.
-    has_overrides = any(spec.get(k) is not None for k in _MATERIAL_OVERRIDE_KEYS) or spec.get("color") is not None
-    if preset in _PRESET_TO_BUILTIN and not has_overrides:
-        return _PRESET_TO_BUILTIN[preset]
 
-    if PbrProperties is None:
-        raise RuntimeError("threejs_materials is unavailable; cannot build a material.")
-    kwargs = dict(_MATERIAL_PRESETS.get(preset, {})) if preset else {}
-    for k in _MATERIAL_OVERRIDE_KEYS:
-        if spec.get(k) is not None:
-            kwargs[k] = spec[k]
-    if spec.get("color") is not None:
-        kwargs["color"] = _material_rgb(spec["color"])
-    return PbrProperties.create(spec.get("name") or preset or "material", **kwargs)
+def _inject_builtin_materials(payload: dict) -> None:
+    """Give every "builtin:<name>" tag a colour-stripped appearance entry in the
+    payload's materials map, so the viewer renders the builtin finish with the
+    part's own CAD colour instead of the builtin's baked colour."""
+    try:
+        shapes = payload["data"]["shapes"]
+    except (KeyError, TypeError):
+        return
+    tags: set = set()
+
+    def walk(node):
+        if not isinstance(node, dict):
+            return
+        mat = node.get("material")
+        if isinstance(mat, str) and mat.startswith("builtin:"):
+            tags.add(mat)
+        for child in node.get("parts", []) or []:
+            walk(child)
+
+    walk(shapes)
+    if tags:
+        mats = shapes.setdefault("materials", {})
+        for tag in tags:
+            mats.setdefault(tag, {"builtin": tag[len("builtin:"):]})
 
 
 def _construct_type(spec: dict) -> Any:
@@ -543,7 +523,7 @@ def _construct_type(spec: dict) -> Any:
     # ── Color ────────────────────────────────────────────────────────────────
     elif t == "Color":
         if "name" in spec:
-            return Color(spec["name"])
+            return _named_color(spec["name"])
         r, g, b, a = spec.get("r", 0), spec.get("g", 0), spec.get("b", 0), spec.get("a", 1)
         # Accept either 0–255 integers or 0.0–1.0 floats; normalise the former.
         if max(r, g, b) > 1:
@@ -711,6 +691,7 @@ def _show_tessellate(obj: Any) -> None:
         # progress to stdout; mute both so the stdio JSON-RPC stream stays clean.
         with contextlib.redirect_stderr(io.StringIO()), contextlib.redirect_stdout(io.StringIO()):
             payload, mapping = _ocp_convert(obj)
+        _inject_builtin_materials(payload)  # colour builtin dielectrics from each part's colour
         payload["config"]["reset_camera"] = "iso"  # frame the part on each render
         sess = _sess()
         sess.viewer["payload"] = payload
@@ -1701,7 +1682,10 @@ async def assembly_api(
 
     {"_type": "Color", ...} ("color" param of the "add" method):
         method #1: {"_type": "Color", name= "..."}
-            - All available values for the "name" argument (some of these might be a bit misleading - if so, use method #2): 
+            - Standard CSS/web colour names also work (crimson, silver, navy, darkblue, teal, indigo,
+              maroon, olive, etc.) in addition to the X11 names listed below — so just use the common
+              colour name you want. Only drop to method #2 (RGB) for a specific shade not covered by a name.
+            - X11 colour names (a superset with numbered shades like steelblue1..4):
                 aliceblue, antiquewhite, antiquewhite1, antiquewhite2, antiquewhite3, antiquewhite4, aquamarine1, aquamarine2, aquamarine4, azure, azure2, azure3, azure4, beet, beige, bisque, bisque2, bisque3, bisque4, black, blanchedalmond, blue, blue1, blue2, blue3, blue4, blueviolet, brown, brown1, brown2, brown3, brown4, burlywood, burlywood1, burlywood2, burlywood3, burlywood4, cadetblue, cadetblue1, cadetblue2, cadetblue3, cadetblue4, chartreuse, chartreuse1, chartreuse2, chartreuse3, chartreuse4, chocolate, chocolate1, chocolate2, chocolate3, chocolate4, coral, coral1, coral2, coral3, coral4, cornflowerblue, cornsilk1, cornsilk2, cornsilk3, cornsilk4, cyan, cyan1, cyan2, cyan3, cyan4, darkgoldenrod, darkgoldenrod1, darkgoldenrod2, darkgoldenrod3, darkgoldenrod4, darkgreen, darkkhaki, darkolivegreen, darkolivegreen1, darkolivegreen2, darkolivegreen3, darkolivegreen4, darkorange, darkorange1, darkorange2, darkorange3, darkorange4, darkorchid, darkorchid1, darkorchid2, darkorchid3, darkorchid4, darksalmon, darkseagreen, darkseagreen1, darkseagreen2, darkseagreen3, darkseagreen4, darkslateblue, darkslategray, darkslategray1, darkslategray2, darkslategray3, darkslategray4, darkturquoise, darkviolet, deeppink, deeppink2, deeppink3, deeppink4, deepskyblue1, deepskyblue2, deepskyblue3, deepskyblue4, dodgerblue1, dodgerblue2, dodgerblue3, dodgerblue4, firebrick, firebrick1, firebrick2, firebrick3, firebrick4, floralwhite, forestgreen, gainsboro, ghostwhite, gold, gold1, gold2, gold3, gold4, goldenrod, goldenrod1, goldenrod2, goldenrod3, goldenrod4, gray, gray0, gray1, gray10, gray11, gray12, gray13, gray14, gray15, gray16, gray17, gray18, gray19, gray2, gray20, gray21, gray22, gray23, gray24, gray25, gray26, gray27, gray28, gray29, gray3, gray30, gray31, gray32, gray33, gray34, gray35, gray36, gray37, gray38, gray39, gray4, gray40, gray41, gray42, gray43, gray44, gray45, gray46, gray47, gray48, gray49, gray5, gray50, gray51, gray52, gray53, gray54, gray55, gray56, gray57, gray58, gray59, gray6, gray60, gray61, gray62, gray63, gray64, gray65, gray66, gray67, gray68, gray69, gray7, gray70, gray71, gray72, gray73, gray74, gray75, gray76, gray77, gray78, gray79, gray8, gray80, gray81, gray82, gray83, gray85, gray86, gray87, gray88, gray89, gray9, gray90, gray91, gray92, gray93, gray94, gray95, gray97, gray98, gray99, green, green1, green2, green3, green4, greenyellow, honeydew, honeydew2, honeydew3, honeydew4, hotpink, hotpink1, hotpink2, hotpink3, hotpink4, indianred, indianred1, indianred2, indianred3, indianred4, ivory, ivory2, ivory3, ivory4, khaki, khaki1, khaki2, khaki3, khaki4, lavender, lavenderblush1, lavenderblush2, lavenderblush3, lavenderblush4, lawngreen, lemonchiffon1, lemonchiffon2, lemonchiffon3, lemonchiffon4, lightblue, lightblue1, lightblue2, lightblue3, lightblue4, lightcoral, lightcyan, lightcyan1, lightcyan2, lightcyan3, lightcyan4, lightgoldenrod, lightgoldenrod1, lightgoldenrod2, lightgoldenrod3, lightgoldenrod4, lightgoldenrodyellow, lightgray, lightpink, lightpink1, lightpink2, lightpink3, lightpink4, lightsalmon1, lightsalmon2, lightsalmon3, lightsalmon4, lightseagreen, lightskyblue, lightskyblue1, lightskyblue2, lightskyblue3, lightskyblue4, lightslateblue, lightslategray, lightsteelblue, lightsteelblue1, lightsteelblue2, lightsteelblue3, lightsteelblue4, lightyellow, lightyellow2, lightyellow3, lightyellow4, limegreen, linen, magenta, magenta1, magenta2, magenta3, magenta4, maroon, maroon1, maroon2, maroon3, maroon4, matrablue, matragray, mediumaquamarine, mediumorchid, mediumorchid1, mediumorchid2, mediumorchid3, mediumorchid4, mediumpurple, mediumpurple1, mediumpurple2, mediumpurple3, mediumpurple4, mediumseagreen, mediumslateblue, mediumspringgreen, mediumturquoise, mediumvioletred, midnightblue, mintcream, mistyrose, mistyrose2, mistyrose3, mistyrose4, moccasin, navajowhite1, navajowhite2, navajowhite3, navajowhite4, navyblue, oldlace, olivedrab, olivedrab1, olivedrab2, olivedrab3, olivedrab4, orange, orange1, orange2, orange3, orange4, orangered, orangered1, orangered2, orangered3, orangered4, orchid, orchid1, orchid2, orchid3, orchid4, palegoldenrod, palegreen, palegreen1, palegreen2, palegreen3, palegreen4, paleturquoise, paleturquoise1, paleturquoise2, paleturquoise3, paleturquoise4, palevioletred, palevioletred1, palevioletred2, palevioletred3, palevioletred4, papayawhip, peachpuff, peachpuff2, peachpuff3, peachpuff4, peru, pink, pink1, pink2, pink3, pink4, plum, plum1, plum2, plum3, plum4, powderblue, purple, purple1, purple2, purple3, purple4, red, red1, red2, red3, red4, rosybrown, rosybrown1, rosybrown2, rosybrown3, rosybrown4, royalblue, royalblue1, royalblue2, royalblue3, royalblue4, saddlebrown, salmon, salmon1, salmon2, salmon3, salmon4, sandybrown, seagreen, seagreen1, seagreen2, seagreen3, seagreen4, seashell, seashell2, seashell3, seashell4, sienna, sienna1, sienna2, sienna3, sienna4, skyblue, skyblue1, skyblue2, skyblue3, skyblue4, slateblue, slateblue1, slateblue2, slateblue3, slateblue4, slategray, slategray1, slategray2, slategray3, slategray4, snow, snow2, snow3, snow4, springgreen, springgreen2, springgreen3, springgreen4, steelblue, steelblue1, steelblue2, steelblue3, steelblue4, tan, tan1, tan2, tan3, tan4, teal, thistle, thistle1, thistle2, thistle3, thistle4, tomato, tomato1, tomato2, tomato3, tomato4, turquoise, turquoise1, turquoise2, turquoise3, turquoise4, violet, violetred, violetred1, violetred2, violetred3, violetred4, wheat, wheat1, wheat2, wheat3, wheat4, white, whitesmoke, yellow, yellow1, yellow2, yellow3, yellow4, yellowgreen
             - By default, use "gray90" for everything. It creates an off-white material color. If the user increases the material "metalness" variable in the 3D viewer, then "gray90" makes the material look like silver metal.
         method #2: {"_type": "Color", "r":0, "g":0, "b":0, "a":1}
@@ -1711,25 +1695,35 @@ async def assembly_api(
             - By default (if you don't set a color for an object) the objects are displayed to the users with a yellowish color in the viewer.
 
     {"_type": "Material", ...} ("material" param of the "add" method):
-        Sets the part's physical surface material (metal / plastic / glass / …), rendered
-        realistically in the viewer's "Studio" mode. Named presets map to the viewer's own tuned
-        materials, so PREFER PRESETS.
+        Sets the part's physical surface finish (metal / plastic / glass / …), rendered
+        realistically in the viewer's "Studio" mode. Format: {"_type": "Material", "preset": "<name>"}
+        where <name> is one of the viewer's built-in materials:
 
-        Named preset (recommended): {"_type": "Material", "preset": "<name>"}
-            metals   : gold, polished_gold, silver, chrome, steel, stainless_steel, aluminum,
-                       brushed_aluminum, copper, brass, titanium, anodized_black
-            plastics : matte_plastic, glossy_plastic, abs_plastic
-            other    : rubber, matte_black, ceramic, car_paint, glass, frosted_glass, concrete, wood
-            - Each preset already has a tuned, realistic appearance (colour + finish). Just pick the
-              one that matches the part; you don't need to set anything else.
-            - Do NOT put a "color" inside the material spec, and do not add explicit PBR fields to a
-              preset — either one forces a fallback path that currently renders opaque non-metals dark.
-              (Per-part custom colouring of preset materials is being added separately.)
+            metals       : gold, copper, brass, chrome, polished-steel, stainless-steel,
+                           polished-aluminum, brushed-aluminum, cast-iron, titanium, galvanized
+            plastic      : plastic-glossy, plastic-matte, abs-black, nylon
+            rubber       : rubber-black, rubber-gray, rubber-red
+            paint        : paint-glossy, paint-matte, paint-metallic, car-paint
+            other        : ceramic-white, concrete, carbon-fiber
+            transparent  : glass-clear, glass-tinted, glass-frosted, acrylic-clear
+        Friendly aliases also work: steel, aluminum, silver, plastic, glass, rubber, ceramic,
+        acrylic, carbon_fiber, matte_black, etc.
+
+        HOW COLOUR WORKS — this matters:
+            - For opaque NON-METALS (plastic, rubber, paint, ceramic, concrete, carbon-fiber) the
+              part's OWN colour (the "color" you pass to "add") becomes the hue, and the material only
+              supplies the finish. So to make a red glossy knob: set the part "color" to red AND
+              "material" preset "plastic-glossy". Pick the finish; the part colour drives the hue.
+            - METALS keep their own metallic tint (gold looks gold) — the part colour doesn't recolour
+              them, so just choose the metal whose colour you want.
+            - GLASS/acrylic are transparent.
+        Do NOT put a "color" or raw PBR numbers inside the material spec — only pick a preset name;
+        colour always comes from the part's "add" colour.
 
         Guidance: assign materials proactively and sensibly based on what the part physically is
-        (metal bracket → steel/aluminum, lens/window → glass, knob → glossy_plastic, tyre → rubber).
-        The user can ask you to change a part's material at any time — just re-issue the model with the
-        updated "material".
+        (metal bracket → steel/aluminum, lens/window → glass-clear, knob → plastic-glossy,
+        tyre → rubber-black, mug → ceramic-white). The user can ask you to change a part's material or
+        colour at any time — just re-issue the model with the updated "material"/"color".
 
     ── Constraint section ─────────────────────────────────────────────────────────────────────────
 
