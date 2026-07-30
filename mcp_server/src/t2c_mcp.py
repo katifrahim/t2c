@@ -45,6 +45,15 @@ except Exception:
     OCP_CONVERT_AVAILABLE = False
     _ocp_convert = None
 
+# Per-part PBR materials. ocp_tessellate carries an object's .material through to
+# the payload's `materials` map, which the viewer's Studio mode renders as a
+# MeshPhysicalMaterial. threejs_materials.PbrProperties is a hard dep of
+# ocp_vscode, so it's present whenever _convert is.
+try:
+    from threejs_materials import PbrProperties
+except Exception:
+    PbrProperties = None
+
 # Measurement backend (distance / properties tools). Forcing is_jupyter_cadquery
 # makes its handlers RETURN responses instead of websocket-sending them, so we
 # can expose them over HTTP via /backend. One backend is created PER SESSION
@@ -369,6 +378,83 @@ def resolve_value(value: Any) -> Any:
     return value
 
 
+# =============================================================================
+# PBR MATERIALS
+# =============================================================================
+# Curated real-world PBR presets → threejs_materials.PbrProperties. Values are
+# metallic-roughness (three.js MeshPhysicalMaterial). Metals carry their
+# characteristic tint in `color`; dielectrics default to neutral and expect the
+# caller to set `color` for the desired hue. Seeded from physicallybased.info
+# references, hardcoded for offline reliability.
+_MATERIAL_PRESETS = {
+    # --- metals: color = characteristic tint, metalness = 1 ---
+    "gold":             dict(color=(1.000, 0.766, 0.336), metalness=1.0, roughness=0.25),
+    "polished_gold":    dict(color=(1.000, 0.766, 0.336), metalness=1.0, roughness=0.08),
+    "silver":           dict(color=(0.972, 0.960, 0.915), metalness=1.0, roughness=0.15),
+    "chrome":           dict(color=(0.550, 0.556, 0.554), metalness=1.0, roughness=0.05),
+    "steel":            dict(color=(0.560, 0.570, 0.580), metalness=1.0, roughness=0.35),
+    "stainless_steel":  dict(color=(0.560, 0.570, 0.580), metalness=1.0, roughness=0.22),
+    "aluminum":         dict(color=(0.913, 0.921, 0.925), metalness=1.0, roughness=0.20),
+    "brushed_aluminum": dict(color=(0.913, 0.921, 0.925), metalness=1.0, roughness=0.40, anisotropy=0.5),
+    "copper":           dict(color=(0.955, 0.637, 0.538), metalness=1.0, roughness=0.30),
+    "brass":            dict(color=(0.887, 0.789, 0.434), metalness=1.0, roughness=0.30),
+    "titanium":         dict(color=(0.620, 0.609, 0.590), metalness=1.0, roughness=0.45),
+    "anodized_black":   dict(color=(0.060, 0.060, 0.065), metalness=0.9, roughness=0.45),
+    # --- dielectrics: set `color` for the hue you want ---
+    "matte_plastic":    dict(color=(0.80, 0.80, 0.80), metalness=0.0, roughness=0.70),
+    "glossy_plastic":   dict(color=(0.80, 0.80, 0.80), metalness=0.0, roughness=0.25, clearcoat=0.6, clearcoat_roughness=0.1),
+    "abs_plastic":      dict(color=(0.80, 0.80, 0.80), metalness=0.0, roughness=0.50),
+    "rubber":           dict(color=(0.08, 0.08, 0.08), metalness=0.0, roughness=0.90),
+    "matte_black":      dict(color=(0.045, 0.045, 0.05), metalness=0.0, roughness=0.80),
+    "ceramic":          dict(color=(0.95, 0.95, 0.95), metalness=0.0, roughness=0.35, clearcoat=0.3, clearcoat_roughness=0.1),
+    "car_paint":        dict(color=(0.70, 0.10, 0.10), metalness=0.0, roughness=0.35, clearcoat=1.0, clearcoat_roughness=0.08),
+    "glass":            dict(color=(1.0, 1.0, 1.0), metalness=0.0, roughness=0.02, transmission=1.0, ior=1.5),
+    "frosted_glass":    dict(color=(1.0, 1.0, 1.0), metalness=0.0, roughness=0.35, transmission=1.0, ior=1.5),
+    "wood":             dict(color=(0.42, 0.26, 0.13), metalness=0.0, roughness=0.60),
+    "concrete":         dict(color=(0.62, 0.62, 0.60), metalness=0.0, roughness=0.90),
+}
+
+# Explicit PBR fields the caller may pass to override a preset (PbrProperties.create kwargs).
+_MATERIAL_OVERRIDE_KEYS = (
+    "metalness", "roughness", "ior", "transmission", "clearcoat", "clearcoat_roughness",
+    "opacity", "transparent", "emissive", "emissive_intensity", "sheen", "anisotropy",
+    "specular_intensity", "thickness",
+)
+
+
+def _material_rgb(c: Any) -> tuple:
+    """Resolve a material colour (CadQuery name, {r,g,b}, or [r,g,b]) to a 0–1 RGB tuple."""
+    if isinstance(c, str):
+        return tuple(Color(c).toTuple()[:3])
+    if isinstance(c, dict):
+        r, g, b = c.get("r", 0), c.get("g", 0), c.get("b", 0)
+    elif isinstance(c, (list, tuple)):
+        r, g, b = c[0], c[1], c[2]
+    else:
+        return (0.8, 0.8, 0.8)
+    if max(r, g, b) > 1:  # accept 0–255 ints or 0–1 floats
+        r, g, b = r / 255.0, g / 255.0, b / 255.0
+    return (r, g, b)
+
+
+def _build_material(spec: dict):
+    """Build a threejs_materials.PbrProperties from a {"_type": "Material"} spec."""
+    if PbrProperties is None:
+        raise RuntimeError("threejs_materials is unavailable; cannot build a material.")
+    preset = spec.get("preset")
+    if preset is not None and preset not in _MATERIAL_PRESETS:
+        raise ValueError(
+            f"Unknown material preset '{preset}'. Available: {sorted(_MATERIAL_PRESETS)}"
+        )
+    kwargs = dict(_MATERIAL_PRESETS.get(preset, {})) if preset else {}
+    for k in _MATERIAL_OVERRIDE_KEYS:
+        if spec.get(k) is not None:
+            kwargs[k] = spec[k]
+    if spec.get("color") is not None:
+        kwargs["color"] = _material_rgb(spec["color"])
+    return PbrProperties.create(spec.get("name") or preset or "material", **kwargs)
+
+
 def _construct_type(spec: dict) -> Any:
     t = spec["_type"]
 
@@ -413,6 +499,10 @@ def _construct_type(spec: dict) -> Any:
         if max(r, g, b) > 1:
             r, g, b = r / 255.0, g / 255.0, b / 255.0
         return Color(r, g, b, a)
+
+    # ── Material (PBR) ────────────────────────────────────────────────────────
+    elif t == "Material":
+        return _build_material(spec)
 
     # ── Matrix ────────────────────────────────────────────────────────────────
     elif t == "Matrix":
@@ -1526,8 +1616,8 @@ async def assembly_api(
             - "arg": {"_ref": "stored_shape"} - the object you created using workplane api that you want to add in this assembly
             - "loc": {"_type": "Location", ...} - set the initial position and orientation of the added object in the assembly (it gets overridden by constraints and solver, but an approximated "loc" can still be helpful for the solver)
             - "name": the name used to reference this assembly object in the "constrain" method (via its "query1" and "query2" positional args) later on to apply constraints on it
-            - "color": {"_type": "Color", ...} - set the material color of the added object in the assembly
-            - "material": Not supported right now, so set to "None"
+            - "color": {"_type": "Color", ...} - set the base color of the added object in the assembly
+            - "material": {"_type": "Material", ...} - set the PHYSICAL SURFACE MATERIAL (metal/plastic/glass/…) of the part. Optional. See the {"_type": "Material", ...} section below. Set sensible materials proactively — a metal bracket → "steel"/"aluminum", a lens/window → "glass", a knob → "glossy_plastic". This makes the model look photorealistic in the viewer's Studio mode.
             - "metadata": Dict[str, Any] - any specific metadata/ context about the assembly part
 
     {"_type": "Location", ...} ("loc" param of the "add" method):
@@ -1557,7 +1647,40 @@ async def assembly_api(
             - "r", "g", "b" accept EITHER 0–255 integers OR 0.0–1.0 floats. The server auto-normalises: if any channel exceeds 1 the whole triple is divided by 255.
             - "a" is alpha (0.0 = fully transparent, 1.0 = fully opaque). Always pass a value in the 0.0–1.0 range.
         note:
-            - By default (if you don't set a color for an object) the objects are displayed to the users with a yellowish color in the viewer. 
+            - By default (if you don't set a color for an object) the objects are displayed to the users with a yellowish color in the viewer.
+
+    {"_type": "Material", ...} ("material" param of the "add" method):
+        Sets the part's physical PBR surface material (how light interacts with it). Rendered as a
+        realistic metal/plastic/glass/etc. in the viewer's "Studio" mode. Two ways to specify it,
+        which can be combined:
+
+        method #1 — named preset (recommended): {"_type": "Material", "preset": "<name>"}
+            Available presets:
+              metals   : gold, polished_gold, silver, chrome, steel, stainless_steel, aluminum,
+                         brushed_aluminum, copper, brass, titanium, anodized_black
+              plastics : matte_plastic, glossy_plastic, abs_plastic
+              other    : rubber, matte_black, ceramic, car_paint, glass, frosted_glass, wood, concrete
+            - Metal presets already carry the correct metallic tint — do NOT override their colour.
+            - Dielectric presets (plastic/rubber/ceramic/car_paint/matte_black/wood/concrete) are
+              neutral by default; give them a hue with "color" (see below). Example — a red glossy
+              knob: {"_type": "Material", "preset": "glossy_plastic", "color": {"_type": "Color", "name": "red"}}
+              …or just "color": "red" / "color": {"r":200,"g":30,"b":30}. glass/frosted_glass are clear.
+
+        method #2 — explicit PBR values: {"_type": "Material", "metalness": 0.0-1.0, "roughness": 0.0-1.0, ...}
+            - Supported fields: metalness, roughness, transmission (0-1, glass), ior (~1.5 glass),
+              clearcoat, clearcoat_roughness, opacity, transparent, emissive [r,g,b], emissive_intensity,
+              sheen (fabric), anisotropy (brushed metal), specular_intensity, thickness.
+            - Explicit fields OVERRIDE the preset when both are given, e.g. a shinier steel:
+              {"_type": "Material", "preset": "steel", "roughness": 0.12}
+
+        "color" (optional): the material's base colour — CadQuery colour name (any name from the
+            Color list above), or {"_type": "Color", ...}, or {"r","g","b"} (0-255 or 0-1), or [r,g,b].
+            When a material sets a colour it drives the Studio appearance, so for coloured dielectrics
+            also pass a matching "color" on the "add" call itself so the plain (non-Studio) view agrees.
+
+        Guidance: assign materials proactively and sensibly based on what the part physically is. The
+        user can also ask you to change a part's material at any time — just re-issue the model with the
+        updated "material". Prefer presets; only use explicit values for looks a preset can't express.
 
     ── Constraint section ─────────────────────────────────────────────────────────────────────────
 
@@ -2072,11 +2195,13 @@ async def assembly_api(
             {"method": "add", "params": {
             "arg": {"_ref": "part1"}, "name": "part1",
             "color": {"_type": "Color", "name": "darkorange"},
+            "material": {"_type": "Material", "preset": "glossy_plastic", "color": {"_type": "Color", "name": "darkorange"}},
             "loc": {"_type": "Location", "x": 0, "y": 0, "z": 0}
             }},
             {"method": "add", "params": {
             "arg": {"_ref": "part2"}, "name": "part2",
             "color": {"_type": "Color", "name": "deepskyblue1"},
+            "material": {"_type": "Material", "preset": "brushed_aluminum"},
             "loc": {"_type": "Location", "x": 0, "y": 0, "z": 40}
             }},
             {"method": "add", "params": {
