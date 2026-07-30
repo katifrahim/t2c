@@ -110,9 +110,80 @@ function loadTCV() {
   });
 }
 
+// Extra HDRIs added to the built-in Studio "Environment" picker (DEV-EDITABLE:
+// add a Poly Haven HDRI slug + label here and it appears in the dropdown's "More"
+// group). Browse slugs at https://polyhaven.com/hdris.
+const HDRI_BASE = "https://dl.polyhaven.org/file/ph-assets/HDRIs/hdr/2k";
+const EXTRA_ENVIRONMENTS = [
+  { label: "Partly Cloudy Sky", slug: "kloofendal_48d_partly_cloudy_puresky" },
+  { label: "Garden", slug: "symmetrical_garden_02" },
+  { label: "City Buildings", slug: "modern_buildings_2" },
+  { label: "Brown Studio", slug: "brown_photostudio_02" },
+  { label: "Cliff Top", slug: "white_cliff_top" },
+];
+
+// Turntable: spin the model group around its vertical (Z) axis each frame — the
+// "product-demo" rotation. Reads the live viewer/model from ref so it survives
+// model updates; idempotent start/stop.
+function setTurntable(ref, on) {
+  ref.current.turntable = on;
+  if (on && !ref.current.spinRaf) {
+    const spin = () => {
+      const g = ref.current.viewer?.rendered?.nestedGroup?.rootGroup;
+      if (g) { g.rotation.z += 0.008; try { ref.current.viewer.update(true, false); } catch {} }
+      ref.current.spinRaf = requestAnimationFrame(spin);
+    };
+    ref.current.spinRaf = requestAnimationFrame(spin);
+  } else if (!on && ref.current.spinRaf) {
+    cancelAnimationFrame(ref.current.spinRaf);
+    ref.current.spinRaf = 0;
+  }
+}
+
+// Augment the viewer's OWN Studio panel (not a separate UI): add extra HDRIs to
+// its Environment <select> and a Turntable toggle, using the panel's native
+// classes so they read as built-in. Runs after each render (the panel is rebuilt
+// with the viewer). The extra <option>s auto-wire to the built-in change handler.
+function augmentStudioPanel(container, ref) {
+  try {
+    const sel = container.querySelector(".tcv_studio_environment");
+    if (sel && !sel.querySelector('optgroup[data-t2c="1"]')) {
+      const og = document.createElement("optgroup");
+      og.label = "More";
+      og.setAttribute("data-t2c", "1");
+      for (const e of EXTRA_ENVIRONMENTS) {
+        const o = document.createElement("option");
+        o.value = `${HDRI_BASE}/${e.slug}_2k.hdr`;
+        o.textContent = e.label;
+        o.title = `Poly Haven: ${e.slug}.hdr`;
+        og.appendChild(o);
+      }
+      sel.appendChild(og);
+    }
+    const panel = container.querySelector(".tcv_cad_studio_container");
+    if (panel && !panel.querySelector(".t2c_turntable_row")) {
+      const row = document.createElement("div");
+      row.className = "tcv_studio_checks t2c_turntable_row";
+      const input = document.createElement("input");
+      input.type = "checkbox";
+      input.className = "tcv_check";
+      input.title = "Auto-rotate the model (turntable)";
+      input.checked = !!ref.current.turntable;
+      input.addEventListener("change", () => setTurntable(ref, input.checked));
+      const label = document.createElement("span");
+      label.className = "tcv_label";
+      label.title = input.title;
+      label.textContent = "Turntable";
+      row.appendChild(input);
+      row.appendChild(label);
+      panel.appendChild(row);
+    }
+  } catch { /* studio panel not present yet — ignore */ }
+}
+
 export default function Viewer() {
   const containerRef = useRef(null);
-  const ref = useRef({ TCV: null, viewer: null, lastVersion: -1, payload: null });
+  const ref = useRef({ TCV: null, viewer: null, lastVersion: -1, payload: null, turntable: false, spinRaf: 0 });
   const sessionId = useSessionStore((s) => s.sessionId);
   const sidRef = useRef(sessionId);
   // Blank white until the backend/MCP server delivers the first model; show a
@@ -273,6 +344,8 @@ export default function Viewer() {
       viewer.render(payload.data, renderOptions, viewerOptions);
       viewer.glassMode(displayOptions.glass);
       viewer.showTools(displayOptions.tools);
+      // Add our extra HDRIs + turntable toggle into the viewer's own Studio panel.
+      augmentStudioPanel(container, ref);
 
       const rc = preset(config, "reset_camera", "iso");
       if (["iso", "left", "right", "top", "bottom", "rear", "front"].includes(rc)) {
@@ -444,6 +517,7 @@ export default function Viewer() {
       cancelled = true;
       if (timer) clearInterval(timer);
       if (rafId) cancelAnimationFrame(rafId);
+      setTurntable(ref, false); // stop the turntable spin loop
       ro.disconnect();
       if (ref.current.viewer) { try { ref.current.viewer.dispose(); } catch {} }
     };
