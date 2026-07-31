@@ -115,11 +115,19 @@ function loadTCV() {
 // group). Browse slugs at https://polyhaven.com/hdris.
 const HDRI_BASE = "https://dl.polyhaven.org/file/ph-assets/HDRIs/hdr/2k";
 const EXTRA_ENVIRONMENTS = [
-  { label: "Partly Cloudy Sky", slug: "kloofendal_48d_partly_cloudy_puresky" },
-  { label: "Garden", slug: "symmetrical_garden_02" },
-  { label: "City Buildings", slug: "modern_buildings_2" },
   { label: "Brown Studio", slug: "brown_photostudio_02" },
+  { label: "Blue Studio", slug: "blue_photo_studio" },
+  { label: "Neon Studio", slug: "neon_photostudio" },
+  { label: "Fireplace", slug: "fireplace" },
+  { label: "Autoshop", slug: "autoshop_01" },
+  { label: "Machine Shop", slug: "machine_shop_02" },
+  { label: "Artist Workshop", slug: "artist_workshop" },
+  { label: "Grassfield", slug: "scythian_tombs_2" },
+  { label: "Garden", slug: "symmetrical_garden_02" },
+  { label: "Lilienstein", slug: "lilienstein" },
   { label: "Cliff Top", slug: "white_cliff_top" },
+  { label: "Cloudy Sky", slug: "kloofendal_48d_partly_cloudy_puresky" },
+  { label: "Clear Night", slug: "rogland_clear_night" }
 ];
 
 // Turntable: spin the model group around its vertical (Z) axis each frame — the
