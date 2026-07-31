@@ -14,8 +14,11 @@ import sys
 from onshape.classify import classify
 from onshape.client import Onshape, parse_url
 from onshape.emit import emit_model
-from onshape.normalize import normalize
+from onshape.extract import resolve_created_faces
+from onshape.normalize import _msg, normalize
 from onshape.verify import fetch_ground_truth, run_steps, compare, Geometry
+
+_MODIFIERS = {"fillet", "chamfer"}
 
 
 def run(url: str, api: Onshape | None = None) -> dict:
@@ -28,7 +31,11 @@ def run(url: str, api: Onshape | None = None) -> dict:
 
     features = api.features(ps)
     sketches = api.sketches(ps)
-    model = normalize(features, sketches, url=url)
+    # Resolve modifier features' target edges to 3D points (one FeatureScript call).
+    mod_ids = [_msg(f)["featureId"] for f in features.get("features", [])
+               if _msg(f).get("featureType") in _MODIFIERS and not _msg(f).get("suppressed")]
+    targets = resolve_created_faces(api, ps, mod_ids)
+    model = normalize(features, sketches, url=url, targets=targets)
     steps = emit_model(model)
 
     out: dict = {

@@ -100,6 +100,49 @@ def test_reverse_curve_keeps_arc_midpoint():
     assert r.data["mid"] == [1, 1]
 
 
+def _rect_profile(w, h):
+    return ir.Profile([
+        ir.Curve("line", {"start": [-w / 2, -h / 2], "end": [w / 2, -h / 2]}),
+        ir.Curve("line", {"start": [w / 2, -h / 2], "end": [w / 2, h / 2]}),
+        ir.Curve("line", {"start": [w / 2, h / 2], "end": [-w / 2, h / 2]}),
+        ir.Curve("line", {"start": [-w / 2, h / 2], "end": [-w / 2, -h / 2]}),
+    ])
+
+
+def _box_ops():
+    sk = ir.Sketch(source={"id": "b"}, plane=ir.Plane(name="XY"), profiles=[_rect_profile(20, 20)])
+    ex = ir.Extrude(source={"id": "eb"}, profile_ref="b", distance=10, op="new")
+    return sk, ex
+
+
+def test_boolean_cut_via_current_body():
+    sk, ex = _box_ops()
+    skc = ir.Sketch(source={"id": "c"}, plane=ir.Plane(name="XY"),
+                    profiles=[ir.Profile([ir.Curve("circle", {"center": [0, 0], "radius": 5})])])
+    exc = ir.Extrude(source={"id": "ec"}, profile_ref="c", distance=10, op="cut")
+    props = _run(emit_model(ir.Model(ops=[sk, ex, skc, exc])))
+    assert props["volume"] == pytest.approx(4000 - math.pi * 25 * 10, rel=1e-6)
+
+
+def test_boolean_add_via_current_body():
+    sk, ex = _box_ops()
+    ska = ir.Sketch(source={"id": "a"}, plane=ir.Plane(name="XY"),
+                    profiles=[ir.Profile([ir.Curve("circle", {"center": [30, 0], "radius": 5})])])
+    exa = ir.Extrude(source={"id": "ea"}, profile_ref="a", distance=10, op="add")
+    props = _run(emit_model(ir.Model(ops=[sk, ex, ska, exa])))
+    assert props["volume"] == pytest.approx(4000 + math.pi * 25 * 10, rel=1e-6)
+
+
+def test_fillet_by_nearest_point_selection():
+    # Fillet the 4 vertical edges of a 20x20x10 prism via 3D-point selection.
+    sk, ex = _box_ops()
+    fil = ir.Fillet(source={"id": "f"}, radius=2,
+                    edge_points=[[10, 10, 5], [-10, 10, 5], [10, -10, 5], [-10, -10, 5]])
+    props = _run(emit_model(ir.Model(ops=[sk, ex, fil])))
+    # 4 vertical edges rounded r2: each removes (4 - pi) * height.
+    assert props["volume"] == pytest.approx(4000 - 4 * (4 - math.pi) * 10, rel=1e-6)
+
+
 def test_unsupported_features_recorded():
     raw = json.load(open(_WASHER_RAW))
     model = normalize(raw["features"], raw["sketches"], url="washer")

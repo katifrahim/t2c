@@ -104,9 +104,13 @@ class Onshape:
         data = json.dumps(payload).encode() if payload is not None else None
         verb = method or ("POST" if data is not None else "GET")
 
+        # Cache GETs, and POSTs to /featurescript (pure geometry queries, keyed by
+        # script+payload) so reconstruction can be iterated offline after one call.
         cache_path = None
-        if self.cache and verb == "GET":
-            key = hashlib.sha256((self.base + path).encode()).hexdigest()[:32]
+        cacheable = verb == "GET" or (verb == "POST" and path.endswith("/featurescript"))
+        if self.cache and cacheable:
+            keysrc = self.base + path + (data.decode() if data else "")
+            key = hashlib.sha256(keysrc.encode()).hexdigest()[:32]
             cache_path = os.path.join(_CACHE_DIR, f"{key}.json")
             if os.path.exists(cache_path):
                 return json.load(open(cache_path))

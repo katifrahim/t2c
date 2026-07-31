@@ -100,6 +100,22 @@ class Revolve(Op):
 
 
 @dataclass
+class Fillet(Op):
+    # One representative 3D point per target edge (from FeatureScript), so emission
+    # selects edges by NearestToPoint instead of any opaque id.
+    edge_points: list[list[float]] = field(default_factory=list)
+    radius: float = 0.0
+    kind: str = "fillet"
+
+
+@dataclass
+class Chamfer(Op):
+    edge_points: list[list[float]] = field(default_factory=list)
+    distance: float = 0.0
+    kind: str = "chamfer"
+
+
+@dataclass
 class Model:
     """A whole Part Studio, normalized to an ordered op list. `unsupported` records
     features we could not faithfully translate (drives rollback-truncation)."""

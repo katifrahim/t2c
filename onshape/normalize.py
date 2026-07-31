@@ -189,11 +189,60 @@ def _extrude_op(feat: dict, sketch_ids: set[str], last_sketch: str | None):
     return op, None
 
 
-def normalize(features: dict, sketches: dict, url: str = "") -> ir.Model:
+def _round_op(feat: dict, kind: str, targets: dict):
+    """fillet/chamfer -> IR op with edge points from FeatureScript-resolved faces."""
+    m = _msg(feat)
+    faces = targets.get(m["featureId"]) or []
+    points = [f["at"] for f in faces if isinstance(f, dict) and "at" in f]
+    if not points:
+        return None, "no resolved edges (FeatureScript)"
+    P = _params(feat)
+    if kind == "fillet":
+        r = parse_length_mm((P.get("radius") or {}).get("expression"))
+        if r is None:  # fall back to the created torus/cylinder radius
+            rs = [f.get("r") for f in faces if f.get("r")]
+            r = sum(rs) / len(rs) if rs else None
+        if r is None:
+            return None, "unresolved fillet radius"
+        return ir.Fillet(source={"id": m["featureId"], "name": m.get("name"), "type": "fillet"},
+                         edge_points=points, radius=r), None
+    d = parse_length_mm((P.get("width") or P.get("length") or {}).get("expression"))
+    if d is None:
+        return None, "unresolved chamfer distance"
+    return ir.Chamfer(source={"id": m["featureId"], "name": m.get("name"), "type": "chamfer"},
+                      edge_points=points, distance=d), None
+
+
+def _extrude_use_counts(feats: list, sketch_ids: set) -> dict:
+    """How many extrudes consume each sketch (for detecting shared, multi-region
+    sketches we can't yet split by region)."""
+    counts: dict[str, int] = {}
+    last = None
+    for f in feats:
+        m = _msg(f)
+        if m.get("suppressed"):
+            continue
+        if m.get("featureType") == "newSketch":
+            last = m.get("featureId")
+        elif m.get("featureType") == "extrude":
+            ref = None
+            for q in (_params(f).get("entities") or {}).get("queries", []):
+                if q.get("featureId") in sketch_ids:
+                    ref = q["featureId"]; break
+            ref = ref or last
+            if ref:
+                counts[ref] = counts.get(ref, 0) + 1
+    return counts
+
+
+def normalize(features: dict, sketches: dict, url: str = "", targets: dict | None = None) -> ir.Model:
     feats = features.get("features", [])
     sk_by_fid = {s["featureId"]: s for s in sketches.get("sketches", [])}
     sketch_ids = set(sk_by_fid)
+    targets = targets or {}
     model = ir.Model(source_url=url)
+    sketch_ops: dict[str, ir.Sketch] = {}
+    use_counts = _extrude_use_counts(feats, sketch_ids)
     last_sketch: str | None = None
 
     for i, f in enumerate(feats):
@@ -202,15 +251,25 @@ def normalize(features: dict, sketches: dict, url: str = "") -> ir.Model:
         if m.get("suppressed"):
             continue
         if ftype == "newSketch":
-            model.ops.append(_sketch_op(f, sk_by_fid.get(fid)))
+            sk = _sketch_op(f, sk_by_fid.get(fid))
+            model.ops.append(sk)
+            sketch_ops[fid] = sk
             last_sketch = fid
-        elif ftype == "extrude":
+            continue
+        if ftype == "extrude":
             op, why = _extrude_op(f, sketch_ids, last_sketch)
-            if op:
-                model.ops.append(op)
-            else:
-                model.unsupported.append({"index": i, "type": ftype, "name": fname, "reason": why})
+            if op:  # reject profiles we can't faithfully reproduce whole-sketch
+                sk = sketch_ops.get(op.profile_ref)
+                if sk is None or not sk.profiles:
+                    op, why = None, "referenced sketch has no reconstructable profile (text/empty)"
+                elif use_counts.get(op.profile_ref, 0) > 1:
+                    op, why = None, "sketch shared by multiple extrudes (region selection needed)"
+        elif ftype in ("fillet", "chamfer"):
+            op, why = _round_op(f, ftype, targets)
         else:
-            model.unsupported.append({"index": i, "type": ftype, "name": fname,
-                                      "reason": "feature type not yet supported"})
+            op, why = None, "feature type not yet supported"
+        if op:
+            model.ops.append(op)
+        else:
+            model.unsupported.append({"index": i, "type": ftype, "name": fname, "reason": why})
     return model
