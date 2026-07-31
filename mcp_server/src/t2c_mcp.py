@@ -45,6 +45,7 @@ except Exception:
     OCP_CONVERT_AVAILABLE = False
     _ocp_convert = None
 
+
 # Measurement backend (distance / properties tools). Forcing is_jupyter_cadquery
 # makes its handlers RETURN responses instead of websocket-sending them, so we
 # can expose them over HTTP via /backend. One backend is created PER SESSION
@@ -369,6 +370,190 @@ def resolve_value(value: Any) -> Any:
     return value
 
 
+# =============================================================================
+# STUDIO MATERIALS
+# =============================================================================
+# A part's material is the name of one of the viewer's built-in Studio materials.
+# Passed as a plain-string tag on the part, it routes through the viewer's reliable
+# `createStudioMaterial` path. (Do NOT feed a threejs_materials.PbrProperties: that
+# takes the viewer's MaterialX path, which renders opaque non-metals with a black
+# albedo.) These 29 names are the viewer's full built-in catalogue.
+_VIEWER_BUILTINS = {
+    # metals (keep their own tuned tint)
+    "chrome", "polished-steel", "polished-aluminum", "gold", "copper", "brass",
+    "stainless-steel", "brushed-aluminum", "cast-iron", "titanium", "galvanized",
+    # opaque non-metals (recoloured per part — see _LEAF_COLOR_BUILTINS)
+    "plastic-glossy", "plastic-matte", "abs-black", "nylon", "rubber-black",
+    "rubber-gray", "rubber-red", "paint-matte", "paint-glossy", "paint-metallic",
+    "car-paint", "ceramic-white", "concrete", "carbon-fiber",
+    # transparent (keep their own tuned look)
+    "acrylic-clear", "glass-clear", "glass-tinted", "glass-frosted",
+}
+
+# Opaque non-metals: the part's OWN colour (its `add` colour) becomes the hue, while
+# the builtin supplies the finish. Emitted as a "builtin:<name>" tag that
+# _inject_builtin_materials turns into a colour-stripped appearance entry so the
+# viewer falls back to the part's CAD colour. Metals/glass keep their builtin look.
+_LEAF_COLOR_BUILTINS = {
+    "plastic-glossy", "plastic-matte", "abs-black", "nylon", "rubber-black",
+    "rubber-gray", "rubber-red", "paint-matte", "paint-glossy", "paint-metallic",
+    "car-paint", "ceramic-white", "concrete",
+}
+
+# Friendly aliases so natural words also resolve to a builtin.
+_MATERIAL_ALIASES = {
+    "steel": "polished-steel", "polished_steel": "polished-steel",
+    "stainless": "stainless-steel", "stainless_steel": "stainless-steel",
+    "aluminum": "polished-aluminum", "aluminium": "polished-aluminum",
+    "polished_aluminum": "polished-aluminum", "silver": "polished-aluminum",
+    "brushed_aluminum": "brushed-aluminum", "cast_iron": "cast-iron",
+    "plastic": "plastic-matte", "matte_plastic": "plastic-matte",
+    "glossy_plastic": "plastic-glossy", "abs": "abs-black", "abs_plastic": "abs-black",
+    "black_plastic": "abs-black", "rubber": "rubber-black", "matte_black": "paint-matte",
+    "paint": "paint-glossy", "matte_paint": "paint-matte", "glossy_paint": "paint-glossy",
+    "metallic_paint": "paint-metallic", "car_paint": "car-paint",
+    "ceramic": "ceramic-white", "carbon_fiber": "carbon-fiber",
+    "glass": "glass-clear", "frosted_glass": "glass-frosted", "tinted_glass": "glass-tinted",
+    "acrylic": "acrylic-clear", "clear_plastic": "acrylic-clear",
+}
+
+try:
+    import webcolors as _webcolors
+except Exception:
+    _webcolors = None
+
+
+def _named_color(name: str) -> "Color":
+    """Resolve a colour name to a CadQuery Color. CadQuery/OCCT only knows X11 names
+    (red, steelblue, gray90, …); fall back to the full CSS palette (crimson, silver,
+    navy, darkblue, …) so common colour names the model reaches for just work."""
+    try:
+        return Color(name)
+    except Exception:
+        pass
+    if _webcolors is not None:
+        try:
+            r, g, b = _webcolors.name_to_rgb(name.strip().replace(" ", "").lower())
+            return Color(r / 255.0, g / 255.0, b / 255.0)
+        except ValueError:
+            pass
+    raise ValueError(f"Unknown colour name '{name}'. Use a CSS/X11 colour name or {{\"r\",\"g\",\"b\"}}.")
+
+
+# =============================================================================
+# TEXTURED MATERIALS
+# =============================================================================
+# Real surface detail (wood grain, brushed metal, fabric, stone …) via Poly Haven
+# CC0 texture sets, referenced BY URL (loaded straight from Poly Haven's CDN, not
+# embedded in the payload) and projected onto the model with the viewer's triplanar
+# mapping (no UVs needed on CAD geometry). Maps: diff (colour), nor_gl (normal),
+# rough (roughness), ao. Missing maps degrade gracefully (the viewer skips them).
+_TEXTURE_BASE = "https://dl.polyhaven.org/file/ph-assets/Textures/jpg/1k"
+
+# category → (Poly Haven slug, metalness). Slugs verified to exist.
+_TEXTURE_CATALOG = {
+    "wood":             ("wood_table_001", 0.0),
+    "oak":              ("oak_veneer_01", 0.0),
+    "wood_laminate":    ("laminate_floor_02", 0.0),
+    "marble":           ("marble_01", 0.0),
+    "concrete":         ("concrete_wall_008", 0.0),
+    "concrete_floor":   ("concrete_floor_worn_001", 0.0),
+    "brick":            ("brick_wall_006", 0.0),
+    "cobblestone":      ("cobblestone_floor_04", 0.0),
+    "stone":            ("gray_rocks", 0.0),
+    "rubber":           ("rubber_tiles", 0.0),
+    "fabric":           ("denim_fabric", 0.0),
+    "leather":          ("leather_white", 0.0),
+    "metal_plate":      ("metal_plate_02", 1.0),
+    "blue_metal":       ("blue_metal_plate", 1.0),
+    "corrugated_metal": ("corrugated_iron_02", 1.0),
+    "rusty_metal":      ("rusty_metal_02", 0.6),
+}
+_TEXTURE_ALIASES = {
+    "wood_grain": "wood", "timber": "wood", "planks": "oak", "laminate": "wood_laminate",
+    "denim": "fabric", "cloth": "fabric", "textile": "fabric", "tile": "cobblestone",
+    "stone_tiles": "cobblestone", "rock": "stone", "brushed_metal": "metal_plate",
+    "galvanized_metal": "corrugated_metal", "rust": "rusty_metal", "granite": "stone",
+}
+
+
+def _texture_appearance(tag: str) -> dict:
+    """Build a viewer appearance object (reliable createStudioMaterial path) with
+    Poly Haven texture-map URLs from a "tex:<metalness>:<slug>" tag."""
+    _, metalness, slug = tag.split(":", 2)
+    url = lambda suffix: f"{_TEXTURE_BASE}/{slug}/{slug}_{suffix}_1k.jpg"
+    return {
+        "builtin": "plastic-matte",   # carrier; overridden below
+        "color": [1.0, 1.0, 1.0],     # show the texture's own colour, untinted
+        "metalness": float(metalness),
+        "roughness": 1.0,             # let the roughness map drive it fully
+        "map": url("diff"),
+        "normalMap": url("nor_gl"),
+        "roughnessMap": url("rough"),
+        "aoMap": url("ao"),
+    }
+
+
+def _build_material(spec: dict) -> str:
+    """Resolve a {"_type": "Material"} spec to a viewer material tag (a str).
+
+    The tag is applied to the assembly child directly (see _run) rather than via
+    Assembly.add(material=...), which would wrap a str into a CadQuery Material.
+    """
+    # Textured material: {"_type": "Material", "texture": "<category|slug>"}
+    tex = spec.get("texture")
+    if tex is not None:
+        cat = _TEXTURE_ALIASES.get(tex, tex)
+        if cat in _TEXTURE_CATALOG:
+            slug, metalness = _TEXTURE_CATALOG[cat]
+        else:
+            slug, metalness = cat, (1.0 if spec.get("metal") else 0.0)  # raw Poly Haven slug
+        return f"tex:{metalness}:{slug}"
+
+    name = spec.get("preset") or spec.get("builtin") or spec.get("name")
+    if not name:
+        raise ValueError('Material spec needs a "preset" or "texture" — a material name.')
+    tag = _MATERIAL_ALIASES.get(name, name)
+    if tag not in _VIEWER_BUILTINS:
+        raise ValueError(
+            f"Unknown material '{name}'. Available: {sorted(_VIEWER_BUILTINS)}; "
+            f"aliases: {sorted(_MATERIAL_ALIASES)}; textures: {sorted(_TEXTURE_CATALOG)}."
+        )
+    # Opaque non-metals are recoloured from the part's own colour.
+    return f"builtin:{tag}" if tag in _LEAF_COLOR_BUILTINS else tag
+
+
+def _inject_studio_materials(payload: dict) -> None:
+    """Turn our marker material tags into the viewer's materials-map appearance
+    entries: "builtin:<name>" → part-coloured builtin; "tex:<m>:<slug>" → textured
+    appearance with Poly Haven map URLs. Both take the reliable createStudioMaterial
+    path (no black-albedo MaterialX bug)."""
+    try:
+        shapes = payload["data"]["shapes"]
+    except (KeyError, TypeError):
+        return
+    tags: set = set()
+
+    def walk(node):
+        if not isinstance(node, dict):
+            return
+        mat = node.get("material")
+        if isinstance(mat, str) and (mat.startswith("builtin:") or mat.startswith("tex:")):
+            tags.add(mat)
+        for child in node.get("parts", []) or []:
+            walk(child)
+
+    walk(shapes)
+    if not tags:
+        return
+    mats = shapes.setdefault("materials", {})
+    for tag in tags:
+        if tag.startswith("builtin:"):
+            mats.setdefault(tag, {"builtin": tag[len("builtin:"):]})
+        else:
+            mats.setdefault(tag, _texture_appearance(tag))
+
+
 def _construct_type(spec: dict) -> Any:
     t = spec["_type"]
 
@@ -407,12 +592,16 @@ def _construct_type(spec: dict) -> Any:
     # ── Color ────────────────────────────────────────────────────────────────
     elif t == "Color":
         if "name" in spec:
-            return Color(spec["name"])
+            return _named_color(spec["name"])
         r, g, b, a = spec.get("r", 0), spec.get("g", 0), spec.get("b", 0), spec.get("a", 1)
         # Accept either 0–255 integers or 0.0–1.0 floats; normalise the former.
         if max(r, g, b) > 1:
             r, g, b = r / 255.0, g / 255.0, b / 255.0
         return Color(r, g, b, a)
+
+    # ── Material (PBR) ────────────────────────────────────────────────────────
+    elif t == "Material":
+        return _build_material(spec)
 
     # ── Matrix ────────────────────────────────────────────────────────────────
     elif t == "Matrix":
@@ -571,6 +760,7 @@ def _show_tessellate(obj: Any) -> None:
         # progress to stdout; mute both so the stdio JSON-RPC stream stays clean.
         with contextlib.redirect_stderr(io.StringIO()), contextlib.redirect_stdout(io.StringIO()):
             payload, mapping = _ocp_convert(obj)
+        _inject_studio_materials(payload)  # resolve builtin/texture material tags → appearance entries
         payload["config"]["reset_camera"] = "iso"  # frame the part on each render
         sess = _sess()
         sess.viewer["payload"] = payload
@@ -707,7 +897,18 @@ def _run(obj: Any, operations: List[dict]) -> Any:
                     resolved_args[2] = p.toTuple()
             obj = method(*resolved_args, **resolved_kwargs)
         elif raw_params:
-            obj = method(**resolve_value(raw_params))
+            resolved_params = resolve_value(raw_params)
+            # A string `material` is a viewer builtin tag. CadQuery's add() would wrap
+            # a str into a Material object (breaking tessellation), so apply it to the
+            # freshly-added child directly instead of passing it through add().
+            builtin_mat = (
+                resolved_params.pop("material")
+                if method_name == "add" and isinstance(resolved_params.get("material"), str)
+                else None
+            )
+            obj = method(**resolved_params)
+            if builtin_mat is not None and getattr(obj, "children", None):
+                obj.children[-1].material = builtin_mat
         else:
             obj = method()
     return obj
@@ -1526,8 +1727,8 @@ async def assembly_api(
             - "arg": {"_ref": "stored_shape"} - the object you created using workplane api that you want to add in this assembly
             - "loc": {"_type": "Location", ...} - set the initial position and orientation of the added object in the assembly (it gets overridden by constraints and solver, but an approximated "loc" can still be helpful for the solver)
             - "name": the name used to reference this assembly object in the "constrain" method (via its "query1" and "query2" positional args) later on to apply constraints on it
-            - "color": {"_type": "Color", ...} - set the material color of the added object in the assembly
-            - "material": Not supported right now, so set to "None"
+            - "color": {"_type": "Color", ...} - set the base color of the added object in the assembly
+            - "material": {"_type": "Material", ...} - set the PHYSICAL SURFACE MATERIAL (metal/plastic/glass/…) of the part. Optional. See the {"_type": "Material", ...} section below. Set sensible materials proactively — a metal bracket → "steel"/"aluminum", a lens/window → "glass", a knob → "glossy_plastic". This makes the model look photorealistic in the viewer's Studio mode.
             - "metadata": Dict[str, Any] - any specific metadata/ context about the assembly part
 
     {"_type": "Location", ...} ("loc" param of the "add" method):
@@ -1550,14 +1751,60 @@ async def assembly_api(
 
     {"_type": "Color", ...} ("color" param of the "add" method):
         method #1: {"_type": "Color", name= "..."}
-            - All available values for the "name" argument (some of these might be a bit misleading - if so, use method #2): 
+            - Standard CSS/web colour names also work (crimson, silver, navy, darkblue, teal, indigo,
+              maroon, olive, etc.) in addition to the X11 names listed below — so just use the common
+              colour name you want. Only drop to method #2 (RGB) for a specific shade not covered by a name.
+            - X11 colour names (a superset with numbered shades like steelblue1..4):
                 aliceblue, antiquewhite, antiquewhite1, antiquewhite2, antiquewhite3, antiquewhite4, aquamarine1, aquamarine2, aquamarine4, azure, azure2, azure3, azure4, beet, beige, bisque, bisque2, bisque3, bisque4, black, blanchedalmond, blue, blue1, blue2, blue3, blue4, blueviolet, brown, brown1, brown2, brown3, brown4, burlywood, burlywood1, burlywood2, burlywood3, burlywood4, cadetblue, cadetblue1, cadetblue2, cadetblue3, cadetblue4, chartreuse, chartreuse1, chartreuse2, chartreuse3, chartreuse4, chocolate, chocolate1, chocolate2, chocolate3, chocolate4, coral, coral1, coral2, coral3, coral4, cornflowerblue, cornsilk1, cornsilk2, cornsilk3, cornsilk4, cyan, cyan1, cyan2, cyan3, cyan4, darkgoldenrod, darkgoldenrod1, darkgoldenrod2, darkgoldenrod3, darkgoldenrod4, darkgreen, darkkhaki, darkolivegreen, darkolivegreen1, darkolivegreen2, darkolivegreen3, darkolivegreen4, darkorange, darkorange1, darkorange2, darkorange3, darkorange4, darkorchid, darkorchid1, darkorchid2, darkorchid3, darkorchid4, darksalmon, darkseagreen, darkseagreen1, darkseagreen2, darkseagreen3, darkseagreen4, darkslateblue, darkslategray, darkslategray1, darkslategray2, darkslategray3, darkslategray4, darkturquoise, darkviolet, deeppink, deeppink2, deeppink3, deeppink4, deepskyblue1, deepskyblue2, deepskyblue3, deepskyblue4, dodgerblue1, dodgerblue2, dodgerblue3, dodgerblue4, firebrick, firebrick1, firebrick2, firebrick3, firebrick4, floralwhite, forestgreen, gainsboro, ghostwhite, gold, gold1, gold2, gold3, gold4, goldenrod, goldenrod1, goldenrod2, goldenrod3, goldenrod4, gray, gray0, gray1, gray10, gray11, gray12, gray13, gray14, gray15, gray16, gray17, gray18, gray19, gray2, gray20, gray21, gray22, gray23, gray24, gray25, gray26, gray27, gray28, gray29, gray3, gray30, gray31, gray32, gray33, gray34, gray35, gray36, gray37, gray38, gray39, gray4, gray40, gray41, gray42, gray43, gray44, gray45, gray46, gray47, gray48, gray49, gray5, gray50, gray51, gray52, gray53, gray54, gray55, gray56, gray57, gray58, gray59, gray6, gray60, gray61, gray62, gray63, gray64, gray65, gray66, gray67, gray68, gray69, gray7, gray70, gray71, gray72, gray73, gray74, gray75, gray76, gray77, gray78, gray79, gray8, gray80, gray81, gray82, gray83, gray85, gray86, gray87, gray88, gray89, gray9, gray90, gray91, gray92, gray93, gray94, gray95, gray97, gray98, gray99, green, green1, green2, green3, green4, greenyellow, honeydew, honeydew2, honeydew3, honeydew4, hotpink, hotpink1, hotpink2, hotpink3, hotpink4, indianred, indianred1, indianred2, indianred3, indianred4, ivory, ivory2, ivory3, ivory4, khaki, khaki1, khaki2, khaki3, khaki4, lavender, lavenderblush1, lavenderblush2, lavenderblush3, lavenderblush4, lawngreen, lemonchiffon1, lemonchiffon2, lemonchiffon3, lemonchiffon4, lightblue, lightblue1, lightblue2, lightblue3, lightblue4, lightcoral, lightcyan, lightcyan1, lightcyan2, lightcyan3, lightcyan4, lightgoldenrod, lightgoldenrod1, lightgoldenrod2, lightgoldenrod3, lightgoldenrod4, lightgoldenrodyellow, lightgray, lightpink, lightpink1, lightpink2, lightpink3, lightpink4, lightsalmon1, lightsalmon2, lightsalmon3, lightsalmon4, lightseagreen, lightskyblue, lightskyblue1, lightskyblue2, lightskyblue3, lightskyblue4, lightslateblue, lightslategray, lightsteelblue, lightsteelblue1, lightsteelblue2, lightsteelblue3, lightsteelblue4, lightyellow, lightyellow2, lightyellow3, lightyellow4, limegreen, linen, magenta, magenta1, magenta2, magenta3, magenta4, maroon, maroon1, maroon2, maroon3, maroon4, matrablue, matragray, mediumaquamarine, mediumorchid, mediumorchid1, mediumorchid2, mediumorchid3, mediumorchid4, mediumpurple, mediumpurple1, mediumpurple2, mediumpurple3, mediumpurple4, mediumseagreen, mediumslateblue, mediumspringgreen, mediumturquoise, mediumvioletred, midnightblue, mintcream, mistyrose, mistyrose2, mistyrose3, mistyrose4, moccasin, navajowhite1, navajowhite2, navajowhite3, navajowhite4, navyblue, oldlace, olivedrab, olivedrab1, olivedrab2, olivedrab3, olivedrab4, orange, orange1, orange2, orange3, orange4, orangered, orangered1, orangered2, orangered3, orangered4, orchid, orchid1, orchid2, orchid3, orchid4, palegoldenrod, palegreen, palegreen1, palegreen2, palegreen3, palegreen4, paleturquoise, paleturquoise1, paleturquoise2, paleturquoise3, paleturquoise4, palevioletred, palevioletred1, palevioletred2, palevioletred3, palevioletred4, papayawhip, peachpuff, peachpuff2, peachpuff3, peachpuff4, peru, pink, pink1, pink2, pink3, pink4, plum, plum1, plum2, plum3, plum4, powderblue, purple, purple1, purple2, purple3, purple4, red, red1, red2, red3, red4, rosybrown, rosybrown1, rosybrown2, rosybrown3, rosybrown4, royalblue, royalblue1, royalblue2, royalblue3, royalblue4, saddlebrown, salmon, salmon1, salmon2, salmon3, salmon4, sandybrown, seagreen, seagreen1, seagreen2, seagreen3, seagreen4, seashell, seashell2, seashell3, seashell4, sienna, sienna1, sienna2, sienna3, sienna4, skyblue, skyblue1, skyblue2, skyblue3, skyblue4, slateblue, slateblue1, slateblue2, slateblue3, slateblue4, slategray, slategray1, slategray2, slategray3, slategray4, snow, snow2, snow3, snow4, springgreen, springgreen2, springgreen3, springgreen4, steelblue, steelblue1, steelblue2, steelblue3, steelblue4, tan, tan1, tan2, tan3, tan4, teal, thistle, thistle1, thistle2, thistle3, thistle4, tomato, tomato1, tomato2, tomato3, tomato4, turquoise, turquoise1, turquoise2, turquoise3, turquoise4, violet, violetred, violetred1, violetred2, violetred3, violetred4, wheat, wheat1, wheat2, wheat3, wheat4, white, whitesmoke, yellow, yellow1, yellow2, yellow3, yellow4, yellowgreen
             - By default, use "gray90" for everything. It creates an off-white material color. If the user increases the material "metalness" variable in the 3D viewer, then "gray90" makes the material look like silver metal.
         method #2: {"_type": "Color", "r":0, "g":0, "b":0, "a":1}
             - "r", "g", "b" accept EITHER 0–255 integers OR 0.0–1.0 floats. The server auto-normalises: if any channel exceeds 1 the whole triple is divided by 255.
             - "a" is alpha (0.0 = fully transparent, 1.0 = fully opaque). Always pass a value in the 0.0–1.0 range.
         note:
-            - By default (if you don't set a color for an object) the objects are displayed to the users with a yellowish color in the viewer. 
+            - By default (if you don't set a color for an object) the objects are displayed to the users with a yellowish color in the viewer.
+
+    {"_type": "Material", ...} ("material" param of the "add" method):
+        Sets the part's physical surface finish (metal / plastic / glass / …), rendered
+        realistically in the viewer's "Studio" mode. Format: {"_type": "Material", "preset": "<name>"}
+        where <name> is one of the viewer's built-in materials:
+
+            metals       : gold, copper, brass, chrome, polished-steel, stainless-steel,
+                           polished-aluminum, brushed-aluminum, cast-iron, titanium, galvanized
+            plastic      : plastic-glossy, plastic-matte, abs-black, nylon
+            rubber       : rubber-black, rubber-gray, rubber-red
+            paint        : paint-glossy, paint-matte, paint-metallic, car-paint
+            other        : ceramic-white, concrete, carbon-fiber
+            transparent  : glass-clear, glass-tinted, glass-frosted, acrylic-clear
+        Friendly aliases also work: steel, aluminum, silver, plastic, glass, rubber, ceramic,
+        acrylic, carbon_fiber, matte_black, etc.
+
+        HOW COLOUR WORKS — this matters:
+            - For opaque NON-METALS (plastic, rubber, paint, ceramic, concrete, carbon-fiber) the
+              part's OWN colour (the "color" you pass to "add") becomes the hue, and the material only
+              supplies the finish. So to make a red glossy knob: set the part "color" to red AND
+              "material" preset "plastic-glossy". Pick the finish; the part colour drives the hue.
+            - METALS keep their own metallic tint (gold looks gold) — the part colour doesn't recolour
+              them, so just choose the metal whose colour you want.
+            - GLASS/acrylic are transparent.
+        Do NOT put a "color" or raw PBR numbers inside a PRESET material spec — only pick a preset name;
+        colour always comes from the part's "add" colour.
+
+        TEXTURED surfaces (real grain/weave/detail): {"_type": "Material", "texture": "<name>"}
+            Use these when the surface should show a photographic texture rather than a flat finish.
+            Textures are projected onto the part automatically (no UVs needed) and carry their own
+            colour, so you do NOT set the part "color" for a textured part.
+            Texture names:
+              wood, oak, wood_laminate, marble, concrete, concrete_floor, brick, cobblestone, stone,
+              rubber, fabric (denim), leather, metal_plate, blue_metal, corrugated_metal, rusty_metal
+            Aliases: wood_grain, timber, planks, cloth, textile, tile, rock, granite, brushed_metal,
+              galvanized_metal, rust. Example — a wooden tabletop: "material": {"_type":"Material","texture":"wood"}.
+            (Prefer a solid PRESET for plain plastics/metals/glass; use a TEXTURE only when real surface
+            detail matters — a wooden panel, a brushed-metal plate, a fabric seat, a marble top.)
+
+        Guidance: assign materials proactively and sensibly based on what the part physically is
+        (metal bracket → steel/aluminum, lens/window → glass-clear, knob → plastic-glossy,
+        tyre → rubber-black, mug → ceramic-white, wooden handle → texture "wood"). The user can ask you
+        to change a part's material or colour at any time — just re-issue the model with the update.
 
     ── Constraint section ─────────────────────────────────────────────────────────────────────────
 
@@ -2072,11 +2319,13 @@ async def assembly_api(
             {"method": "add", "params": {
             "arg": {"_ref": "part1"}, "name": "part1",
             "color": {"_type": "Color", "name": "darkorange"},
+            "material": {"_type": "Material", "preset": "glossy_plastic"},
             "loc": {"_type": "Location", "x": 0, "y": 0, "z": 0}
             }},
             {"method": "add", "params": {
             "arg": {"_ref": "part2"}, "name": "part2",
             "color": {"_type": "Color", "name": "deepskyblue1"},
+            "material": {"_type": "Material", "preset": "brushed_aluminum"},
             "loc": {"_type": "Location", "x": 0, "y": 0, "z": 40}
             }},
             {"method": "add", "params": {

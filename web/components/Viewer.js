@@ -110,9 +110,217 @@ function loadTCV() {
   });
 }
 
+// Extra HDRIs added to the built-in Studio "Environment" picker (DEV-EDITABLE:
+// add a Poly Haven HDRI slug + label here and it appears in the dropdown's "More"
+// group). Browse slugs at https://polyhaven.com/hdris.
+const HDRI_BASE = "https://dl.polyhaven.org/file/ph-assets/HDRIs/hdr";
+const hdriUrl = (slug, use4k) => {
+  const res = use4k ? "4k" : "2k";
+  return `${HDRI_BASE}/${res}/${slug}_${res}.hdr`;
+};
+const EXTRA_ENVIRONMENTS = [
+  { label: "Brown Studio", slug: "brown_photostudio_02" },
+  { label: "Blue Studio", slug: "blue_photo_studio" },
+  { label: "Neon Studio", slug: "neon_photostudio" },
+  { label: "Fireplace", slug: "fireplace" },
+  { label: "Autoshop", slug: "autoshop_01" },
+  { label: "Machine Shop", slug: "machine_shop_02" },
+  { label: "Artist Workshop", slug: "artist_workshop" },
+  { label: "Grassfield", slug: "scythian_tombs_2" },
+  { label: "Garden", slug: "symmetrical_garden_02" },
+  { label: "Lilienstein", slug: "lilienstein" },
+  { label: "Cliff Top", slug: "white_cliff_top" },
+  { label: "Cloudy Sky", slug: "kloofendal_48d_partly_cloudy_puresky" },
+  { label: "Clear Night", slug: "rogland_clear_night" }
+];
+
+// Model rotation, applied ONLY while the Studio tab is active (like PBR/env).
+//   ref.current.rot       — per-axis manual angle from the sliders (radians)
+//   ref.current.spin      — per-axis turntable on/off
+//   ref.current.spinAccum — per-axis accumulated turntable angle (radians)
+// A single RAF sets rootGroup.rotation = rot + spinAccum each frame, advancing the
+// accumulator for active turntables, and resets the model upright outside Studio.
+// Reads the live viewer from ref so it survives model updates.
+// Turntable speed (radians/frame). The "Rotation Speed" slider (1–100) scales it;
+// SPIN_SPEED is the default at slider value 20.
+const SPIN_SPEED = 0.008;
+const SPEED_UNIT = SPIN_SPEED / 20;
+function rotationTick(ref) {
+  const v = ref.current.viewer;
+  const g = v?.rendered?.nestedGroup?.rootGroup;
+  if (g) {
+    if (v._studioManager?.isActive) {
+      const { rot, spin, spinAccum, spinSpeed } = ref.current;
+      if (spin.x) spinAccum.x += spinSpeed;
+      if (spin.y) spinAccum.y += spinSpeed;
+      if (spin.z) spinAccum.z += spinSpeed;
+      const tx = rot.x + spinAccum.x, ty = rot.y + spinAccum.y, tz = rot.z + spinAccum.z;
+      if (g.rotation.x !== tx || g.rotation.y !== ty || g.rotation.z !== tz) {
+        g.rotation.set(tx, ty, tz);
+        try { v.update(true, false); } catch {}
+      }
+    } else if (g.rotation.x || g.rotation.y || g.rotation.z) {
+      g.rotation.set(0, 0, 0);
+      try { v.update(true, false); } catch {}
+    }
+  }
+  ref.current.rotRaf = requestAnimationFrame(() => rotationTick(ref));
+}
+
+// A native-styled Studio slider row (0–360°) that manually rotates one axis.
+function makeRotationSliderRow(axis, ref) {
+  const row = document.createElement("div");
+  row.className = "tcv_studio_row t2c_rot_row";
+  const lab = document.createElement("span");
+  lab.className = "tcv_label";
+  lab.title = `Manually rotate the model around the ${axis.toUpperCase()} axis (degrees)`;
+  lab.textContent = `Rotate ${axis.toUpperCase()}`;
+  const group = document.createElement("div");
+  group.className = "tcv_studio_slider_group";
+  const range = document.createElement("input");
+  range.type = "range"; range.min = "0"; range.max = "360"; range.step = "1";
+  range.className = "tcv_clip_slider";
+  const num = document.createElement("input");
+  num.className = "tcv_clip_input";
+  const initDeg = Math.round((ref.current.rot[axis] * 180) / Math.PI) % 360;
+  range.value = String(initDeg); num.value = String(initDeg);
+  const apply = (val) => {
+    const d = Math.max(0, Math.min(360, Math.round(Number(val) || 0)));
+    range.value = String(d); num.value = String(d);
+    ref.current.rot[axis] = (d * Math.PI) / 180;
+  };
+  range.addEventListener("input", () => apply(range.value));
+  num.addEventListener("input", () => apply(num.value));
+  group.appendChild(range); group.appendChild(num);
+  row.appendChild(lab); row.appendChild(group);
+  return row;
+}
+
+// A native-styled Studio checkbox row that auto-rotates (turntable) one axis.
+// Uses the same classes as the "Use 4K maps" row so it sits right-aligned under
+// the control column, directly below its axis's Rotate slider.
+function makeTurntableRow(axis, ref) {
+  const row = document.createElement("div");
+  row.className = "tcv_studio_checks tcv_studio_4k_row t2c_spin_row";
+  const cb = document.createElement("input");
+  cb.type = "checkbox"; cb.className = "tcv_check";
+  cb.checked = !!ref.current.spin[axis];
+  cb.title = `Auto-rotate (turntable) the model around the ${axis.toUpperCase()} axis`;
+  cb.addEventListener("change", () => {
+    ref.current.spin[axis] = cb.checked;
+    // Turning the turntable off drops its accumulated spin, so the axis returns to
+    // the angle set by that axis's Rotate slider.
+    if (!cb.checked) ref.current.spinAccum[axis] = 0;
+  });
+  const lab = document.createElement("span");
+  lab.className = "tcv_label"; lab.title = cb.title;
+  lab.textContent = `Turntable ${axis.toUpperCase()}`;
+  row.appendChild(cb); row.appendChild(lab);
+  return row;
+}
+
+// A native-styled Studio slider (1–100) for the turntable rotation speed.
+function makeSpeedSliderRow(ref) {
+  const row = document.createElement("div");
+  row.className = "tcv_studio_row t2c_speed_row";
+  const lab = document.createElement("span");
+  lab.className = "tcv_label";
+  lab.title = "Turntable rotation speed";
+  lab.textContent = "Rotation Speed";
+  const group = document.createElement("div");
+  group.className = "tcv_studio_slider_group";
+  const range = document.createElement("input");
+  range.type = "range"; range.min = "1"; range.max = "100"; range.step = "1";
+  range.className = "tcv_clip_slider";
+  const num = document.createElement("input");
+  num.className = "tcv_clip_input";
+  const initVal = Math.max(1, Math.min(100, Math.round(ref.current.spinSpeed / SPEED_UNIT)));
+  range.value = String(initVal); num.value = String(initVal);
+  const apply = (val) => {
+    const v = Math.max(1, Math.min(100, Math.round(Number(val) || 1)));
+    range.value = String(v); num.value = String(v);
+    ref.current.spinSpeed = v * SPEED_UNIT;
+  };
+  range.addEventListener("input", () => apply(range.value));
+  num.addEventListener("input", () => apply(num.value));
+  group.appendChild(range); group.appendChild(num);
+  row.appendChild(lab); row.appendChild(group);
+  return row;
+}
+
+// Register our EXTRA_ENVIRONMENTS with the viewer's EnvironmentManager as
+// resolution-aware presets, so the built-in "Use 4K maps" checkbox works for them
+// exactly like the built-in HDRIs. Without this our envs are fixed 2K URLs the
+// manager can't re-resolve, and isPreset() (which gates the 4K toggle) excludes
+// them. Idempotent per manager instance (a fresh one is created on each render).
+function registerCustomEnvs(viewer) {
+  const em = viewer?.envManager;
+  if (!em || em.__t2cEnvs) return;
+  em.__t2cEnvs = true;
+  const slugs = EXTRA_ENVIRONMENTS.map((e) => e.slug);
+  const urlsAt = (use4k) => Object.fromEntries(slugs.map((s) => [s, hdriUrl(s, use4k)]));
+  // Register at the manager's current resolution so slug values resolve to a URL.
+  Object.assign(em._userOverrides, urlsAt(em._use4k));
+  Object.assign(em._presetUrls, urlsAt(em._use4k));
+  // Let the 4K toggle treat our slugs as resolution-switchable.
+  const origIsPreset = em.isPreset.bind(em);
+  em.isPreset = (name) => origIsPreset(name) || slugs.includes(name);
+  // On a 4K switch: point our overrides at the new resolution and drop our stale
+  // cache first, so the reload inside the original picks up the new-res URL.
+  const origSet4k = em.setUse4kEnvMaps.bind(em);
+  em.setUse4kEnvMaps = (use4k, currentEnvName, renderer) => {
+    Object.assign(em._userOverrides, urlsAt(use4k));
+    for (const s of slugs) {
+      const c = em._cache.get(s);
+      if (c) { try { c.dispose(); } catch {} em._cache.delete(s); em._lightDetectionCache?.delete(s); }
+    }
+    return origSet4k(use4k, currentEnvName, renderer);
+  };
+}
+
+// Augment the viewer's OWN Studio panel (not a separate UI): add extra HDRIs to
+// its Environment <select> and a Turntable toggle, using the panel's native
+// classes so they read as built-in. Runs after each render (the panel is rebuilt
+// with the viewer). The extra <option>s auto-wire to the built-in change handler.
+function augmentStudioPanel(container, ref, viewer) {
+  try {
+    registerCustomEnvs(viewer);  // make the 4K toggle work for our envs (fresh viewer, not ref)
+    const sel = container.querySelector(".tcv_studio_environment");
+    if (sel && !sel.querySelector('optgroup[data-t2c="1"]')) {
+      const og = document.createElement("optgroup");
+      og.label = "More";
+      og.setAttribute("data-t2c", "1");
+      for (const e of EXTRA_ENVIRONMENTS) {
+        const o = document.createElement("option");
+        o.value = e.slug;  // a registered preset slug (resolution-aware); not a fixed URL
+        o.textContent = e.label;
+        o.title = `Poly Haven: ${e.slug}.hdr`;
+        og.appendChild(o);
+      }
+      sel.appendChild(og);
+    }
+    const panel = container.querySelector(".tcv_cad_studio_container");
+    if (panel && !panel.querySelector(".t2c_rot_row")) {
+      const spacer = document.createElement("div");
+      spacer.className = "tcv_studio_group_spacer";
+      panel.appendChild(spacer);
+      // Each axis: its Rotate slider, then its Turntable toggle directly below it.
+      for (const axis of ["x", "y", "z"]) {
+        panel.appendChild(makeRotationSliderRow(axis, ref));
+        panel.appendChild(makeTurntableRow(axis, ref));
+      }
+      panel.appendChild(makeSpeedSliderRow(ref));  // turntable rotation speed
+    }
+  } catch { /* studio panel not present yet — ignore */ }
+}
+
 export default function Viewer() {
   const containerRef = useRef(null);
-  const ref = useRef({ TCV: null, viewer: null, lastVersion: -1, payload: null });
+  const ref = useRef({
+    TCV: null, viewer: null, lastVersion: -1, payload: null,
+    rot: { x: 0, y: 0, z: 0 }, spin: { x: false, y: false, z: false },
+    spinAccum: { x: 0, y: 0, z: 0 }, spinSpeed: SPIN_SPEED, rotRaf: 0,
+  });
   const sessionId = useSessionStore((s) => s.sessionId);
   const sidRef = useRef(sessionId);
   // Blank white until the backend/MCP server delivers the first model; show a
@@ -273,6 +481,8 @@ export default function Viewer() {
       viewer.render(payload.data, renderOptions, viewerOptions);
       viewer.glassMode(displayOptions.glass);
       viewer.showTools(displayOptions.tools);
+      // Add our extra HDRIs + turntable toggle into the viewer's own Studio panel.
+      augmentStudioPanel(container, ref, viewer);
 
       const rc = preset(config, "reset_camera", "iso");
       if (["iso", "left", "right", "top", "bottom", "rear", "front"].includes(rc)) {
@@ -403,6 +613,9 @@ export default function Viewer() {
       timer = setInterval(poll, 1000);
     })();
 
+    // Single persistent loop that applies the Studio rotation (sliders + turntables).
+    rotationTick(ref);
+
     // Re-fit the canvas to the container on window resize AND slider drags,
     // preserving the camera/model (mirrors ocp_vscode's viewer.html — re-render
     // is avoided so the user's view isn't reset).
@@ -444,6 +657,7 @@ export default function Viewer() {
       cancelled = true;
       if (timer) clearInterval(timer);
       if (rafId) cancelAnimationFrame(rafId);
+      if (ref.current.rotRaf) cancelAnimationFrame(ref.current.rotRaf); // stop the rotation loop
       ro.disconnect();
       if (ref.current.viewer) { try { ref.current.viewer.dispose(); } catch {} }
     };
