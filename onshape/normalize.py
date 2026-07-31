@@ -348,14 +348,15 @@ def _boolean_op(feat: dict):
 
 
 def normalize(features: dict, sketches: dict, url: str = "", targets: dict | None = None,
-              axes: dict | None = None, caps: dict | None = None) -> ir.Model:
+              axes: dict | None = None, caps: dict | None = None,
+              body_flow: dict | None = None) -> ir.Model:
     feats = features.get("features", [])
     sk_by_fid = {s["featureId"]: s for s in sketches.get("sketches", [])}
     sketch_ids = set(sk_by_fid)
     targets = targets or {}
     axes = axes or {}
     caps = caps or {}
-    model = ir.Model(source_url=url)
+    model = ir.Model(source_url=url, body_flow=body_flow or {})
     sketch_ops: dict[str, ir.Sketch] = {}
     use_counts = _extrude_use_counts(feats, sketch_ids)
     last_sketch: str | None = None
@@ -399,6 +400,7 @@ def normalize(features: dict, sketches: dict, url: str = "", targets: dict | Non
         else:
             op, why = None, "feature type not yet supported"
         if op:
+            op.source["index"] = i  # feature index, for body-flow lookup
             model.ops.append(op)
         else:
             model.unsupported.append({"index": i, "type": ftype, "name": fname, "reason": why})

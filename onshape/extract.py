@@ -99,6 +99,32 @@ def resolve_extrude_caps(api: Onshape, ps: PartStudio, extrudes: list[tuple]) ->
     return out
 
 
+# Centroids (mm) of every SOLID body present at a rollback state -- the raw signal
+# for tracking bodies across features (create/modify/pattern/union).
+_FS_SOLIDS = """function(context is Context, queries){
+  var out = [];
+  for (var b in evaluateQuery(context, qBodyType(qEverything(EntityType.BODY), BodyType.SOLID))){
+    var c = evApproximateCentroid(context, {"entities": b});
+    out = append(out, [c[0]/millimeter, c[1]/millimeter, c[2]/millimeter]);
+  }
+  return out;
+}"""
+
+
+def resolve_body_flow(api: Onshape, ps: PartStudio, max_rollback: int) -> dict:
+    """{rollbackBarIndex: [solid centroid, ...]} for indices 1..max_rollback.
+    body_flow[i] is the state after feature i-1 (i.e. before feature i)."""
+    flow: dict = {}
+    for rb in range(1, max_rollback + 1):
+        try:
+            res = api.call(f"{ps.path}/featurescript?rollbackBarIndex={rb}",
+                           {"script": _FS_SOLIDS, "queries": {}})
+            flow[rb] = _unwrap(res.get("result")) or []
+        except Exception:  # noqa: BLE001
+            flow[rb] = []
+    return flow
+
+
 def resolve_created_faces(api: Onshape, ps: PartStudio, feature_ids: list[str]) -> dict:
     """{featureId: [{"at": [x,y,z] mm, "r": mm}, ...]} for the given features.
 

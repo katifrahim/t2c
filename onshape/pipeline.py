@@ -14,11 +14,12 @@ import sys
 from onshape.classify import classify
 from onshape.client import Onshape, parse_url
 from onshape.emit import emit_model
-from onshape.extract import resolve_created_faces, resolve_extrude_caps
+from onshape.extract import resolve_created_faces, resolve_extrude_caps, resolve_body_flow
 from onshape.normalize import _msg, normalize
 from onshape.verify import fetch_ground_truth, run_steps, compare, Geometry
 
 _MODIFIERS = {"fillet", "chamfer"}
+_MULTIBODY = {"circularPattern", "booleanBodies"}
 
 
 def run(url: str, api: Onshape | None = None) -> dict:
@@ -40,7 +41,11 @@ def run(url: str, api: Onshape | None = None) -> dict:
     extrudes = [(_msg(f)["featureId"], i + 1) for i, f in enumerate(flist)
                 if _msg(f).get("featureType") == "extrude" and not _msg(f).get("suppressed")]
     caps = resolve_extrude_caps(api, ps, extrudes)
-    model = normalize(features, sketches, url=url, targets=targets, caps=caps)
+    # Body-flow (one rollback query per feature) only when patterns/booleans need it.
+    body_flow = {}
+    if any(_msg(f).get("featureType") in _MULTIBODY for f in flist):
+        body_flow = resolve_body_flow(api, ps, len(flist))
+    model = normalize(features, sketches, url=url, targets=targets, caps=caps, body_flow=body_flow)
     steps = emit_model(model)
 
     out: dict = {

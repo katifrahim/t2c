@@ -144,3 +144,5 @@ class Model:
     ops: list[Op] = field(default_factory=list)
     source_url: str = ""
     unsupported: list[dict] = field(default_factory=list)  # {index, type, name, reason}
+    # {rollbackBarIndex: [solid centroid,...]} for cross-feature body tracking.
+    body_flow: dict = field(default_factory=dict)
