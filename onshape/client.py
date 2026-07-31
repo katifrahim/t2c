@@ -7,9 +7,11 @@ Auth is HTTP Basic over the API-key pair — Onshape accepts this for API keys.
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import os
 import re
+import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
@@ -17,6 +19,21 @@ from dataclasses import dataclass
 DEFAULT_BASE = "https://cad.onshape.com/api/v9"
 # onshape-exp lives beside the repo (../../onshape-exp/.env from this file).
 _ENV_FALLBACK = os.path.join(os.path.dirname(__file__), "..", "..", "onshape-exp", ".env")
+_CACHE_DIR = os.path.join(os.path.dirname(__file__), "out", "cache")
+_MAX_RETRIES = 6
+_TIMEOUT = 45.0          # per-request socket timeout (seconds)
+_MIN_INTERVAL = 0.35     # min spacing between live requests (proactive throttle)
+_last_request = 0.0
+LAST_RETRY_AFTER = None   # Retry-After (s) from the most recent 429, for telemetry
+
+
+def _throttle() -> None:
+    global _last_request
+    now = time.monotonic()
+    wait = _MIN_INTERVAL - (now - _last_request)
+    if wait > 0:
+        time.sleep(wait)
+    _last_request = time.monotonic()
 
 # .../documents/<did>/<wvm>/<wid>/e/<eid>  — wvm is w (workspace), v (version) or m (microversion)
 _URL_RE = re.compile(
@@ -64,9 +81,10 @@ def parse_url(url: str) -> PartStudio:
 class Onshape:
     """Minimal authenticated Onshape API client."""
 
-    def __init__(self, base: str | None = None, load_dotenv: bool = True):
+    def __init__(self, base: str | None = None, load_dotenv: bool = True, cache: bool = True):
         if load_dotenv:
             load_env()
+        self.cache = cache  # cache GET responses on disk (dev iteration; avoids 429s)
         self.base = (base or os.environ.get("ONSHAPE_BASE_URL") or DEFAULT_BASE).rstrip("/")
         try:
             access = os.environ["ONSHAPE_ACCESS_KEY"]
@@ -78,24 +96,58 @@ class Onshape:
         self._auth = "Basic " + base64.b64encode(f"{access}:{secret}".encode()).decode()
 
     def call(self, path: str, payload: dict | None = None, method: str | None = None):
-        """GET when no payload; POST otherwise. `method` forces the verb."""
+        """GET when no payload; POST otherwise. `method` forces the verb.
+
+        Retries 429/5xx with exponential backoff (honoring Retry-After). GET
+        responses are cached on disk when `self.cache` is set.
+        """
         data = json.dumps(payload).encode() if payload is not None else None
+        verb = method or ("POST" if data is not None else "GET")
+
+        cache_path = None
+        if self.cache and verb == "GET":
+            key = hashlib.sha256((self.base + path).encode()).hexdigest()[:32]
+            cache_path = os.path.join(_CACHE_DIR, f"{key}.json")
+            if os.path.exists(cache_path):
+                return json.load(open(cache_path))
+
         req = urllib.request.Request(
             self.base + path,
             data=data,
-            method=method or ("POST" if data is not None else "GET"),
+            method=verb,
             headers={
                 "Authorization": self._auth,
                 "Accept": "application/json;charset=UTF-8; qs=0.09",
                 "Content-Type": "application/json",
             },
         )
-        try:
-            with urllib.request.urlopen(req) as r:
-                return json.load(r)
-        except urllib.error.HTTPError as e:  # surface Onshape's error body
-            body = e.read().decode(errors="replace")
-            raise RuntimeError(f"Onshape {e.code} on {path}: {body[:500]}") from e
+        _throttle()  # stay under the burst limit
+        for attempt in range(_MAX_RETRIES):
+            try:
+                # A timeout is essential: without it a stalled socket hangs forever
+                # and never reaches the retry logic below.
+                with urllib.request.urlopen(req, timeout=_TIMEOUT) as r:
+                    result = json.load(r)
+                if cache_path:
+                    os.makedirs(_CACHE_DIR, exist_ok=True)
+                    json.dump(result, open(cache_path, "w"))
+                return result
+            except urllib.error.HTTPError as e:
+                if e.code == 429:
+                    global LAST_RETRY_AFTER
+                    LAST_RETRY_AFTER = e.headers.get("Retry-After")
+                if e.code in (429, 500, 502, 503, 504) and attempt < _MAX_RETRIES - 1:
+                    wait = float(e.headers.get("Retry-After") or 0) or min(2**attempt, 30)
+                    time.sleep(wait)
+                    continue
+                body = e.read().decode(errors="replace")
+                raise RuntimeError(f"Onshape {e.code} on {path}: {body[:500]}") from e
+            except (urllib.error.URLError, TimeoutError) as e:  # stalled/dropped socket
+                if attempt < _MAX_RETRIES - 1:
+                    time.sleep(min(2**attempt, 30))
+                    continue
+                raise RuntimeError(f"Onshape request error on {path}: {e}") from e
+        raise RuntimeError(f"Onshape request failed after {_MAX_RETRIES} retries: {path}")
 
     # --- typed Part Studio endpoints -------------------------------------------------
     def features(self, ps: PartStudio) -> dict:

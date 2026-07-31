@@ -1,0 +1,216 @@
+"""Normalize an Onshape Part Studio (features + solved sketches) into the IR.
+
+Reads the raw `/features` and `/sketches?includeGeometry=true` responses. Sketch
+geometry is already solved (2D coordinates in the sketch's local frame, in metres);
+feature dimensions come from parametric expressions. Feature types we can't yet
+translate are recorded on `Model.unsupported` (never silently dropped) so the
+pipeline can rollback-truncate to the largest verifiable prefix.
+"""
+from __future__ import annotations
+
+import math
+import re
+
+from onshape import ir
+
+MM = 1e3  # metres -> millimetres
+
+# Onshape length units -> millimetres.
+_UNIT_MM = {"mm": 1.0, "cm": 10.0, "m": 1000.0, "meter": 1000.0, "millimeter": 1.0,
+            "centimeter": 10.0, "in": 25.4, "inch": 25.4, "ft": 304.8, "foot": 304.8, "yd": 914.4}
+_NUM_UNIT = re.compile(r"^\s*(-?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?)\s*([a-zA-Z]*)\s*$")
+
+# Onshape operationType enum -> IR boolean op.
+_OP = {"NEW": "new", "ADD": "add", "REMOVE": "cut", "INTERSECT": "intersect"}
+
+
+def _msg(x: dict) -> dict:
+    return x.get("message", x)
+
+
+def parse_length_mm(expr: str | None) -> float | None:
+    """'1.80 mm' / '0.5 in' / '25' -> millimetres. None if it isn't a plain
+    number+unit (e.g. references a variable) — the caller then flags it."""
+    if not expr:
+        return None
+    m = _NUM_UNIT.match(expr)
+    if not m:
+        return None
+    val, unit = float(m.group(1)), m.group(2).lower()
+    if not unit:
+        return val  # bare number: Onshape default length unit is mm in these dumps
+    if unit not in _UNIT_MM:
+        return None
+    return val * _UNIT_MM[unit]
+
+
+def _params(feat: dict) -> dict:
+    """parameterId -> parameter message dict."""
+    out = {}
+    for p in _msg(feat).get("parameters", []):
+        pm = _msg(p)
+        if pm.get("parameterId"):
+            out[pm["parameterId"]] = pm
+    return out
+
+
+def _enum(p: dict | None):
+    return p.get("value") if p else None
+
+
+def _bool(p: dict | None) -> bool:
+    return bool(p.get("value")) if p else False
+
+
+# --- sketch geometry -------------------------------------------------------------
+def _xy(v: dict) -> list[float]:
+    return [v["x"] * MM, v["y"] * MM]
+
+
+def _point_map(entities: list[dict]) -> dict:
+    return {
+        e["sketchEntityId"]: _xy(_msg(e)["position2d"])
+        for e in entities
+        if e.get("sketchEntityType") == "skPoint" and "position2d" in _msg(e)
+    }
+
+
+def _dist(a, b) -> float:
+    return math.hypot(a[0] - b[0], a[1] - b[1])
+
+
+def _reverse(curve: ir.Curve) -> ir.Curve:
+    """Same curve traversed the other way (start<->end; arc midpoint unchanged)."""
+    d = curve.data
+    if curve.kind == "arc":
+        return ir.Curve("arc", {"start": d["end"], "mid": d["mid"], "end": d["start"]})
+    return ir.Curve("line", {"start": d["end"], "end": d["start"]})
+
+
+def _assemble_loops(segments: list[ir.Curve], tol: float = 1e-4) -> list[list[ir.Curve]]:
+    """Chain curves into closed loops, REORIENTING each so its start->end follows the
+    traversal direction. Without this, a curve matched by its end would emit a
+    zero-length lineTo/threePointArc (OCCT: 'GC_MakeArcOfCircle - no result')."""
+    remaining = list(segments)
+    loops: list[list[ir.Curve]] = []
+    while remaining:
+        cur = remaining.pop(0)
+        loop = [cur]
+        loop_start, cur_end = cur.data["start"], cur.data["end"]
+        while remaining and _dist(cur_end, loop_start) > tol:
+            for i, c in enumerate(remaining):
+                if _dist(c.data["start"], cur_end) < tol:
+                    loop.append(c); cur_end = c.data["end"]; remaining.pop(i); break
+                if _dist(c.data["end"], cur_end) < tol:
+                    rc = _reverse(c); loop.append(rc); cur_end = rc.data["end"]; remaining.pop(i); break
+            else:
+                break  # open chain; leave as-is
+        loops.append(loop)
+    return loops
+
+
+def _arc_curve(em: dict, g: dict, s: list[float], e2: list[float]) -> ir.Curve:
+    """3-point arc: midpoint from the solved parameter range (reliable direction)."""
+    center = _xy(g["center2d"])
+    r = g["radius"] * MM
+    a0, a1 = em.get("startParameter"), em.get("endParameter")
+    if a0 is not None and a1 is not None:
+        am = (a0 + a1) / 2
+        mid = [center[0] + r * math.cos(am), center[1] + r * math.sin(am)]
+    else:  # fall back to the chord's perpendicular bulge
+        mx, my = (s[0] + e2[0]) / 2, (s[1] + e2[1]) / 2
+        vx, vy = mx - center[0], my - center[1]
+        n = math.hypot(vx, vy) or 1.0
+        mid = [center[0] + r * vx / n, center[1] + r * vy / n]
+    return ir.Curve("arc", {"start": s, "mid": mid, "end": e2})
+
+
+def _sketch_profiles(sk: dict) -> list[ir.Profile]:
+    ents = sk.get("entities", [])
+    pts = _point_map(ents)
+    profiles: list[ir.Profile] = []
+    segments: list[ir.Curve] = []
+    for e in ents:
+        em = _msg(e)
+        t = e.get("sketchEntityType")
+        if em.get("isConstruction"):
+            continue
+        g = em.get("geometry", {})
+        if t == "skCircle":
+            c = _xy(g["center2d"])
+            profiles.append(ir.Profile([ir.Curve("circle", {"center": c, "radius": g["radius"] * MM})]))
+        elif t == "skLineSegment":
+            s, e2 = pts.get(em["startPointId"]), pts.get(em["endPointId"])
+            if s and e2:
+                segments.append(ir.Curve("line", {"start": s, "end": e2}))
+        elif t == "skArc":
+            s, e2 = pts.get(em["startPointId"]), pts.get(em["endPointId"])
+            if s and e2:
+                segments.append(_arc_curve(em, g, s, e2))
+    for loop in _assemble_loops(segments):
+        profiles.append(ir.Profile(loop))
+    return profiles
+
+
+# --- feature translation ---------------------------------------------------------
+def _sketch_op(feat: dict, sketch: dict | None) -> ir.Sketch:
+    m = _msg(feat)
+    plane = ir.Plane.from_matrix(sketch.get("sketchMatrix") if sketch else None)
+    profiles = _sketch_profiles(sketch) if sketch else []
+    return ir.Sketch(source={"id": m["featureId"], "name": m.get("name"), "type": "newSketch"},
+                     plane=plane, profiles=profiles)
+
+
+def _extrude_op(feat: dict, sketch_ids: set[str], last_sketch: str | None):
+    m = _msg(feat)
+    P = _params(feat)
+    end_bound = _enum(P.get("endBound"))
+    if end_bound not in ("BLIND", None):  # SYMMETRIC handled via `symmetric` flag
+        return None, f"endBound={end_bound}"
+    depth = parse_length_mm((P.get("depth") or {}).get("expression"))
+    if depth is None:
+        return None, "unresolved depth expression"
+    if _bool(P.get("oppositeDirection")):
+        depth = -depth
+    # link to the sketch it consumes
+    ref = None
+    for q in (P.get("entities") or {}).get("queries", []):
+        fid = q.get("featureId")
+        if fid in sketch_ids:
+            ref = fid; break
+    ref = ref or last_sketch
+    op = ir.Extrude(
+        source={"id": m["featureId"], "name": m.get("name"), "type": "extrude"},
+        profile_ref=ref or "",
+        distance=depth,
+        symmetric=_bool(P.get("symmetric")),
+        op=_OP.get(_enum(P.get("operationType")), "new"),
+    )
+    return op, None
+
+
+def normalize(features: dict, sketches: dict, url: str = "") -> ir.Model:
+    feats = features.get("features", [])
+    sk_by_fid = {s["featureId"]: s for s in sketches.get("sketches", [])}
+    sketch_ids = set(sk_by_fid)
+    model = ir.Model(source_url=url)
+    last_sketch: str | None = None
+
+    for i, f in enumerate(feats):
+        m = _msg(f)
+        ftype, fid, fname = m.get("featureType"), m.get("featureId"), m.get("name")
+        if m.get("suppressed"):
+            continue
+        if ftype == "newSketch":
+            model.ops.append(_sketch_op(f, sk_by_fid.get(fid)))
+            last_sketch = fid
+        elif ftype == "extrude":
+            op, why = _extrude_op(f, sketch_ids, last_sketch)
+            if op:
+                model.ops.append(op)
+            else:
+                model.unsupported.append({"index": i, "type": ftype, "name": fname, "reason": why})
+        else:
+            model.unsupported.append({"index": i, "type": ftype, "name": fname,
+                                      "reason": "feature type not yet supported"})
+    return model
