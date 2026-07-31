@@ -113,7 +113,11 @@ function loadTCV() {
 // Extra HDRIs added to the built-in Studio "Environment" picker (DEV-EDITABLE:
 // add a Poly Haven HDRI slug + label here and it appears in the dropdown's "More"
 // group). Browse slugs at https://polyhaven.com/hdris.
-const HDRI_BASE = "https://dl.polyhaven.org/file/ph-assets/HDRIs/hdr/2k";
+const HDRI_BASE = "https://dl.polyhaven.org/file/ph-assets/HDRIs/hdr";
+const hdriUrl = (slug, use4k) => {
+  const res = use4k ? "4k" : "2k";
+  return `${HDRI_BASE}/${res}/${slug}_${res}.hdr`;
+};
 const EXTRA_ENVIRONMENTS = [
   { label: "Brown Studio", slug: "brown_photostudio_02" },
   { label: "Blue Studio", slug: "blue_photo_studio" },
@@ -148,12 +152,43 @@ function setTurntable(ref, on) {
   }
 }
 
+// Register our EXTRA_ENVIRONMENTS with the viewer's EnvironmentManager as
+// resolution-aware presets, so the built-in "Use 4K maps" checkbox works for them
+// exactly like the built-in HDRIs. Without this our envs are fixed 2K URLs the
+// manager can't re-resolve, and isPreset() (which gates the 4K toggle) excludes
+// them. Idempotent per manager instance (a fresh one is created on each render).
+function registerCustomEnvs(viewer) {
+  const em = viewer?.envManager;
+  if (!em || em.__t2cEnvs) return;
+  em.__t2cEnvs = true;
+  const slugs = EXTRA_ENVIRONMENTS.map((e) => e.slug);
+  const urlsAt = (use4k) => Object.fromEntries(slugs.map((s) => [s, hdriUrl(s, use4k)]));
+  // Register at the manager's current resolution so slug values resolve to a URL.
+  Object.assign(em._userOverrides, urlsAt(em._use4k));
+  Object.assign(em._presetUrls, urlsAt(em._use4k));
+  // Let the 4K toggle treat our slugs as resolution-switchable.
+  const origIsPreset = em.isPreset.bind(em);
+  em.isPreset = (name) => origIsPreset(name) || slugs.includes(name);
+  // On a 4K switch: point our overrides at the new resolution and drop our stale
+  // cache first, so the reload inside the original picks up the new-res URL.
+  const origSet4k = em.setUse4kEnvMaps.bind(em);
+  em.setUse4kEnvMaps = (use4k, currentEnvName, renderer) => {
+    Object.assign(em._userOverrides, urlsAt(use4k));
+    for (const s of slugs) {
+      const c = em._cache.get(s);
+      if (c) { try { c.dispose(); } catch {} em._cache.delete(s); em._lightDetectionCache?.delete(s); }
+    }
+    return origSet4k(use4k, currentEnvName, renderer);
+  };
+}
+
 // Augment the viewer's OWN Studio panel (not a separate UI): add extra HDRIs to
 // its Environment <select> and a Turntable toggle, using the panel's native
 // classes so they read as built-in. Runs after each render (the panel is rebuilt
 // with the viewer). The extra <option>s auto-wire to the built-in change handler.
-function augmentStudioPanel(container, ref) {
+function augmentStudioPanel(container, ref, viewer) {
   try {
+    registerCustomEnvs(viewer);  // make the 4K toggle work for our envs (fresh viewer, not ref)
     const sel = container.querySelector(".tcv_studio_environment");
     if (sel && !sel.querySelector('optgroup[data-t2c="1"]')) {
       const og = document.createElement("optgroup");
@@ -161,7 +196,7 @@ function augmentStudioPanel(container, ref) {
       og.setAttribute("data-t2c", "1");
       for (const e of EXTRA_ENVIRONMENTS) {
         const o = document.createElement("option");
-        o.value = `${HDRI_BASE}/${e.slug}_2k.hdr`;
+        o.value = e.slug;  // a registered preset slug (resolution-aware); not a fixed URL
         o.textContent = e.label;
         o.title = `Poly Haven: ${e.slug}.hdr`;
         og.appendChild(o);
@@ -353,7 +388,7 @@ export default function Viewer() {
       viewer.glassMode(displayOptions.glass);
       viewer.showTools(displayOptions.tools);
       // Add our extra HDRIs + turntable toggle into the viewer's own Studio panel.
-      augmentStudioPanel(container, ref);
+      augmentStudioPanel(container, ref, viewer);
 
       const rc = preset(config, "reset_camera", "iso");
       if (["iso", "left", "right", "top", "bottom", "rear", "front"].includes(rc)) {
