@@ -92,8 +92,13 @@ def _point_selector(points: list[list[float]]) -> dict:
 
 
 def emit_model(model: ir.Model) -> list[dict]:
-    """Walk the IR and produce the `templates.steps` array, threading a single
-    `current` body through booleans and modifiers."""
+    """Walk the IR and produce the `templates.steps` array.
+
+    Tracks a LIST of live bodies. Extrude NEW appends a body; ADD/CUT/INTERSECT
+    boolean the new tool into the most-recent body; circular pattern appends rotated
+    copies of the most-recent body; booleanBodies unions all live bodies into one;
+    fillet/chamfer modify the most-recent body. The last stored object is the final
+    model (what verification reads)."""
     steps: list[dict] = []
     by_ref = {op.source.get("id"): op for op in model.ops if isinstance(op, ir.Sketch)}
     n = 0
@@ -107,7 +112,7 @@ def emit_model(model: ir.Model) -> list[dict]:
         n += 1
         return f"body{n}"
 
-    current: str | None = None
+    bodies: list[str] = []  # live bodies, most-recent last
 
     for op in model.ops:
         if isinstance(op, ir.Sketch):
@@ -119,23 +124,37 @@ def emit_model(model: ir.Model) -> list[dict]:
             tool = name()
             add(_emit_extrude(sk, op, tool) if isinstance(op, ir.Extrude)
                 else _emit_revolve(sk, op, tool))
-            if op.op == "new" or current is None:
-                current = tool
-            else:  # boolean the freshly-built tool solid into the current body
+            if op.op == "new" or not bodies:
+                bodies.append(tool)
+            else:  # boolean the tool into the most-recent body
                 body = name()
                 add({"operations": [{"method": _BOOL[op.op], "args": [{"_ref": tool}]}],
-                     "start_from": current, "store_as": body})
-                current = body
-        elif isinstance(op, ir.Fillet) and op.edge_points and current:
+                     "start_from": bodies[-1], "store_as": body})
+                bodies[-1] = body
+        elif isinstance(op, ir.CircularPattern) and bodies:
+            target = bodies[-1]
+            k = op.count if op.count > 1 else 1
+            step_ang = (op.angle / op.count) if op.equal_space else op.angle
+            a0 = op.axis_origin
+            a1 = [a0[0] + op.axis_dir[0], a0[1] + op.axis_dir[1], a0[2] + op.axis_dir[2]]
+            for i in range(1, k):  # instance 0 is the original body
+                copy = name()
+                add({"operations": [{"method": "rotate", "args": [a0, a1, i * step_ang]}],
+                     "start_from": target, "store_as": copy})
+                bodies.append(copy)
+        elif isinstance(op, ir.Boolean) and bodies:
+            if len(bodies) > 1:
+                body = name()
+                ops = [{"method": _BOOL.get(op.op, "union"), "args": [{"_ref": b}]}
+                       for b in bodies[1:]]
+                add({"operations": ops, "start_from": bodies[0], "store_as": body})
+                bodies = [body]
+        elif isinstance(op, (ir.Fillet, ir.Chamfer)) and op.edge_points and bodies:
             body = name()
+            meth = "fillet" if isinstance(op, ir.Fillet) else "chamfer"
+            amt = op.radius if isinstance(op, ir.Fillet) else op.distance
             add({"operations": [{"method": "edges", "args": [_point_selector(op.edge_points)]},
-                                {"method": "fillet", "args": [op.radius]}],
-                 "start_from": current, "store_as": body})
-            current = body
-        elif isinstance(op, ir.Chamfer) and op.edge_points and current:
-            body = name()
-            add({"operations": [{"method": "edges", "args": [_point_selector(op.edge_points)]},
-                                {"method": "chamfer", "args": [op.distance]}],
-                 "start_from": current, "store_as": body})
-            current = body
+                                {"method": meth, "args": [amt]}],
+                 "start_from": bodies[-1], "store_as": body})
+            bodies[-1] = body
     return steps

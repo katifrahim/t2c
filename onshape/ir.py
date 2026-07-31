@@ -116,6 +116,23 @@ class Chamfer(Op):
 
 
 @dataclass
+class CircularPattern(Op):
+    # Patterns the most-recent body around an axis into `count` instances.
+    count: int = 1
+    angle: float = 360.0          # degrees swept
+    equal_space: bool = True
+    axis_origin: list[float] = field(default_factory=lambda: [0, 0, 0])
+    axis_dir: list[float] = field(default_factory=lambda: [0, 0, 1])
+    kind: str = "circular_pattern"
+
+
+@dataclass
+class Boolean(Op):
+    op: str = "union"             # union | cut | intersect
+    kind: str = "boolean"
+
+
+@dataclass
 class Model:
     """A whole Part Studio, normalized to an ordered op list. `unsupported` records
     features we could not faithfully translate (drives rollback-truncation)."""

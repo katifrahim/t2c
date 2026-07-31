@@ -143,8 +143,30 @@ def test_fillet_by_nearest_point_selection():
     assert props["volume"] == pytest.approx(4000 - 4 * (4 - math.pi) * 10, rel=1e-6)
 
 
+def test_circular_pattern_plus_union():
+    # 4x4x4 box off-center at x=20, patterned 3x (120 deg) about Z, then unioned.
+    prof = ir.Profile([
+        ir.Curve("line", {"start": [18, -2], "end": [22, -2]}),
+        ir.Curve("line", {"start": [22, -2], "end": [22, 2]}),
+        ir.Curve("line", {"start": [22, 2], "end": [18, 2]}),
+        ir.Curve("line", {"start": [18, 2], "end": [18, -2]}),
+    ])
+    sk = ir.Sketch(source={"id": "s"}, plane=ir.Plane(name="XY"), profiles=[prof])
+    ex = ir.Extrude(source={"id": "e"}, profile_ref="s", distance=4, op="new")
+    pat = ir.CircularPattern(source={"id": "p"}, count=3, angle=360, equal_space=True,
+                             axis_origin=[0, 0, 0], axis_dir=[0, 0, 1])
+    boo = ir.Boolean(source={"id": "b"}, op="union")
+    props = _run(emit_model(ir.Model(ops=[sk, ex, pat, boo])))
+    assert props["volume"] == pytest.approx(4 * 4 * 4 * 3, rel=1e-6)  # 3 disjoint copies
+
+
 def test_unsupported_features_recorded():
+    # Without FeatureScript targets a fillet can't resolve its edges -> flagged;
+    # circularPattern / booleanBodies are now supported (not flagged).
     raw = json.load(open(_WASHER_RAW))
     model = normalize(raw["features"], raw["sketches"], url="washer")
     kinds = {u["type"] for u in model.unsupported}
-    assert {"circularPattern", "booleanBodies", "fillet"} <= kinds
+    assert "fillet" in kinds
+    assert "circularPattern" not in kinds and "booleanBodies" not in kinds
+    assert any(isinstance(o, ir.CircularPattern) for o in model.ops)
+    assert any(isinstance(o, ir.Boolean) for o in model.ops)

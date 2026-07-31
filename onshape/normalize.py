@@ -235,11 +235,51 @@ def _extrude_use_counts(feats: list, sketch_ids: set) -> dict:
     return counts
 
 
-def normalize(features: dict, sketches: dict, url: str = "", targets: dict | None = None) -> ir.Model:
+def _parse_angle_deg(expr: str | None) -> float | None:
+    if not expr:
+        return None
+    m = re.match(r"^\s*(-?\d+(?:\.\d+)?)\s*(deg|rad|degree|radian)?\s*$", expr)
+    if not m:
+        return None
+    v = float(m.group(1))
+    return math.degrees(v) if (m.group(2) or "").startswith("rad") else v
+
+
+_BOOL_OP = {"UNION": "union", "SUBTRACTION": "cut", "INTERSECTION": "intersect"}
+
+
+def _pattern_op(feat: dict, axes: dict):
+    m = _msg(feat)
+    P = _params(feat)
+    if _enum(P.get("patternType")) not in ("PART", None):
+        return None, f"patternType={_enum(P.get('patternType'))}"
+    count = parse_length_mm((P.get("instanceCount") or {}).get("expression"))
+    angle = _parse_angle_deg((P.get("angle") or {}).get("expression"))
+    if not count or angle is None:
+        return None, "unresolved pattern count/angle"
+    ax = axes.get(m["featureId"]) or {}
+    return ir.CircularPattern(
+        source={"id": m["featureId"], "name": m.get("name"), "type": "circularPattern"},
+        count=int(round(count)), angle=angle,
+        equal_space=bool((P.get("equalSpace") or {}).get("value", True)),
+        axis_origin=ax.get("origin", [0, 0, 0]), axis_dir=ax.get("dir", [0, 0, 1]),
+    ), None
+
+
+def _boolean_op(feat: dict):
+    m = _msg(feat)
+    op = _BOOL_OP.get(_enum(_params(feat).get("operationType")), "union")
+    return ir.Boolean(source={"id": m["featureId"], "name": m.get("name"),
+                              "type": "booleanBodies"}, op=op), None
+
+
+def normalize(features: dict, sketches: dict, url: str = "", targets: dict | None = None,
+              axes: dict | None = None) -> ir.Model:
     feats = features.get("features", [])
     sk_by_fid = {s["featureId"]: s for s in sketches.get("sketches", [])}
     sketch_ids = set(sk_by_fid)
     targets = targets or {}
+    axes = axes or {}
     model = ir.Model(source_url=url)
     sketch_ops: dict[str, ir.Sketch] = {}
     use_counts = _extrude_use_counts(feats, sketch_ids)
@@ -266,6 +306,10 @@ def normalize(features: dict, sketches: dict, url: str = "", targets: dict | Non
                     op, why = None, "sketch shared by multiple extrudes (region selection needed)"
         elif ftype in ("fillet", "chamfer"):
             op, why = _round_op(f, ftype, targets)
+        elif ftype == "circularPattern":
+            op, why = _pattern_op(f, axes)
+        elif ftype == "booleanBodies":
+            op, why = _boolean_op(f)
         else:
             op, why = None, "feature type not yet supported"
         if op:

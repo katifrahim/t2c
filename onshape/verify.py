@@ -57,6 +57,33 @@ def run_steps(steps: list[dict]) -> dict:
     return asyncio.run(_run_steps_async(steps))
 
 
+def _steps_worker(steps, q):
+    try:
+        q.put(("ok", run_steps(steps)))
+    except Exception as e:  # noqa: BLE001
+        q.put(("err", str(e)[:300]))
+
+
+def run_steps_guarded(steps: list[dict], timeout: float = 45.0) -> dict:
+    """Execute steps in a child process so an OCCT hang (uninterruptible from
+    Python) becomes a flagged timeout instead of freezing the pipeline."""
+    import multiprocessing as mp
+
+    ctx = mp.get_context("spawn")
+    q = ctx.Queue()
+    p = ctx.Process(target=_steps_worker, args=(steps, q))
+    p.start()
+    p.join(timeout)
+    if p.is_alive():
+        p.terminate()
+        p.join()
+        raise TimeoutError(f"execution exceeded {timeout:.0f}s (likely invalid geometry)")
+    tag, val = q.get_nowait()
+    if tag == "err":
+        raise RuntimeError(val)
+    return val
+
+
 # --- ground truth ----------------------------------------------------------------
 @dataclass
 class Geometry:
@@ -148,7 +175,7 @@ def verify(steps: list[dict], ps: PartStudio, api: Onshape | None = None,
     api = api or Onshape()
     truth = fetch_ground_truth(ps, api)
     try:
-        props = run_steps(steps)
-    except Exception as e:  # execution failure is a verification failure
+        props = run_steps_guarded(steps)
+    except Exception as e:  # execution failure/timeout is a verification failure
         return VerifyResult(ok=False, reason=f"execution error: {e}")
     return compare(Geometry.from_mcp_props(props), truth, **tol)
