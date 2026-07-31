@@ -201,7 +201,12 @@ function makeTurntableRow(axis, ref) {
   cb.type = "checkbox"; cb.className = "tcv_check";
   cb.checked = !!ref.current.spin[axis];
   cb.title = `Auto-rotate (turntable) the model around the ${axis.toUpperCase()} axis`;
-  cb.addEventListener("change", () => { ref.current.spin[axis] = cb.checked; });
+  cb.addEventListener("change", () => {
+    ref.current.spin[axis] = cb.checked;
+    // Turning the turntable off drops its accumulated spin, so the axis returns to
+    // the angle set by that axis's Rotate slider.
+    if (!cb.checked) ref.current.spinAccum[axis] = 0;
+  });
   const lab = document.createElement("span");
   lab.className = "tcv_label"; lab.title = cb.title;
   lab.textContent = `Turntable ${axis.toUpperCase()}`;
