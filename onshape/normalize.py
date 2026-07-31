@@ -153,6 +153,63 @@ def _sketch_profiles(sk: dict) -> list[ir.Profile]:
 
 
 # --- feature translation ---------------------------------------------------------
+# --- rollback cap-face -> exact per-extrude profiles ----------------------------
+def _project_2d(p_mm: list[float], matrix: list[float]) -> list[float]:
+    """World point (mm) -> the sketch's local 2D frame (mm), dropping the normal."""
+    ox, oy, oz = matrix[3] * MM, matrix[7] * MM, matrix[11] * MM
+    xd = (matrix[0], matrix[4], matrix[8])
+    yd = (matrix[1], matrix[5], matrix[9])
+    dx, dy, dz = p_mm[0] - ox, p_mm[1] - oy, p_mm[2] - oz
+    return [dx * xd[0] + dy * xd[1] + dz * xd[2], dx * yd[0] + dy * yd[1] + dz * yd[2]]
+
+
+def _edge_to_curve_2d(pts: list[list[float]]) -> ir.Curve:
+    """3 sampled 2D points (param 0/0.5/1) -> line | arc | circle Curve."""
+    p0, pm, p1 = pts[0], pts[1], pts[2]
+    if math.hypot(p0[0] - p1[0], p0[1] - p1[1]) < 1e-4:  # closed edge = full circle
+        center = [(p0[0] + pm[0]) / 2, (p0[1] + pm[1]) / 2]
+        return ir.Curve("circle", {"center": center,
+                                    "radius": math.hypot(p0[0] - pm[0], p0[1] - pm[1]) / 2})
+    area2 = abs((pm[0] - p0[0]) * (p1[1] - p0[1]) - (pm[1] - p0[1]) * (p1[0] - p0[0]))
+    if area2 < 1e-6:  # collinear
+        return ir.Curve("line", {"start": p0, "end": p1})
+    return ir.Curve("arc", {"start": p0, "mid": pm, "end": p1})
+
+
+def _profile_sig(prof: ir.Profile):
+    pts = []
+    for c in prof.curves:
+        for k in ("start", "end", "center", "mid"):
+            if k in c.data:
+                pts.append((round(c.data[k][0], 3), round(c.data[k][1], 3)))
+    return tuple(sorted(pts))
+
+
+def caps_to_profiles(faces: list[dict], matrix: list[float]) -> list[ir.Profile]:
+    """Rollback-resolved cap faces -> exact 2D regions (outer loops + holes),
+    deduplicated across the start/end caps."""
+    ndir = (matrix[2], matrix[6], matrix[10])
+    profiles: list[ir.Profile] = []
+    seen = set()
+    for face in faces:
+        n = face.get("n", [0, 0, 0])
+        if abs(n[0] * ndir[0] + n[1] * ndir[1] + n[2] * ndir[2]) < 0.9:
+            continue  # side wall, not a cap
+        circles, segs = [], []
+        for edge in face.get("edges", []):
+            if len(edge) < 3:
+                continue
+            c = _edge_to_curve_2d([_project_2d(p, matrix) for p in edge])
+            (circles if c.kind == "circle" else segs).append(c)
+        loops = _assemble_loops(segs) if segs else []
+        for prof in [ir.Profile(loop) for loop in loops] + [ir.Profile([c]) for c in circles]:
+            sig = _profile_sig(prof)
+            if sig and sig not in seen:
+                seen.add(sig)
+                profiles.append(prof)
+    return profiles
+
+
 def _sketch_op(feat: dict, sketch: dict | None) -> ir.Sketch:
     m = _msg(feat)
     plane = ir.Plane.from_matrix(sketch.get("sketchMatrix") if sketch else None)
@@ -274,12 +331,13 @@ def _boolean_op(feat: dict):
 
 
 def normalize(features: dict, sketches: dict, url: str = "", targets: dict | None = None,
-              axes: dict | None = None) -> ir.Model:
+              axes: dict | None = None, caps: dict | None = None) -> ir.Model:
     feats = features.get("features", [])
     sk_by_fid = {s["featureId"]: s for s in sketches.get("sketches", [])}
     sketch_ids = set(sk_by_fid)
     targets = targets or {}
     axes = axes or {}
+    caps = caps or {}
     model = ir.Model(source_url=url)
     sketch_ops: dict[str, ir.Sketch] = {}
     use_counts = _extrude_use_counts(feats, sketch_ids)
@@ -298,12 +356,19 @@ def normalize(features: dict, sketches: dict, url: str = "", targets: dict | Non
             continue
         if ftype == "extrude":
             op, why = _extrude_op(f, sketch_ids, last_sketch)
-            if op:  # reject profiles we can't faithfully reproduce whole-sketch
+            if op:
                 sk = sketch_ops.get(op.profile_ref)
-                if sk is None or not sk.profiles:
+                matrix = (sk_by_fid.get(op.profile_ref) or {}).get("sketchMatrix")
+                if fid in caps and matrix:  # exact regions from the extrude's rollback
+                    profs = caps_to_profiles(caps[fid], matrix)
+                    if profs:
+                        op.profiles = profs
+                    else:
+                        op, why = None, "rollback cap resolution produced no profile"
+                elif sk is None or not sk.profiles:
                     op, why = None, "referenced sketch has no reconstructable profile (text/empty)"
                 elif use_counts.get(op.profile_ref, 0) > 1:
-                    op, why = None, "sketch shared by multiple extrudes (region selection needed)"
+                    op, why = None, "sketch shared by multiple extrudes (needs rollback caps)"
         elif ftype in ("fillet", "chamfer"):
             op, why = _round_op(f, ftype, targets)
         elif ftype == "circularPattern":

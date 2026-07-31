@@ -47,6 +47,46 @@ def _unwrap(v):
     return v
 
 
+# Per-extrude created planar faces, with each boundary edge sampled at parameters
+# 0/0.5/1 (3 points classify any line/arc/circle). Evaluated at the extrude's own
+# rollback so its faces are clean and unfragmented by later features.
+_FS_CAPS = """function(context is Context, queries){
+  var out = [];
+  for (var f in evaluateQuery(context, qCreatedBy(makeId("%s"), EntityType.FACE))){
+    var s = evSurfaceDefinition(context, {"face": f});
+    if (!(s is Plane)) { continue; }
+    var edges = [];
+    for (var e in evaluateQuery(context, qAdjacent(f, AdjacencyType.EDGE, EntityType.EDGE))){
+      var tl = evEdgeTangentLines(context, {"edge": e, "parameters": [0, 0.5, 1]});
+      var pts = [];
+      for (var t in tl){ pts = append(pts, [t.origin[0]/millimeter, t.origin[1]/millimeter, t.origin[2]/millimeter]); }
+      edges = append(edges, pts);
+    }
+    out = append(out, {"n": [s.normal[0], s.normal[1], s.normal[2]], "edges": edges});
+  }
+  return out;
+}"""
+
+
+def resolve_extrude_caps(api: Onshape, ps: PartStudio, extrudes: list[tuple]) -> dict:
+    """{featureId: [{"n": [x,y,z], "edges": [[p0,pmid,p1] mm, ...]}, ...]}.
+
+    `extrudes` is a list of (featureId, rollback_index) — the index just AFTER the
+    extrude, so its created faces exist and aren't yet fragmented. Best-effort:
+    missing/failed entries are simply absent (the extrude then falls back)."""
+    out: dict = {}
+    for fid, rb in extrudes:
+        try:
+            res = api.call(f"{ps.path}/featurescript?rollbackBarIndex={rb}",
+                           {"script": _FS_CAPS % fid, "queries": {}})
+            faces = _unwrap(res.get("result")) or []
+            if faces:
+                out[fid] = faces
+        except Exception:  # noqa: BLE001
+            continue
+    return out
+
+
 def resolve_created_faces(api: Onshape, ps: PartStudio, feature_ids: list[str]) -> dict:
     """{featureId: [{"at": [x,y,z] mm, "r": mm}, ...]} for the given features.
 

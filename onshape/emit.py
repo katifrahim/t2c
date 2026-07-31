@@ -64,7 +64,8 @@ _BOOL = {"add": "union", "cut": "cut", "intersect": "intersect"}
 
 
 def _emit_extrude(sketch: ir.Sketch, ex: ir.Extrude, store_as: str) -> dict:
-    ops = _profile_ops(sketch.profiles)
+    # Prefer the extrude's own rollback-resolved regions; fall back to the sketch.
+    ops = _profile_ops(ex.profiles if ex.profiles is not None else sketch.profiles)
     ex_op = {"method": "extrude", "params": {"until": ex.distance, "combine": False,
                                              "both": ex.symmetric}}
     if ex.taper is not None:

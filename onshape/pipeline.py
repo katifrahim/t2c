@@ -14,7 +14,7 @@ import sys
 from onshape.classify import classify
 from onshape.client import Onshape, parse_url
 from onshape.emit import emit_model
-from onshape.extract import resolve_created_faces
+from onshape.extract import resolve_created_faces, resolve_extrude_caps
 from onshape.normalize import _msg, normalize
 from onshape.verify import fetch_ground_truth, run_steps, compare, Geometry
 
@@ -31,11 +31,16 @@ def run(url: str, api: Onshape | None = None) -> dict:
 
     features = api.features(ps)
     sketches = api.sketches(ps)
+    flist = features.get("features", [])
     # Resolve modifier features' target edges to 3D points (one FeatureScript call).
-    mod_ids = [_msg(f)["featureId"] for f in features.get("features", [])
+    mod_ids = [_msg(f)["featureId"] for f in flist
                if _msg(f).get("featureType") in _MODIFIERS and not _msg(f).get("suppressed")]
     targets = resolve_created_faces(api, ps, mod_ids)
-    model = normalize(features, sketches, url=url, targets=targets)
+    # Resolve each extrude's exact regions from its own rollback checkpoint (i+1).
+    extrudes = [(_msg(f)["featureId"], i + 1) for i, f in enumerate(flist)
+                if _msg(f).get("featureType") == "extrude" and not _msg(f).get("suppressed")]
+    caps = resolve_extrude_caps(api, ps, extrudes)
+    model = normalize(features, sketches, url=url, targets=targets, caps=caps)
     steps = emit_model(model)
 
     out: dict = {

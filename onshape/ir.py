@@ -81,11 +81,14 @@ class Sketch(Op):
 
 @dataclass
 class Extrude(Op):
-    profile_ref: str = ""            # which sketch this extrudes
+    profile_ref: str = ""            # which sketch this extrudes (for its plane)
     distance: float = 0.0            # mm; signed for direction
     symmetric: bool = False
     op: str = "new"                  # new | add | cut | intersect
     taper: float | None = None
+    # Exact regions this extrude consumes, resolved from its rollback cap faces.
+    # When set, emission draws these instead of the whole sketch (solves multi-region).
+    profiles: list[Profile] | None = None
     kind: str = "extrude"
 
 
