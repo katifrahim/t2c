@@ -141,14 +141,27 @@ function setTurntable(ref, on) {
   ref.current.turntable = on;
   if (on && !ref.current.spinRaf) {
     const spin = () => {
-      const g = ref.current.viewer?.rendered?.nestedGroup?.rootGroup;
-      if (g) { g.rotation.z += 0.008; try { ref.current.viewer.update(true, false); } catch {} }
+      const v = ref.current.viewer;
+      const g = v?.rendered?.nestedGroup?.rootGroup;
+      if (g) {
+        // Studio-only: rotate only while the Studio tab is active (same signal
+        // that gates PBR/env). Outside it, keep the model in its upright pose.
+        if (v._studioManager?.isActive) {
+          g.rotation.z += 0.008;
+          try { v.update(true, false); } catch {}
+        } else if (g.rotation.z !== 0) {
+          g.rotation.z = 0;
+          try { v.update(true, false); } catch {}
+        }
+      }
       ref.current.spinRaf = requestAnimationFrame(spin);
     };
     ref.current.spinRaf = requestAnimationFrame(spin);
   } else if (!on && ref.current.spinRaf) {
     cancelAnimationFrame(ref.current.spinRaf);
     ref.current.spinRaf = 0;
+    const g = ref.current.viewer?.rendered?.nestedGroup?.rootGroup;
+    if (g && g.rotation.z !== 0) { g.rotation.z = 0; try { ref.current.viewer.update(true, false); } catch {} }
   }
 }
 
