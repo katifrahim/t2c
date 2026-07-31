@@ -71,9 +71,14 @@ ADD-tab → pattern1 ×3 → cut all 3 → pattern2 → union 5 → fillet → c
 boolean **hangs in OCCT**. Hypothesis: patterning the **centered annulus** creates
 coincident ring copies that CadQuery/OCCT can't union cleanly. Direction: detect
 symmetric/coincident pattern copies (union with `glue`, or skip coincident copies), and
-make booleans/fillets resilient (`clean`/tolerance, per-edge fallback). Debug offline —
-all washer data is cached, so `emit_model` can be iterated with no API calls; use
+make booleans/fillets resilient (`clean`/tolerance, per-edge fallback). Iterate with
 `verify.run_steps_guarded(steps[:k])` to find the hanging step.
+
+Prereq to iterate offline: run the pipeline **once** so every rollback `/featurescript`
+call is cached — until 2026-08-01 these were silently NOT cached (the cache key check
+ignored the `?rollbackBarIndex=N` query string, now fixed in `client.py`), so each debug
+run re-hit the API and could exhaust the ~daily quota. The washer's rollback data still
+needs one clean fetch (key was rate-limited, `Retry-After` ~21h, when this was found).
 
 ## Notes / gotchas
 

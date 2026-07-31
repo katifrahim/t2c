@@ -107,7 +107,10 @@ class Onshape:
         # Cache GETs, and POSTs to /featurescript (pure geometry queries, keyed by
         # script+payload) so reconstruction can be iterated offline after one call.
         cache_path = None
-        cacheable = verb == "GET" or (verb == "POST" and path.endswith("/featurescript"))
+        # Rollback evaluations POST to /featurescript?rollbackBarIndex=N; strip the
+        # query string so those (the priciest, most-repeated) calls are cached too.
+        base_path = path.split("?", 1)[0]
+        cacheable = verb == "GET" or (verb == "POST" and base_path.endswith("/featurescript"))
         if self.cache and cacheable:
             keysrc = self.base + path + (data.decode() if data else "")
             key = hashlib.sha256(keysrc.encode()).hexdigest()[:32]
