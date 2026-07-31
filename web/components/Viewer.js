@@ -194,9 +194,11 @@ function makeRotationSliderRow(axis, ref) {
 }
 
 // A native-styled Studio checkbox row that auto-rotates (turntable) one axis.
+// Uses the same classes as the "Use 4K maps" row so it sits right-aligned under
+// the control column, directly below its axis's Rotate slider.
 function makeTurntableRow(axis, ref) {
   const row = document.createElement("div");
-  row.className = "tcv_studio_checks t2c_spin_row";
+  row.className = "tcv_studio_checks tcv_studio_4k_row t2c_spin_row";
   const cb = document.createElement("input");
   cb.type = "checkbox"; cb.className = "tcv_check";
   cb.checked = !!ref.current.spin[axis];
@@ -270,8 +272,11 @@ function augmentStudioPanel(container, ref, viewer) {
       const spacer = document.createElement("div");
       spacer.className = "tcv_studio_group_spacer";
       panel.appendChild(spacer);
-      for (const axis of ["x", "y", "z"]) panel.appendChild(makeRotationSliderRow(axis, ref));
-      for (const axis of ["x", "y", "z"]) panel.appendChild(makeTurntableRow(axis, ref));
+      // Each axis: its Rotate slider, then its Turntable toggle directly below it.
+      for (const axis of ["x", "y", "z"]) {
+        panel.appendChild(makeRotationSliderRow(axis, ref));
+        panel.appendChild(makeTurntableRow(axis, ref));
+      }
     }
   } catch { /* studio panel not present yet — ignore */ }
 }
