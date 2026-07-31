@@ -141,16 +141,19 @@ const EXTRA_ENVIRONMENTS = [
 // A single RAF sets rootGroup.rotation = rot + spinAccum each frame, advancing the
 // accumulator for active turntables, and resets the model upright outside Studio.
 // Reads the live viewer from ref so it survives model updates.
+// Turntable speed (radians/frame). The "Rotation Speed" slider (1–100) scales it;
+// SPIN_SPEED is the default at slider value 20.
 const SPIN_SPEED = 0.008;
+const SPEED_UNIT = SPIN_SPEED / 20;
 function rotationTick(ref) {
   const v = ref.current.viewer;
   const g = v?.rendered?.nestedGroup?.rootGroup;
   if (g) {
     if (v._studioManager?.isActive) {
-      const { rot, spin, spinAccum } = ref.current;
-      if (spin.x) spinAccum.x += SPIN_SPEED;
-      if (spin.y) spinAccum.y += SPIN_SPEED;
-      if (spin.z) spinAccum.z += SPIN_SPEED;
+      const { rot, spin, spinAccum, spinSpeed } = ref.current;
+      if (spin.x) spinAccum.x += spinSpeed;
+      if (spin.y) spinAccum.y += spinSpeed;
+      if (spin.z) spinAccum.z += spinSpeed;
       const tx = rot.x + spinAccum.x, ty = rot.y + spinAccum.y, tz = rot.z + spinAccum.z;
       if (g.rotation.x !== tx || g.rotation.y !== ty || g.rotation.z !== tz) {
         g.rotation.set(tx, ty, tz);
@@ -216,6 +219,35 @@ function makeTurntableRow(axis, ref) {
   return row;
 }
 
+// A native-styled Studio slider (1–100) for the turntable rotation speed.
+function makeSpeedSliderRow(ref) {
+  const row = document.createElement("div");
+  row.className = "tcv_studio_row t2c_speed_row";
+  const lab = document.createElement("span");
+  lab.className = "tcv_label";
+  lab.title = "Turntable rotation speed";
+  lab.textContent = "Rotation Speed";
+  const group = document.createElement("div");
+  group.className = "tcv_studio_slider_group";
+  const range = document.createElement("input");
+  range.type = "range"; range.min = "1"; range.max = "100"; range.step = "1";
+  range.className = "tcv_clip_slider";
+  const num = document.createElement("input");
+  num.className = "tcv_clip_input";
+  const initVal = Math.max(1, Math.min(100, Math.round(ref.current.spinSpeed / SPEED_UNIT)));
+  range.value = String(initVal); num.value = String(initVal);
+  const apply = (val) => {
+    const v = Math.max(1, Math.min(100, Math.round(Number(val) || 1)));
+    range.value = String(v); num.value = String(v);
+    ref.current.spinSpeed = v * SPEED_UNIT;
+  };
+  range.addEventListener("input", () => apply(range.value));
+  num.addEventListener("input", () => apply(num.value));
+  group.appendChild(range); group.appendChild(num);
+  row.appendChild(lab); row.appendChild(group);
+  return row;
+}
+
 // Register our EXTRA_ENVIRONMENTS with the viewer's EnvironmentManager as
 // resolution-aware presets, so the built-in "Use 4K maps" checkbox works for them
 // exactly like the built-in HDRIs. Without this our envs are fixed 2K URLs the
@@ -277,6 +309,7 @@ function augmentStudioPanel(container, ref, viewer) {
         panel.appendChild(makeRotationSliderRow(axis, ref));
         panel.appendChild(makeTurntableRow(axis, ref));
       }
+      panel.appendChild(makeSpeedSliderRow(ref));  // turntable rotation speed
     }
   } catch { /* studio panel not present yet — ignore */ }
 }
@@ -286,7 +319,7 @@ export default function Viewer() {
   const ref = useRef({
     TCV: null, viewer: null, lastVersion: -1, payload: null,
     rot: { x: 0, y: 0, z: 0 }, spin: { x: false, y: false, z: false },
-    spinAccum: { x: 0, y: 0, z: 0 }, rotRaf: 0,
+    spinAccum: { x: 0, y: 0, z: 0 }, spinSpeed: SPIN_SPEED, rotRaf: 0,
   });
   const sessionId = useSessionStore((s) => s.sessionId);
   const sidRef = useRef(sessionId);
