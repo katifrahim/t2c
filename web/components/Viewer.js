@@ -134,35 +134,79 @@ const EXTRA_ENVIRONMENTS = [
   { label: "Clear Night", slug: "rogland_clear_night" }
 ];
 
-// Turntable: spin the model group around its vertical (Z) axis each frame — the
-// "product-demo" rotation. Reads the live viewer/model from ref so it survives
-// model updates; idempotent start/stop.
-function setTurntable(ref, on) {
-  ref.current.turntable = on;
-  if (on && !ref.current.spinRaf) {
-    const spin = () => {
-      const v = ref.current.viewer;
-      const g = v?.rendered?.nestedGroup?.rootGroup;
-      if (g) {
-        // Studio-only: rotate only while the Studio tab is active (same signal
-        // that gates PBR/env). Outside it, keep the model in its upright pose.
-        if (v._studioManager?.isActive) {
-          g.rotation.z += 0.008;
-          try { v.update(true, false); } catch {}
-        } else if (g.rotation.z !== 0) {
-          g.rotation.z = 0;
-          try { v.update(true, false); } catch {}
-        }
+// Model rotation, applied ONLY while the Studio tab is active (like PBR/env).
+//   ref.current.rot       — per-axis manual angle from the sliders (radians)
+//   ref.current.spin      — per-axis turntable on/off
+//   ref.current.spinAccum — per-axis accumulated turntable angle (radians)
+// A single RAF sets rootGroup.rotation = rot + spinAccum each frame, advancing the
+// accumulator for active turntables, and resets the model upright outside Studio.
+// Reads the live viewer from ref so it survives model updates.
+const SPIN_SPEED = 0.008;
+function rotationTick(ref) {
+  const v = ref.current.viewer;
+  const g = v?.rendered?.nestedGroup?.rootGroup;
+  if (g) {
+    if (v._studioManager?.isActive) {
+      const { rot, spin, spinAccum } = ref.current;
+      if (spin.x) spinAccum.x += SPIN_SPEED;
+      if (spin.y) spinAccum.y += SPIN_SPEED;
+      if (spin.z) spinAccum.z += SPIN_SPEED;
+      const tx = rot.x + spinAccum.x, ty = rot.y + spinAccum.y, tz = rot.z + spinAccum.z;
+      if (g.rotation.x !== tx || g.rotation.y !== ty || g.rotation.z !== tz) {
+        g.rotation.set(tx, ty, tz);
+        try { v.update(true, false); } catch {}
       }
-      ref.current.spinRaf = requestAnimationFrame(spin);
-    };
-    ref.current.spinRaf = requestAnimationFrame(spin);
-  } else if (!on && ref.current.spinRaf) {
-    cancelAnimationFrame(ref.current.spinRaf);
-    ref.current.spinRaf = 0;
-    const g = ref.current.viewer?.rendered?.nestedGroup?.rootGroup;
-    if (g && g.rotation.z !== 0) { g.rotation.z = 0; try { ref.current.viewer.update(true, false); } catch {} }
+    } else if (g.rotation.x || g.rotation.y || g.rotation.z) {
+      g.rotation.set(0, 0, 0);
+      try { v.update(true, false); } catch {}
+    }
   }
+  ref.current.rotRaf = requestAnimationFrame(() => rotationTick(ref));
+}
+
+// A native-styled Studio slider row (0–360°) that manually rotates one axis.
+function makeRotationSliderRow(axis, ref) {
+  const row = document.createElement("div");
+  row.className = "tcv_studio_row t2c_rot_row";
+  const lab = document.createElement("span");
+  lab.className = "tcv_label";
+  lab.title = `Manually rotate the model around the ${axis.toUpperCase()} axis (degrees)`;
+  lab.textContent = `Rotate ${axis.toUpperCase()}`;
+  const group = document.createElement("div");
+  group.className = "tcv_studio_slider_group";
+  const range = document.createElement("input");
+  range.type = "range"; range.min = "0"; range.max = "360"; range.step = "1";
+  range.className = "tcv_clip_slider";
+  const num = document.createElement("input");
+  num.className = "tcv_clip_input";
+  const initDeg = Math.round((ref.current.rot[axis] * 180) / Math.PI) % 360;
+  range.value = String(initDeg); num.value = String(initDeg);
+  const apply = (val) => {
+    const d = Math.max(0, Math.min(360, Math.round(Number(val) || 0)));
+    range.value = String(d); num.value = String(d);
+    ref.current.rot[axis] = (d * Math.PI) / 180;
+  };
+  range.addEventListener("input", () => apply(range.value));
+  num.addEventListener("input", () => apply(num.value));
+  group.appendChild(range); group.appendChild(num);
+  row.appendChild(lab); row.appendChild(group);
+  return row;
+}
+
+// A native-styled Studio checkbox row that auto-rotates (turntable) one axis.
+function makeTurntableRow(axis, ref) {
+  const row = document.createElement("div");
+  row.className = "tcv_studio_checks t2c_spin_row";
+  const cb = document.createElement("input");
+  cb.type = "checkbox"; cb.className = "tcv_check";
+  cb.checked = !!ref.current.spin[axis];
+  cb.title = `Auto-rotate (turntable) the model around the ${axis.toUpperCase()} axis`;
+  cb.addEventListener("change", () => { ref.current.spin[axis] = cb.checked; });
+  const lab = document.createElement("span");
+  lab.className = "tcv_label"; lab.title = cb.title;
+  lab.textContent = `Turntable ${axis.toUpperCase()}`;
+  row.appendChild(cb); row.appendChild(lab);
+  return row;
 }
 
 // Register our EXTRA_ENVIRONMENTS with the viewer's EnvironmentManager as
@@ -217,29 +261,23 @@ function augmentStudioPanel(container, ref, viewer) {
       sel.appendChild(og);
     }
     const panel = container.querySelector(".tcv_cad_studio_container");
-    if (panel && !panel.querySelector(".t2c_turntable_row")) {
-      const row = document.createElement("div");
-      row.className = "tcv_studio_checks t2c_turntable_row";
-      const input = document.createElement("input");
-      input.type = "checkbox";
-      input.className = "tcv_check";
-      input.title = "Auto-rotate the model (turntable)";
-      input.checked = !!ref.current.turntable;
-      input.addEventListener("change", () => setTurntable(ref, input.checked));
-      const label = document.createElement("span");
-      label.className = "tcv_label";
-      label.title = input.title;
-      label.textContent = "Turntable";
-      row.appendChild(input);
-      row.appendChild(label);
-      panel.appendChild(row);
+    if (panel && !panel.querySelector(".t2c_rot_row")) {
+      const spacer = document.createElement("div");
+      spacer.className = "tcv_studio_group_spacer";
+      panel.appendChild(spacer);
+      for (const axis of ["x", "y", "z"]) panel.appendChild(makeRotationSliderRow(axis, ref));
+      for (const axis of ["x", "y", "z"]) panel.appendChild(makeTurntableRow(axis, ref));
     }
   } catch { /* studio panel not present yet — ignore */ }
 }
 
 export default function Viewer() {
   const containerRef = useRef(null);
-  const ref = useRef({ TCV: null, viewer: null, lastVersion: -1, payload: null, turntable: false, spinRaf: 0 });
+  const ref = useRef({
+    TCV: null, viewer: null, lastVersion: -1, payload: null,
+    rot: { x: 0, y: 0, z: 0 }, spin: { x: false, y: false, z: false },
+    spinAccum: { x: 0, y: 0, z: 0 }, rotRaf: 0,
+  });
   const sessionId = useSessionStore((s) => s.sessionId);
   const sidRef = useRef(sessionId);
   // Blank white until the backend/MCP server delivers the first model; show a
@@ -532,6 +570,9 @@ export default function Viewer() {
       timer = setInterval(poll, 1000);
     })();
 
+    // Single persistent loop that applies the Studio rotation (sliders + turntables).
+    rotationTick(ref);
+
     // Re-fit the canvas to the container on window resize AND slider drags,
     // preserving the camera/model (mirrors ocp_vscode's viewer.html — re-render
     // is avoided so the user's view isn't reset).
@@ -573,7 +614,7 @@ export default function Viewer() {
       cancelled = true;
       if (timer) clearInterval(timer);
       if (rafId) cancelAnimationFrame(rafId);
-      setTurntable(ref, false); // stop the turntable spin loop
+      if (ref.current.rotRaf) cancelAnimationFrame(ref.current.rotRaf); // stop the rotation loop
       ro.disconnect();
       if (ref.current.viewer) { try { ref.current.viewer.dispose(); } catch {} }
     };
