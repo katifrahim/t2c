@@ -210,6 +210,24 @@ def caps_to_profiles(faces: list[dict], matrix: list[float]) -> list[ir.Profile]
     return profiles
 
 
+def _cap_distance(faces: list[dict], matrix: list[float]) -> float | None:
+    """Signed extrude distance = the normal-offset of the far cap from the sketch
+    plane. Geometric, so it handles up-to-* terminations and variable expressions."""
+    ndir = (matrix[2], matrix[6], matrix[10])
+    ox, oy, oz = matrix[3] * MM, matrix[7] * MM, matrix[11] * MM
+    offs = []
+    for face in faces:
+        n = face.get("n", [0, 0, 0])
+        if abs(n[0] * ndir[0] + n[1] * ndir[1] + n[2] * ndir[2]) < 0.9:
+            continue
+        for edge in face.get("edges", []):
+            if edge:
+                p = edge[0]
+                offs.append((p[0] - ox) * ndir[0] + (p[1] - oy) * ndir[1] + (p[2] - oz) * ndir[2])
+                break
+    return max(offs, key=abs) if offs else None
+
+
 def _sketch_op(feat: dict, sketch: dict | None) -> ir.Sketch:
     m = _msg(feat)
     plane = ir.Plane.from_matrix(sketch.get("sketchMatrix") if sketch else None)
@@ -221,14 +239,13 @@ def _sketch_op(feat: dict, sketch: dict | None) -> ir.Sketch:
 def _extrude_op(feat: dict, sketch_ids: set[str], last_sketch: str | None):
     m = _msg(feat)
     P = _params(feat)
-    end_bound = _enum(P.get("endBound"))
-    if end_bound not in ("BLIND", None):  # SYMMETRIC handled via `symmetric` flag
-        return None, f"endBound={end_bound}"
-    depth = parse_length_mm((P.get("depth") or {}).get("expression"))
-    if depth is None:
-        return None, "unresolved depth expression"
-    if _bool(P.get("oppositeDirection")):
-        depth = -depth
+    # Depth: for BLIND, parse the expression; otherwise (up-to-*), leave None and
+    # let the rollback cap-offset supply it (handled in normalize()).
+    depth = None
+    if _enum(P.get("endBound")) in ("BLIND", None):
+        depth = parse_length_mm((P.get("depth") or {}).get("expression"))
+        if depth is not None and _bool(P.get("oppositeDirection")):
+            depth = -depth
     # link to the sketch it consumes
     ref = None
     for q in (P.get("entities") or {}).get("queries", []):
@@ -359,12 +376,16 @@ def normalize(features: dict, sketches: dict, url: str = "", targets: dict | Non
             if op:
                 sk = sketch_ops.get(op.profile_ref)
                 matrix = (sk_by_fid.get(op.profile_ref) or {}).get("sketchMatrix")
-                if fid in caps and matrix:  # exact regions from the extrude's rollback
+                if fid in caps and matrix:  # exact regions + distance from rollback
                     profs = caps_to_profiles(caps[fid], matrix)
-                    if profs:
+                    dist = _cap_distance(caps[fid], matrix)
+                    if profs and dist is not None:
                         op.profiles = profs
+                        op.distance = dist  # geometric: also resolves up-to terminations
                     else:
-                        op, why = None, "rollback cap resolution produced no profile"
+                        op, why = None, "rollback cap resolution produced no profile/distance"
+                elif op.distance is None:
+                    op, why = None, "unresolved depth (up-to termination, no caps)"
                 elif sk is None or not sk.profiles:
                     op, why = None, "referenced sketch has no reconstructable profile (text/empty)"
                 elif use_counts.get(op.profile_ref, 0) > 1:
