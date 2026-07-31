@@ -11,21 +11,33 @@ from __future__ import annotations
 
 from onshape.client import Onshape, PartStudio
 
-# Created-face centroids + radius per feature id, all in millimetres, computed
-# server-side. `%s` is filled with a FeatureScript array literal of feature ids.
+# One representative point PER created face, plus radius, in millimetres. The point
+# is the midpoint of the face's LONGEST boundary edge -- a tangent line for a
+# straight-edge fillet/chamfer, a boundary circle for a circular one -- so it always
+# lies near the real edge and never on the axis (evApproximateCentroid gives the axis
+# center for surfaces of revolution, which mis-selects circular edges). `%s` is a
+# FeatureScript array literal of feature ids.
 _FS_CREATED = """function(context is Context, queries){
   var res = {};
   var ids = %s;
   for (var fid in ids){
     var faces = [];
     for (var f in evaluateQuery(context, qCreatedBy(makeId(fid), EntityType.FACE))){
-      var c = evApproximateCentroid(context, {"entities": f});
       var s = evSurfaceDefinition(context, {"face": f});
       var r = 0 * meter;
       if (s is Cylinder) { r = s.radius; }
       else if (s is Torus) { r = s.minorRadius; }
-      faces = append(faces, { "at": [c[0]/millimeter, c[1]/millimeter, c[2]/millimeter],
-                              "r": r/millimeter });
+      var best = undefined;
+      var bestLen = -1 * meter;
+      for (var e in evaluateQuery(context, qAdjacent(f, AdjacencyType.EDGE, EntityType.EDGE))){
+        var L = evLength(context, {"entities": e});
+        if (L > bestLen){
+          bestLen = L;
+          var tl = evEdgeTangentLines(context, {"edge": e, "parameters": [0.5]});
+          best = [tl[0].origin[0]/millimeter, tl[0].origin[1]/millimeter, tl[0].origin[2]/millimeter];
+        }
+      }
+      if (best != undefined){ faces = append(faces, { "at": best, "r": r/millimeter }); }
     }
     res[fid] = faces;
   }

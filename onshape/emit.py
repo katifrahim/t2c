@@ -84,9 +84,15 @@ def _emit_revolve(sketch: ir.Sketch, rev: ir.Revolve, store_as: str) -> dict:
 
 
 def _point_selector(points: list[list[float]]) -> dict:
-    """One 3D point -> NearestToPointSelector; several -> SumSelector tree."""
-    sel = {"_type": "NearestToPointSelector", "pnt": points[0]}
-    for p in points[1:]:
+    """One 3D point -> NearestToPointSelector; several -> SumSelector tree.
+    Near-duplicate points are collapsed (they'd make a degenerate selector)."""
+    uniq: list[list[float]] = []
+    for p in points:
+        if not any(abs(p[0] - q[0]) < 1e-4 and abs(p[1] - q[1]) < 1e-4
+                   and abs(p[2] - q[2]) < 1e-4 for q in uniq):
+            uniq.append(p)
+    sel = {"_type": "NearestToPointSelector", "pnt": uniq[0]}
+    for p in uniq[1:]:
         sel = {"_type": "SumSelector", "left": sel,
                "right": {"_type": "NearestToPointSelector", "pnt": p}}
     return sel
