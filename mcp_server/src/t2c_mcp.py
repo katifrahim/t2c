@@ -54,11 +54,13 @@ try:
     import ocp_vscode.backend as _ocp_backend_mod
     _ocp_backend_mod.is_jupyter_cadquery = True
     from ocp_vscode.comms import MessageType as _MessageType, default as _ocp_default
+    from ocp_vscode.measure import get_properties as _get_properties
     MEASURE_AVAILABLE = True
 except Exception:
     _ocp_backend_mod = None
     _MessageType = None
     _ocp_default = None
+    _get_properties = None
     MEASURE_AVAILABLE = False
 
 
@@ -745,6 +747,138 @@ def _show_push(obj: Any) -> None:
             show(target, port=VIEWER_PORT)
     except Exception:
         pass
+
+
+# =============================================================================
+# PICKED-FEATURE REFERENCES  (viewer "select" tool → prompt injection)
+# =============================================================================
+# When the user clicks features in the 3D viewer, the frontend posts the picked
+# shape-id paths to /selection. Each path already resolves to a real OCCT
+# sub-shape via the session's measurement backend (mb.model). We turn each into a
+# neutral, human-readable geometric description the LLM can map to a selection.
+
+def _part_name(shape_id: str) -> str:
+    """The part a picked feature belongs to: the path segment before the topology
+    suffix (/faces/faces_N, /edges/edges_N, /vertices/vertices_N), or the last
+    segment for a whole-solid pick."""
+    base = re.split(r"/(?:faces|edges|vertices)/", shape_id)[0]
+    segs = [s for s in base.split("/") if s]
+    return segs[-1] if segs else shape_id
+
+
+def _fmt(x: float) -> str:
+    v = round(float(x), 3) + 0.0
+    if v == 0:
+        v = 0.0  # avoid "-0"
+    return f"{v:g}"
+
+
+def _pt(p) -> str:
+    return "(" + ", ".join(_fmt(v) for v in p) + ")"
+
+
+def _face_normal(shape):
+    """Outward-ish surface normal at the face's UV midpoint, as a unit tuple."""
+    from OCP.BRepTools import BRepTools
+    from OCP.BRepGProp import BRepGProp_Face
+    from OCP.gp import gp_Pnt, gp_Vec, gp_Dir
+    u0, u1, v0, v1 = BRepTools.UVBounds_s(shape)
+    pnt, normal = gp_Pnt(), gp_Vec()
+    BRepGProp_Face(shape).Normal((u0 + u1) / 2, (v0 + v1) / 2, pnt, normal)
+    if normal.Magnitude() < 1e-10:
+        return None
+    d = gp_Dir(normal)
+    return (d.X(), d.Y(), d.Z())
+
+
+def _line_direction(shape):
+    """Unit direction of a straight edge, or None."""
+    from OCP.BRepAdaptor import BRepAdaptor_Curve
+    from OCP.gp import gp_Pnt, gp_Vec, gp_Dir
+    curve = BRepAdaptor_Curve(shape)
+    pnt, vec = gp_Pnt(), gp_Vec()
+    curve.D1(curve.FirstParameter(), pnt, vec)
+    if vec.Magnitude() < 1e-10:
+        return None
+    d = gp_Dir(vec)
+    return (d.X(), d.Y(), d.Z())
+
+
+def _describe_feature(shape_id: str, props: dict, idx: int, shape=None) -> dict:
+    """Build {id,label,text} for one picked feature from get_properties output.
+    `text` is a neutral one-liner (safe to show the user); `label` is a short chip."""
+    st = props.get("shape_type", "Shape")     # Vertex/Edge/Face/Solid/Compound
+    gt = props.get("geom_type", "")            # Plane/Cylinder/Line/Circle/...
+    part = _part_name(shape_id)
+    flat = {}
+    for sec in props.get("result", []) or []:
+        if isinstance(sec, dict):
+            flat.update(sec)
+
+    # The centroid CadQuery's own nearest-to-point selector compares against —
+    # the authoritative datum for the LLM to re-resolve this exact entity.
+    center = None
+    if shape is not None:
+        try:
+            c = cq.Shape.cast(shape).Center()
+            center = (c.x, c.y, c.z)
+        except Exception:
+            center = None
+
+    attrs = [f'on part "{part}"']
+    if st == "Vertex":
+        pt = center or flat.get("xyz") or props.get("refpoint")
+        if pt is not None:
+            attrs.append(f"at {_pt(pt)}")
+        label = "Vertex"
+    elif st == "Edge":
+        if center is not None:
+            attrs.append(f"center {_pt(center)}")
+        for k in ("radius", "major radius", "minor radius"):
+            if k in flat:
+                attrs.append(f"{k} {_fmt(flat[k])}")
+        if "start" in flat and "end" in flat:
+            attrs.append(f"from {_pt(flat['start'])} to {_pt(flat['end'])}")
+        if "length" in flat:
+            attrs.append(f"length {_fmt(flat['length'])}")
+        if shape is not None and gt == "Line":
+            try:
+                d = _line_direction(shape)
+                if d:
+                    attrs.append(f"direction {_pt(d)}")
+            except Exception:
+                pass
+        label = f"{gt} edge" if gt else "Edge"
+    elif st == "Face":
+        if center is not None:
+            attrs.append(f"center {_pt(center)}")
+        for k in ("radius", "base radius", "minor radius", "major radius"):
+            if k in flat:
+                attrs.append(f"{k} {_fmt(flat[k])}")
+        if shape is not None:
+            try:
+                n = _face_normal(shape)
+                if n:
+                    attrs.append(f"normal {_pt(n)}")
+            except Exception:
+                pass
+        if "area" in flat:
+            attrs.append(f"area {_fmt(flat['area'])}")
+        label = f"{gt} face" if gt else "Face"
+    else:  # Solid / CompSolid / Compound
+        if center is not None:
+            attrs.append(f"center {_pt(center)}")
+        if "volume" in flat:
+            attrs.append(f"volume {_fmt(flat['volume'])}")
+        label = st
+
+    bb = flat.get("bb")
+    if isinstance(bb, dict) and "min" in bb and "max" in bb:
+        attrs.append(f"bbox {_pt(bb['min'])}–{_pt(bb['max'])}")
+
+    kind = (f"{gt} " if gt and gt not in ("Point", "Other") else "") + st.lower()
+    text = f"{idx}. {kind}: " + ", ".join(attrs)
+    return {"id": shape_id, "label": f"{label} #{idx}", "text": text}
 
 
 def _show_tessellate(obj: Any) -> None:
@@ -2847,6 +2981,32 @@ async def _backend(request):
         _log_err(str(e), traceback.format_exc())
         return JSONResponse({"error": _scrub(str(e))}, status_code=500)
     return JSONResponse(resp or {})
+
+
+@mcp.custom_route("/selection", methods=["POST"])
+async def _selection(request):
+    """Viewer 'select' tool: the frontend posts the picked shape-id paths
+    ({"shapeIds": [...]}); we resolve each to its OCCT sub-shape and return a
+    neutral geometric description the prompt is prefixed with. ?session=<id>."""
+    from starlette.responses import JSONResponse
+    mb = _get_session(request.query_params.get("session")).measure_backend
+    if mb is None or not getattr(mb, "model", None) or _get_properties is None:
+        return JSONResponse({"features": []})
+    try:
+        ids = (await request.json()).get("shapeIds", []) or []
+    except Exception:
+        ids = []
+    features = []
+    for sid in ids:
+        shape = mb.model.get(sid)
+        if shape is None:
+            continue
+        try:
+            props = _get_properties(shape)
+            features.append(_describe_feature(sid, props, len(features) + 1, shape))
+        except Exception as e:
+            _log_err(str(e), traceback.format_exc())
+    return JSONResponse({"features": features})
 
 
 # =============================================================================
