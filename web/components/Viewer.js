@@ -579,7 +579,9 @@ export default function Viewer() {
       } catch { /* ignore */ }
 
       // Repurposed button: it now drives geometry selection for prompt references,
-      // not clipboard. Rename its tooltip (data-*-tooltip attrs) to match.
+      // not clipboard. Rename its tooltip (data-*-tooltip attrs) to match, then
+      // re-run updateTooltips so the button's keyboard-shortcut suffix (Shift+S →
+      // "› S") is re-appended onto the new base label like every other tool.
       try {
         container
           .querySelectorAll('[data-base-tooltip="Copy shape IDs to clipboard"]')
@@ -587,6 +589,7 @@ export default function Viewer() {
             el.setAttribute("data-tooltip", "Select geometry");
             el.setAttribute("data-base-tooltip", "Select geometry");
           });
+        display.updateTooltips();
       } catch { /* ignore */ }
 
       // Mobile: start with the Tools panel collapsed to declutter the small screen.
