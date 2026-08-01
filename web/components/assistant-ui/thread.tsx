@@ -47,6 +47,7 @@ import {
   SuggestionPrimitive,
   ThreadPrimitive,
   type ToolCallMessagePartComponent,
+  useAui,
   useAuiState,
 } from "@assistant-ui/react";
 import {
@@ -78,6 +79,7 @@ import {
   type PropsWithChildren,
 } from "react";
 import { useCreditStore } from "@/lib/credit-store";
+import { useSelectionStore } from "@/lib/selection-store";
 
 export type ThreadGroupPart = MessagePrimitive.GroupedParts.GroupPart;
 
@@ -362,10 +364,59 @@ const ComposerInput: FC = () => {
   );
 };
 
-const Composer: FC = () => {
+// Header for the reference block prefixed onto a prompt when the user has picked
+// geometry in the viewer. The system prompt teaches the AI to read this block.
+const SELECTION_BLOCK_HEADER = "Selected geometry (picked by the user in the 3D viewer):";
+
+function buildSelectionBlock(features: { text: string }[]): string {
+  return [SELECTION_BLOCK_HEADER, ...features.map((f) => f.text)].join("\n");
+}
+
+// Basic chip bar: shows the features the user picked in the viewer so they can
+// see what will be referenced, and clear the whole set. (Deliberately minimal.)
+const SelectedFeaturesBar: FC = () => {
+  const features = useSelectionStore((s) => s.features);
+  const clear = useSelectionStore((s) => s.clear);
+  if (features.length === 0) return null;
   return (
-    <ComposerPrimitive.Root className="aui-composer-root relative flex w-full flex-col">
-      <ComposerPrimitive.AttachmentDropzone render={<div data-slot="aui_composer-shell" className="border-border/60 data-[dragging=true]:border-ring focus-within:border-border dark:border-muted-foreground/15 dark:focus-within:border-muted-foreground/30 flex w-full flex-col gap-2 rounded-(--composer-radius) border bg-(--composer-bg) p-(--composer-padding) shadow-[0_4px_16px_-8px_rgba(0,0,0,0.08),0_1px_2px_rgba(0,0,0,0.04)] transition-[border-color,box-shadow] focus-within:shadow-[0_6px_24px_-8px_rgba(0,0,0,0.12),0_1px_2px_rgba(0,0,0,0.05)] data-[dragging=true]:border-dashed data-[dragging=true]:bg-[color-mix(in_oklab,var(--color-accent)_50%,var(--color-background))] dark:shadow-none" />}><ComposerAttachments /><ComposerInput /><ComposerAction /></ComposerPrimitive.AttachmentDropzone>
+    <div className="flex flex-wrap items-center gap-1.5 px-1 pb-1">
+      <span className="text-muted-foreground text-xs">Referring to:</span>
+      {features.map((f) => (
+        <span
+          key={f.id}
+          className="bg-muted text-muted-foreground rounded-full px-2 py-0.5 text-xs"
+        >
+          {f.label}
+        </span>
+      ))}
+      <button
+        type="button"
+        onClick={clear}
+        className="text-muted-foreground/70 hover:text-foreground ml-0.5 inline-flex items-center rounded-full p-0.5"
+        aria-label="Clear selected geometry"
+      >
+        <XIcon className="size-3.5" />
+      </button>
+    </div>
+  );
+};
+
+const Composer: FC = () => {
+  const aui = useAui();
+  // Prefix the outgoing prompt with the picked-feature reference block, then let
+  // the composer's own submit send the combined text. Runs before the internal
+  // handler (composeEventHandlers), so both Enter and the Send button are covered.
+  const onSubmit = () => {
+    const { features, clear } = useSelectionStore.getState();
+    if (features.length === 0) return;
+    const text = aui.composer().getState().text;
+    const block = buildSelectionBlock(features);
+    aui.composer().setText(text.trim() ? `${block}\n\n${text}` : block);
+    clear();
+  };
+  return (
+    <ComposerPrimitive.Root onSubmit={onSubmit} className="aui-composer-root relative flex w-full flex-col">
+      <ComposerPrimitive.AttachmentDropzone render={<div data-slot="aui_composer-shell" className="border-border/60 data-[dragging=true]:border-ring focus-within:border-border dark:border-muted-foreground/15 dark:focus-within:border-muted-foreground/30 flex w-full flex-col gap-2 rounded-(--composer-radius) border bg-(--composer-bg) p-(--composer-padding) shadow-[0_4px_16px_-8px_rgba(0,0,0,0.08),0_1px_2px_rgba(0,0,0,0.04)] transition-[border-color,box-shadow] focus-within:shadow-[0_6px_24px_-8px_rgba(0,0,0,0.12),0_1px_2px_rgba(0,0,0,0.05)] data-[dragging=true]:border-dashed data-[dragging=true]:bg-[color-mix(in_oklab,var(--color-accent)_50%,var(--color-background))] dark:shadow-none" />}><ComposerAttachments /><SelectedFeaturesBar /><ComposerInput /><ComposerAction /></ComposerPrimitive.AttachmentDropzone>
     </ComposerPrimitive.Root>
   );
 };

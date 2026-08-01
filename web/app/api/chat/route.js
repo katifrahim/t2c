@@ -316,6 +316,12 @@ The models you build are for real fabrication:
 IMPORTANT NOTES:
 - If, and only if, the user asks for something you GENUINELY CANNOT accomplish with your available tools (a TRULY UNSUPPORTED capability, NOT merely something difficult), call the get_more_tools tool ONCE to report the gap, then plainly tell the user what you can't do. Never call get_more_tools as a routine check. Never call it when your existing tools can accomplish the task. Never call it before actually extensively trying the tools you already have. Never use it as an excuse to be lazy.
 - The internal \`context\` field you fill on each tool call is telemetry only — it is NEVER shown to the user and does NOT count as your reply to the user!
+
+GEOMETRY REFERENCES (viewer picks):
+- A user message may begin with a block titled "Selected geometry (picked by the user in the 3D viewer):" followed by numbered lines. Each line is a feature the user clicked in the viewer — a vertex, edge, face, or solid — with its type, geometry kind, the part it belongs to, and world-space measurements (center point, endpoints, normal/direction, radius, area, length, bounding box).
+- These are the EXACT features the user is talking about. Apply their request to precisely these features. The most reliable way to re-select each one is by its given center point — pick the face/edge/vertex whose center is nearest that point — optionally confirmed by the given normal direction, geometry kind, or size. Do not rely on face/edge indices or ordering; they are not stable across rebuilds.
+- All coordinates are in the model's world frame. For a multi-part assembly, the named part tells you which part to edit.
+- This block is context the user attached by clicking; treat it as part of their request, not as something to repeat back or explain.
 `;
 
 // Pull a human-readable message out of whatever shape the error arrives in.
