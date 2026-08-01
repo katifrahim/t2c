@@ -9,7 +9,7 @@ from both engines' opaque topological naming.
 """
 from __future__ import annotations
 
-from onshape.client import Onshape, PartStudio
+from onshape.client import Onshape, PartStudio, RateLimited
 
 # One representative point PER created face, plus radius, in millimetres. The point
 # is the midpoint of the face's LONGEST boundary edge -- a tangent line for a
@@ -94,6 +94,8 @@ def resolve_extrude_caps(api: Onshape, ps: PartStudio, extrudes: list[tuple]) ->
             faces = _unwrap(res.get("result")) or []
             if faces:
                 out[fid] = faces
+        except RateLimited:
+            raise  # a global stop, not a per-feature miss -- don't emit a broken model
         except Exception:  # noqa: BLE001
             continue
     return out
@@ -120,6 +122,8 @@ def resolve_body_flow(api: Onshape, ps: PartStudio, max_rollback: int) -> dict:
             res = api.call(f"{ps.path}/featurescript?rollbackBarIndex={rb}",
                            {"script": _FS_SOLIDS, "queries": {}})
             flow[rb] = _unwrap(res.get("result")) or []
+        except RateLimited:
+            raise  # a global stop, not a per-feature miss -- don't emit a broken model
         except Exception:  # noqa: BLE001
             flow[rb] = []
     return flow
@@ -137,5 +141,7 @@ def resolve_created_faces(api: Onshape, ps: PartStudio, feature_ids: list[str]) 
     try:
         res = api.featurescript(ps, _FS_CREATED % ids)
         return _unwrap(res.get("result", {})) or {}
+    except RateLimited:
+        raise  # a global stop, not a per-feature miss -- don't emit a broken model
     except Exception:  # noqa: BLE001
         return {}

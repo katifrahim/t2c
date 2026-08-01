@@ -23,8 +23,14 @@ _CACHE_DIR = os.path.join(os.path.dirname(__file__), "out", "cache")
 _MAX_RETRIES = 6
 _TIMEOUT = 45.0          # per-request socket timeout (seconds)
 _MIN_INTERVAL = 0.35     # min spacing between live requests (proactive throttle)
+_MAX_BACKOFF = 30.0      # cap any single retry sleep; longer Retry-After -> fail fast
 _last_request = 0.0
 LAST_RETRY_AFTER = None   # Retry-After (s) from the most recent 429, for telemetry
+
+
+class RateLimited(RuntimeError):
+    """Raised when Onshape returns a 429 whose Retry-After exceeds _MAX_BACKOFF —
+    i.e. the daily cap is hit. Surfaces immediately instead of sleeping for hours."""
 
 
 def _throttle() -> None:
@@ -142,9 +148,19 @@ class Onshape:
             except urllib.error.HTTPError as e:
                 if e.code == 429:
                     global LAST_RETRY_AFTER
-                    LAST_RETRY_AFTER = e.headers.get("Retry-After")
+                    ra = e.headers.get("Retry-After")
+                    LAST_RETRY_AFTER = ra
+                    # Onshape's daily-cap 429s carry a multi-HOUR Retry-After. Never
+                    # sleep that off inside the request (it hangs the whole pipeline,
+                    # uninterruptibly, for up to ~21h) -- fail fast and loud so the
+                    # caller can stop and try again after the cap resets.
+                    if ra and float(ra) > _MAX_BACKOFF:
+                        raise RateLimited(
+                            f"Onshape rate limit hit; Retry-After {float(ra):.0f}s "
+                            f"(~{float(ra) / 3600:.1f}h) on {path}") from e
                 if e.code in (429, 500, 502, 503, 504) and attempt < _MAX_RETRIES - 1:
-                    wait = float(e.headers.get("Retry-After") or 0) or min(2**attempt, 30)
+                    wait = min(float(e.headers.get("Retry-After") or 0) or 2**attempt,
+                               _MAX_BACKOFF)
                     time.sleep(wait)
                     continue
                 body = e.read().decode(errors="replace")
