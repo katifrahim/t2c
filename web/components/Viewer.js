@@ -367,14 +367,29 @@ export default function Viewer() {
     // close on Escape, and we must not swallow that. (The reported culprits are
     // n/v/e/f/s and Backspace.)
     const VIEWER_KEYS = new Set(["Backspace", "Delete", "n", "v", "e", "f", "s"]);
+    // Pick-filter keys → topo mode. While a pick tool is active these must drive
+    // the filter ONLY; otherwise "s" would ALSO open the Studio (its global
+    // shortcut). We run the filter switch ourselves and stop the event so the
+    // colliding global shortcut can't fire. Global shortcuts stay intact when no
+    // pick tool is active.
+    const FILTER_TOPO = { n: "None", v: "Vertex", e: "Edge", f: "Face", s: "Solid" };
     const isTextField = (el) =>
       !!el && (el.isContentEditable || el.tagName === "INPUT" ||
                el.tagName === "TEXTAREA" || el.tagName === "SELECT");
-    const block = (e) => {
-      if (isTextField(e.target) && VIEWER_KEYS.has(e.key)) e.stopImmediatePropagation();
+    const onKeyDownCapture = (e) => {
+      if (isTextField(e.target)) {
+        if (VIEWER_KEYS.has(e.key)) e.stopImmediatePropagation();
+        return;
+      }
+      const viewer = ref.current.viewer;
+      const topo = FILTER_TOPO[e.key];
+      if (topo && viewer?.cadTools?.enabledTool) {
+        try { ref.current.display?.shapeFilterDropDownMenu?.setValue(topo); } catch {}
+        e.stopImmediatePropagation();
+      }
     };
-    window.addEventListener("keydown", block, true); // capture: ahead of doc + window
-    return () => window.removeEventListener("keydown", block, true);
+    window.addEventListener("keydown", onKeyDownCapture, true); // capture: ahead of doc + window
+    return () => window.removeEventListener("keydown", onKeyDownCapture, true);
   }, []);
 
   // On chat/session switch: keep the current scene on screen (no blanking) and
