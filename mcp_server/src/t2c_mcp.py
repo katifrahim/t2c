@@ -938,6 +938,128 @@ def _placement_of(loc_tq):
         return None, None
 
 
+# =============================================================================
+# ASSEMBLY SELF-DIAGNOSTIC FEEDBACK  (returned automatically by assembly_api)
+# =============================================================================
+# Ground truth about the solved assembly so the LLM can spot and fix its own
+# positioning/orientation/constraint mistakes before handing the result to the
+# user — the automatic analog of what the "select geometry" feature gives manually.
+
+def _num(x) -> float:
+    v = round(float(x), 3) + 0.0
+    return 0.0 if v == 0 else v
+
+
+def _assembly_world_parts(asm) -> list:
+    """[(name, world_location, world_shape)] for each leaf part, at its solved
+    world placement (relative child locations composed down the tree)."""
+    out = []
+
+    def rec(node, parent_loc):
+        wl = parent_loc * node.loc
+        if node.obj is not None:
+            try:
+                s = node.obj.val() if isinstance(node.obj, Workplane) else node.obj
+                if isinstance(s, cq.Shape):
+                    out.append((node.name, wl, s.located(wl)))
+            except Exception:
+                pass
+        for ch in node.children:
+            rec(ch, wl)
+
+    rec(asm, Location())
+    return out
+
+
+def _bbox_overlap(a, b, tol=1e-6) -> bool:
+    return all(a["min"][i] <= b["max"][i] + tol and b["min"][i] <= a["max"][i] + tol
+               for i in range(3))
+
+
+def _overlap_volume(s1, s2):
+    try:
+        c = s1.intersect(s2)
+        return c.Volume() if c is not None else 0.0
+    except Exception:
+        return None
+
+
+def _min_distance(s1, s2):
+    try:
+        from OCP.BRepExtrema import BRepExtrema_DistShapeShape
+        d = BRepExtrema_DistShapeShape(s1.wrapped, s2.wrapped)
+        return d.Value() if d.IsDone() else None
+    except Exception:
+        return None
+
+
+def _assembly_report(asm) -> dict:
+    """Per-part placement + bbox, part collisions, floating (disconnected) parts,
+    unconstrained parts, and solve status. Best-effort — never raises."""
+    try:
+        parts = _assembly_world_parts(asm)
+    except Exception:
+        return {}
+    if not parts:
+        return {}
+
+    constrained = set()
+    try:
+        for c in asm.constraints:
+            for o in c.objects:
+                constrained.add(o.split("@")[0].split("/")[-1])  # leaf part name
+    except Exception:
+        pass
+
+    report = {"parts": [], "collisions": [], "floating_parts": [], "unconstrained_parts": []}
+    bbs = []  # (name, shape, bbox_dict)
+    for name, wl, shape in parts:
+        t, r = wl.toTuple()
+        try:
+            bb = shape.BoundingBox()
+            bbox = {"min": [_num(bb.xmin), _num(bb.ymin), _num(bb.zmin)],
+                    "max": [_num(bb.xmax), _num(bb.ymax), _num(bb.zmax)]}
+        except Exception:
+            bbox = None
+        report["parts"].append({
+            "name": name,
+            "position": [_num(v) for v in t],
+            "rotation_deg": [_num(v) for v in r],
+            "bbox": bbox,
+            "constrained": name in constrained,
+        })
+        if name not in constrained:
+            report["unconstrained_parts"].append(name)
+        bbs.append((name, shape, bbox))
+
+    # Pairwise interference/contact — bbox-prefiltered, capped so it stays cheap.
+    n = len(bbs)
+    if 1 < n <= 12:
+        import itertools
+        touch = {name: False for name, _, _ in bbs}
+        for (n1, s1, b1), (n2, s2, b2) in itertools.combinations(bbs, 2):
+            if not (b1 and b2 and _bbox_overlap(b1, b2)):
+                continue  # bboxes apart → cannot touch
+            vol = _overlap_volume(s1, s2)
+            if vol is not None and vol > 1e-6:
+                report["collisions"].append({"parts": [n1, n2], "overlap_volume": _num(vol)})
+                touch[n1] = touch[n2] = True
+            else:
+                d = _min_distance(s1, s2)
+                if d is not None and d < 1e-6:  # coincident faces (mated, no volume)
+                    touch[n1] = touch[n2] = True
+        report["floating_parts"] = [nm for nm, ok in touch.items() if not ok]
+
+    sr = getattr(asm, "_solve_result", None)
+    if isinstance(sr, dict):
+        obj_hist = (sr.get("iterations") or {}).get("obj") or []
+        report["solve"] = {"success": bool(sr.get("success")),
+                           "residual": _num(obj_hist[-1]) if obj_hist else None}
+    else:
+        report["solve"] = {"attempted": False}
+    return report
+
+
 def _show_tessellate(obj: Any) -> None:
     """http: tessellate obj into the three-cad-viewer payload and store it for
     /model. Replaces the ocp_vscode websocket push (which can't work over HTTPS)."""
@@ -1883,7 +2005,8 @@ async def assembly_api(
     ctx: Context = None,
 ) -> str:
     """
-    Assembly API fundamentals: 
+    Assembly API fundamentals:
+        - The response includes an "assembly_report" with ground truth about the result: each part's world "position"/"rotation_deg"/"bbox"/"constrained", "collisions" (parts whose solids overlap, with overlap_volume — almost always a positioning error), "floating_parts" (parts touching nothing — often misplaced/disconnected), "unconstrained_parts" (left at their add-location), and "solve" (success + residual). ALWAYS read it: if it shows collisions, unconstrained/floating parts, or an unsuccessful solve, fix the constraints/locations and re-run BEFORE presenting the assembly to the user.
         - Use Workplane API to build each part (one part = one piece on a CNC machine or printer), then use Assembly API to combine those distinct parts together with constraint-based relative positioning/orientation, part-specific colors, hierarachy, sub-assemblies, etc.
         - Always use constraints. Constraints offer a better representation of the real world relationship the user wants to model than directly supplying locations. They allow you to dynamically position parts relative to each other. With constraints, if one part's location changes, then it automatically updates the location of all other connected parts.
         - There are a total of 9 constraints (5 relative, 4 fixed). Each constraint is basically a cost function. After all constraints have been defined, a solver updates the position and orientation of the parts to minimize the sum of all cost functions. The solver is basically an optimizer.
@@ -2698,8 +2821,13 @@ async def assembly_api(
         _store(name, obj)
         await anyio.to_thread.run_sync(_show, obj)
 
-        return json.dumps({"status": "success", "name": name,
-                           "obj_type": _obj_type(obj), "properties": _properties(obj)})
+        result = {"status": "success", "name": name,
+                  "obj_type": _obj_type(obj), "properties": _properties(obj)}
+        if isinstance(obj, Assembly):
+            report = await anyio.to_thread.run_sync(_assembly_report, obj)
+            if report:
+                result["assembly_report"] = report
+        return json.dumps(result)
     except Exception as e:
         return _error(str(e), traceback.format_exc())
 
