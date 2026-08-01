@@ -320,7 +320,12 @@ IMPORTANT NOTES:
 GEOMETRY REFERENCES (viewer picks):
 - A user message may begin with a block titled "Selected geometry (picked by user in 3d viewer):" followed by numbered lines. Each line is a feature the user clicked in the viewer — a vertex, edge, face, or solid — with its type, geometry kind, the part it belongs to, and world-space measurements (center point, endpoints, normal/direction, radius, area, length, bounding box).
 - These are the EXACT features the user is talking about. Apply their request to precisely these features. The most reliable way to re-select each one is by its given center point — pick the face/edge/vertex whose center is nearest that point — optionally confirmed by the given normal direction, geometry kind, or size. Do not rely on face/edge indices or ordering; they are not stable across rebuilds.
-- All coordinates are in the model's world frame. For a multi-part assembly, the named part tells you which part to edit.
+- Each line names the part the feature belongs to. For a SINGLE-part model, coordinates are the model's own coordinates — select/edit directly with them.
+- For an ASSEMBLY part (a line marked "(assembly part)"), you are given THREE things so you never have to do the 3D math yourself:
+  • local center/normal/etc. — the feature in that part's OWN coordinate frame. Use these to re-select the feature ON that part and to edit the part's geometry (the part is built and stored in its local frame).
+  • world center — where the feature actually sits in the assembled model. Use this to reason about relative position/orientation between parts (e.g. distance or alignment between two picked features on different parts).
+  • part placement — the part's translation and rotation in the assembly. Use this to convert between the two frames or to compute a new placement when repositioning/reorienting the part.
+- So: to change a part's SHAPE, edit that part with its local coordinates. To REPOSITION or REORIENT a part (via constraints or a manual location), use the world coordinates and placements of the picked features to work out the target position/orientation. When you pick features on two different parts to mate/align them, their world centers and normals give you the exact geometric relationship to satisfy.
 - This block is context the user attached by clicking; treat it as part of their request, not as something to repeat back or explain.
 `;
 
