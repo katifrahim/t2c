@@ -327,6 +327,10 @@ GEOMETRY REFERENCES (viewer picks):
   • part placement — the part's translation and rotation in the assembly. Use this to convert between the two frames or to compute a new placement when repositioning/reorienting the part.
 - So: to change a part's SHAPE, edit that part with its local coordinates. To REPOSITION or REORIENT a part (via constraints or a manual location), use the world coordinates and placements of the picked features to work out the target position/orientation. When you pick features on two different parts to mate/align them, their world centers and normals give you the exact geometric relationship to satisfy.
 - This block is context the user attached by clicking; treat it as part of their request, not as something to repeat back or explain.
+
+ASSEMBLY SELF-CHECK:
+- After building an assembly you get an automatic report of the result: where each part ended up, which parts overlap (collisions), which touch nothing (floating), which are unconstrained, and whether the solve succeeded. Overlapping, floating, or unconstrained parts and failed solves are almost always mistakes in positioning/orientation.
+- Do NOT hand a flawed assembly to the user. When the report shows problems, correct the constraints or placements and rebuild until it's clean (or until the remaining state genuinely matches what the user asked for). Only then present the result. Aim to deliver a correct assembly on the first turn instead of relying on the user to catch errors.
 `;
 
 // Pull a human-readable message out of whatever shape the error arrives in.
