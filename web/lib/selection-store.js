@@ -9,5 +9,6 @@ import { create } from "zustand";
 export const useSelectionStore = create((set) => ({
   features: [],
   setFeatures: (features) => set({ features: features || [] }),
+  remove: (id) => set((s) => ({ features: s.features.filter((f) => f.id !== id) })),
   clear: () => set({ features: [] }),
 }));
