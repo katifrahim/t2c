@@ -534,6 +534,17 @@ export default function Viewer() {
         }
       } catch { /* ignore */ }
 
+      // Repurposed button: it now drives geometry selection for prompt references,
+      // not clipboard. Rename its tooltip (data-*-tooltip attrs) to match.
+      try {
+        container
+          .querySelectorAll('[data-base-tooltip="Copy shape IDs to clipboard"]')
+          .forEach((el) => {
+            el.setAttribute("data-tooltip", "Select geometry");
+            el.setAttribute("data-base-tooltip", "Select geometry");
+          });
+      } catch { /* ignore */ }
+
       // Mobile: start with the Tools panel collapsed to declutter the small screen.
       // (The wrapped showToolsPanel above keeps the X/Y/Z legend visible.) Render the
       // tree while it's still visible first — the library only re-renders the tree on
