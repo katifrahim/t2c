@@ -355,6 +355,28 @@ export default function Viewer() {
     try { ref.current.viewer?.setTheme(theme); } catch {}
   }, [theme]);
 
+  // three-cad-viewer binds its shortcuts globally — on `document` (Backspace/Esc
+  // change the picked selection; n/v/e/f/s switch the pick filter) and on `window`
+  // (trackball camera keys). None of them check focus, so typing a prompt drove
+  // the viewer (e.g. "s" flipped the pick filter, Backspace dropped a picked-
+  // feature chip). A capture-phase interceptor runs before every viewer listener
+  // and swallows those keys while a text field is focused. It only stops
+  // propagation — never preventDefault — so normal typing/deletion is untouched.
+  useEffect(() => {
+    // Escape is intentionally excluded — many inputs live inside dialogs that
+    // close on Escape, and we must not swallow that. (The reported culprits are
+    // n/v/e/f/s and Backspace.)
+    const VIEWER_KEYS = new Set(["Backspace", "Delete", "n", "v", "e", "f", "s"]);
+    const isTextField = (el) =>
+      !!el && (el.isContentEditable || el.tagName === "INPUT" ||
+               el.tagName === "TEXTAREA" || el.tagName === "SELECT");
+    const block = (e) => {
+      if (isTextField(e.target) && VIEWER_KEYS.has(e.key)) e.stopImmediatePropagation();
+    };
+    window.addEventListener("keydown", block, true); // capture: ahead of doc + window
+    return () => window.removeEventListener("keydown", block, true);
+  }, []);
+
   // On chat/session switch: keep the current scene on screen (no blanking) and
   // force the next poll to re-render this session's model — or its placeholder
   // (grid + tools + empty scene), so the viewer widget is NEVER torn down.

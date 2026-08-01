@@ -76,7 +76,6 @@ import {
   useState,
   type ComponentType,
   type FC,
-  type KeyboardEvent as ReactKeyboardEvent,
   type PropsWithChildren,
 } from "react";
 import { useCreditStore } from "@/lib/credit-store";
@@ -415,13 +414,8 @@ const Composer: FC = () => {
     aui.composer().setText(text.trim() ? `${block}\n\n${text}` : block);
     clear();
   };
-  // The 3D viewer registers its keyboard shortcuts on `document` (Backspace/Esc
-  // change the picked selection; n/v/e/f/s switch the pick filter). Stop composer
-  // keystrokes from bubbling there so typing a prompt never drives the viewer —
-  // its shortcuts stay live only while the viewer itself has focus.
-  const onKeyDown = (e: ReactKeyboardEvent) => e.stopPropagation();
   return (
-    <ComposerPrimitive.Root onSubmit={onSubmit} onKeyDown={onKeyDown} className="aui-composer-root relative flex w-full flex-col">
+    <ComposerPrimitive.Root onSubmit={onSubmit} className="aui-composer-root relative flex w-full flex-col">
       <ComposerPrimitive.AttachmentDropzone render={<div data-slot="aui_composer-shell" className="border-border/60 data-[dragging=true]:border-ring focus-within:border-border dark:border-muted-foreground/15 dark:focus-within:border-muted-foreground/30 flex w-full flex-col gap-2 rounded-(--composer-radius) border bg-(--composer-bg) p-(--composer-padding) shadow-[0_4px_16px_-8px_rgba(0,0,0,0.08),0_1px_2px_rgba(0,0,0,0.04)] transition-[border-color,box-shadow] focus-within:shadow-[0_6px_24px_-8px_rgba(0,0,0,0.12),0_1px_2px_rgba(0,0,0,0.05)] data-[dragging=true]:border-dashed data-[dragging=true]:bg-[color-mix(in_oklab,var(--color-accent)_50%,var(--color-background))] dark:shadow-none" />}><ComposerAttachments /><SelectedFeaturesBar /><ComposerInput /><ComposerAction /></ComposerPrimitive.AttachmentDropzone>
     </ComposerPrimitive.Root>
   );
