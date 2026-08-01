@@ -476,6 +476,12 @@ export default function Viewer() {
       if (!TCV || !container) return;
       ref.current.payload = payload; // remember for re-fitting on resize
       if (ref.current.viewer) { try { ref.current.viewer.dispose(); } catch {} }
+      // The Display owns the container's keyboard-shortcut listener and only
+      // detaches it in ITS dispose() — which we must call, or each model swap
+      // leaks a stale handler bound to the now-disposed viewer. Those stale
+      // handlers throw "Viewer.render() must be called…" on every shortcut
+      // (x/s/p/t/b/…) while the live viewer still handles the key.
+      if (ref.current.display) { try { ref.current.display.dispose(); } catch {} }
       // A new model invalidates any features picked on the previous one.
       try { useSelectionStore.getState().clear(); } catch {}
       container.innerHTML = "";
@@ -493,6 +499,7 @@ export default function Viewer() {
       if (window.innerWidth < 768) viewerOptions.control = "orbit";
 
       const display = new TCV.Display(container, displayOptions);
+      ref.current.display = display; // tracked so we can dispose it on the next swap
       const viewer = new TCV.Viewer(display, displayOptions, notify, null);
       // Mobile: keep the X/Y/Z orientation legend visible regardless of the Tools
       // panel state. The library ties the marker to the panel — showToolsPanel(flag)
@@ -736,6 +743,7 @@ export default function Viewer() {
       if (ref.current.rotRaf) cancelAnimationFrame(ref.current.rotRaf); // stop the rotation loop
       ro.disconnect();
       if (ref.current.viewer) { try { ref.current.viewer.dispose(); } catch {} }
+      if (ref.current.display) { try { ref.current.display.dispose(); } catch {} }
     };
   }, []);
 
