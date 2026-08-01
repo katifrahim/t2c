@@ -55,12 +55,14 @@ try:
     _ocp_backend_mod.is_jupyter_cadquery = True
     from ocp_vscode.comms import MessageType as _MessageType, default as _ocp_default
     from ocp_vscode.measure import get_properties as _get_properties
+    from ocp_tessellate.ocp_utils import tq_to_loc as _tq_to_loc
     MEASURE_AVAILABLE = True
 except Exception:
     _ocp_backend_mod = None
     _MessageType = None
     _ocp_default = None
     _get_properties = None
+    _tq_to_loc = None
     MEASURE_AVAILABLE = False
 
 
@@ -804,10 +806,25 @@ def _line_direction(shape):
     return (d.X(), d.Y(), d.Z())
 
 
-def _describe_feature(shape_id: str, props: dict, shape=None) -> dict:
-    """Build {id,label,text} for one picked feature from get_properties output.
-    `text` is a neutral one-liner (safe to show the user); `label` is a short chip.
-    Neither is numbered — the frontend numbers by position so removals renumber."""
+def _feat_center(shape):
+    """Centroid CadQuery's nearest-to-point selector compares against — the datum
+    that lets the LLM re-resolve this exact entity. None on failure."""
+    try:
+        c = cq.Shape.cast(shape).Center()
+        return (c.x, c.y, c.z)
+    except Exception:
+        return None
+
+
+def _describe_feature(shape_id, shape, world_center=None, placement=None) -> dict:
+    """One picked feature → {id,label,text}. Neutral one-liner (safe to show the
+    user), unnumbered (the frontend numbers by position).
+
+    `shape` is the frame the model is EDITED in: for a placed assembly part that's
+    the PART-LOCAL shape (coords labelled "local"), and world_center + placement
+    then locate it in the assembly. For a single part (identity placement) it's the
+    world shape and world_center/placement are None — coords are unlabelled."""
+    props = _get_properties(shape)
     st = props.get("shape_type", "Shape")     # Vertex/Edge/Face/Solid/Compound
     gt = props.get("geom_type", "")            # Plane/Cylinder/Line/Circle/...
     part = _part_name(shape_id)
@@ -816,70 +833,109 @@ def _describe_feature(shape_id: str, props: dict, shape=None) -> dict:
         if isinstance(sec, dict):
             flat.update(sec)
 
-    # The centroid CadQuery's own nearest-to-point selector compares against —
-    # the authoritative datum for the LLM to re-resolve this exact entity.
-    center = None
-    if shape is not None:
-        try:
-            c = cq.Shape.cast(shape).Center()
-            center = (c.x, c.y, c.z)
-        except Exception:
-            center = None
+    center = _feat_center(shape)
+    placed = placement is not None
+    f = "local " if placed else ""   # label coords as part-local for placed parts
 
-    attrs = [f'on part "{part}"']
+    attrs = [f'on part "{part}"' + (" (assembly part)" if placed else "")]
     if st == "Vertex":
         pt = center or flat.get("xyz") or props.get("refpoint")
         if pt is not None:
-            attrs.append(f"at {_pt(pt)}")
+            attrs.append(f"{f}position {_pt(pt)}")
         label = "Vertex"
     elif st == "Edge":
         if center is not None:
-            attrs.append(f"center {_pt(center)}")
+            attrs.append(f"{f}center {_pt(center)}")
         for k in ("radius", "major radius", "minor radius"):
             if k in flat:
                 attrs.append(f"{k} {_fmt(flat[k])}")
         if "start" in flat and "end" in flat:
-            attrs.append(f"from {_pt(flat['start'])} to {_pt(flat['end'])}")
+            attrs.append(f"{f}from {_pt(flat['start'])} to {_pt(flat['end'])}")
         if "length" in flat:
             attrs.append(f"length {_fmt(flat['length'])}")
-        if shape is not None and gt == "Line":
+        if gt == "Line":
             try:
                 d = _line_direction(shape)
                 if d:
-                    attrs.append(f"direction {_pt(d)}")
+                    attrs.append(f"{f}direction {_pt(d)}")
             except Exception:
                 pass
         label = f"{gt} edge" if gt else "Edge"
     elif st == "Face":
         if center is not None:
-            attrs.append(f"center {_pt(center)}")
+            attrs.append(f"{f}center {_pt(center)}")
         for k in ("radius", "base radius", "minor radius", "major radius"):
             if k in flat:
                 attrs.append(f"{k} {_fmt(flat[k])}")
-        if shape is not None:
-            try:
-                n = _face_normal(shape)
-                if n:
-                    attrs.append(f"normal {_pt(n)}")
-            except Exception:
-                pass
+        try:
+            n = _face_normal(shape)
+            if n:
+                attrs.append(f"{f}normal {_pt(n)}")
+        except Exception:
+            pass
         if "area" in flat:
             attrs.append(f"area {_fmt(flat['area'])}")
         label = f"{gt} face" if gt else "Face"
     else:  # Solid / CompSolid / Compound
         if center is not None:
-            attrs.append(f"center {_pt(center)}")
+            attrs.append(f"{f}center {_pt(center)}")
         if "volume" in flat:
             attrs.append(f"volume {_fmt(flat['volume'])}")
         label = st
 
     bb = flat.get("bb")
     if isinstance(bb, dict) and "min" in bb and "max" in bb:
-        attrs.append(f"bbox {_pt(bb['min'])}–{_pt(bb['max'])}")
+        attrs.append(f"{f}bbox {_pt(bb['min'])}–{_pt(bb['max'])}")
+
+    # Assembly context: where the feature sits in the assembly, and how the part is
+    # placed — so the LLM can reason about position/orientation without the math.
+    if placed:
+        if world_center is not None:
+            attrs.append(f"world center {_pt(world_center)}")
+        (tx, ty, tz), (rx, ry, rz) = placement
+        attrs.append(
+            f"part placed at ({_fmt(tx)}, {_fmt(ty)}, {_fmt(tz)}) "
+            f"rotated ({_fmt(rx)}, {_fmt(ry)}, {_fmt(rz)})° (XYZ)"
+        )
 
     kind = (f"{gt} " if gt and gt not in ("Point", "Other") else "") + st.lower()
     text = f"{kind}: " + ", ".join(attrs)
     return {"id": shape_id, "label": label, "text": text}
+
+
+def _walk_part_locs(model: dict) -> dict:
+    """Map each tessellated part id → its absolute world placement (t, q) or None,
+    from the ocp_vscode model tree — the same placement that moved mb.model's
+    shapes to world. Lets /selection recover part-local coordinates."""
+    out = {}
+
+    def walk(node):
+        for v in node.get("parts", []) or []:
+            if v.get("parts") is not None:
+                walk(v)
+            else:
+                out[v["id"]] = v.get("loc")
+    try:
+        walk(model)
+    except Exception:
+        pass
+    return out
+
+
+def _placement_of(loc_tq):
+    """(cq.Location, ((tx,ty,tz),(rx,ry,rz)) degrees) for a part's (t,q), or
+    (None, None) if it's missing / an identity placement (single-part case)."""
+    if not loc_tq or _tq_to_loc is None:
+        return None, None
+    try:
+        loc = cq.Location(_tq_to_loc(*loc_tq))
+        pl = loc.toTuple()
+        (t, r) = pl
+        if all(abs(v) < 1e-6 for v in (*t, *r)):
+            return None, None   # identity → world == local, no assembly context
+        return loc, pl
+    except Exception:
+        return None, None
 
 
 def _show_tessellate(obj: Any) -> None:
@@ -900,12 +956,17 @@ def _show_tessellate(obj: Any) -> None:
         sess = _sess()
         sess.viewer["payload"] = payload
         sess.viewer["version"] += 1
-        # Load the BRep model into this session's measurement backend (serialize the
-        # live OCCT mapping the same way send_backend would).
+        # Serialize the OCCT mapping the same way send_backend would, then (a) record
+        # each part's world placement for /selection's local-frame recovery and
+        # (b) load it into this session's measurement backend.
+        try:
+            model = json.loads(json.dumps(mapping, default=_ocp_default))
+        except Exception:
+            model = None
+        sess.viewer["part_locs"] = _walk_part_locs(model) if model is not None else {}
         mb = sess.measure_backend
-        if mb is not None:
+        if mb is not None and model is not None:
             try:
-                model = json.loads(json.dumps(mapping, default=_ocp_default))
                 with contextlib.redirect_stderr(io.StringIO()), contextlib.redirect_stdout(io.StringIO()):
                     mb.load_model(model)
             except Exception:
@@ -2990,21 +3051,32 @@ async def _selection(request):
     ({"shapeIds": [...]}); we resolve each to its OCCT sub-shape and return a
     neutral geometric description the prompt is prefixed with. ?session=<id>."""
     from starlette.responses import JSONResponse
-    mb = _get_session(request.query_params.get("session")).measure_backend
+    sess = _get_session(request.query_params.get("session"))
+    mb = sess.measure_backend
     if mb is None or not getattr(mb, "model", None) or _get_properties is None:
         return JSONResponse({"features": []})
     try:
         ids = (await request.json()).get("shapeIds", []) or []
     except Exception:
         ids = []
+    part_locs = sess.viewer.get("part_locs") or {}
     features = []
     for sid in ids:
-        shape = mb.model.get(sid)
-        if shape is None:
+        world_shape = mb.model.get(sid)
+        if world_shape is None:
             continue
         try:
-            props = _get_properties(shape)
-            features.append(_describe_feature(sid, props, shape))
+            # For a placed assembly part, edit-frame coords must be part-LOCAL:
+            # recover them by un-applying the part's world placement. Single parts
+            # (identity placement) stay world-framed with no assembly context.
+            part_id = re.split(r"/(?:faces|edges|vertices)/", sid)[0]
+            loc, placement = _placement_of(part_locs.get(part_id))
+            if loc is not None:
+                shape = cq.Shape.cast(world_shape).moved(loc.inverse).wrapped
+                world_center = _feat_center(world_shape)
+            else:
+                shape, world_center = world_shape, None
+            features.append(_describe_feature(sid, shape, world_center, placement))
         except Exception as e:
             _log_err(str(e), traceback.format_exc())
     return JSONResponse({"features": features})
