@@ -804,9 +804,10 @@ def _line_direction(shape):
     return (d.X(), d.Y(), d.Z())
 
 
-def _describe_feature(shape_id: str, props: dict, idx: int, shape=None) -> dict:
+def _describe_feature(shape_id: str, props: dict, shape=None) -> dict:
     """Build {id,label,text} for one picked feature from get_properties output.
-    `text` is a neutral one-liner (safe to show the user); `label` is a short chip."""
+    `text` is a neutral one-liner (safe to show the user); `label` is a short chip.
+    Neither is numbered — the frontend numbers by position so removals renumber."""
     st = props.get("shape_type", "Shape")     # Vertex/Edge/Face/Solid/Compound
     gt = props.get("geom_type", "")            # Plane/Cylinder/Line/Circle/...
     part = _part_name(shape_id)
@@ -877,8 +878,8 @@ def _describe_feature(shape_id: str, props: dict, idx: int, shape=None) -> dict:
         attrs.append(f"bbox {_pt(bb['min'])}–{_pt(bb['max'])}")
 
     kind = (f"{gt} " if gt and gt not in ("Point", "Other") else "") + st.lower()
-    text = f"{idx}. {kind}: " + ", ".join(attrs)
-    return {"id": shape_id, "label": f"{label} #{idx}", "text": text}
+    text = f"{kind}: " + ", ".join(attrs)
+    return {"id": shape_id, "label": label, "text": text}
 
 
 def _show_tessellate(obj: Any) -> None:
@@ -3003,7 +3004,7 @@ async def _selection(request):
             continue
         try:
             props = _get_properties(shape)
-            features.append(_describe_feature(sid, props, len(features) + 1, shape))
+            features.append(_describe_feature(sid, props, shape))
         except Exception as e:
             _log_err(str(e), traceback.format_exc())
     return JSONResponse({"features": features})
