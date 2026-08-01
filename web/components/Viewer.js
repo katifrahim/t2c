@@ -2,6 +2,7 @@
 import { useEffect, useRef, useState } from "react";
 import { LoaderIcon } from "lucide-react";
 import { useSessionStore } from "@/lib/session-store";
+import { useSelectionStore } from "@/lib/selection-store";
 import { useViewerThemeStore } from "@/lib/viewer-theme-store";
 import { ANALYTICS_ENABLED } from "@/lib/analytics-enabled";
 
@@ -448,6 +449,8 @@ export default function Viewer() {
       if (!TCV || !container) return;
       ref.current.payload = payload; // remember for re-fitting on resize
       if (ref.current.viewer) { try { ref.current.viewer.dispose(); } catch {} }
+      // A new model invalidates any features picked on the previous one.
+      try { useSelectionStore.getState().clear(); } catch {}
       container.innerHTML = "";
 
       const config = payload.config || {};
@@ -490,6 +493,41 @@ export default function Viewer() {
       }
       ref.current.viewer = viewer;
       setHasModel(true);
+
+      // "Select" tool → prompt reference. The built-in notify only emits lossy
+      // trailing indices (for clipboard); wrap it so we also read the full picked
+      // paths, resolve them to geometric descriptions on the backend, and stash
+      // them for the chat composer to prefix onto the next prompt. Paths are built
+      // exactly like the measure tools (fromSolid → strip topology → solid id).
+      try {
+        const so = viewer.cadTools?.selectObject;
+        if (so && !so.__t2cWrapped) {
+          so.__t2cWrapped = true;
+          const orig = so.notify.bind(so);
+          so.notify = async () => {
+            orig();
+            const ids = (so.selectedShapes || []).map((s) => {
+              let n = s.obj.name;
+              if (s.fromSolid) {
+                n = n.replace(/\|faces.*$/, "").replace(/\|edges.*$/, "").replace(/\|vertices.*$/, "");
+              }
+              return n.replaceAll("|", "/");
+            });
+            const setFeatures = useSelectionStore.getState().setFeatures;
+            if (ids.length === 0) { setFeatures([]); return; }
+            try {
+              const resp = await fetch(`/api/selection?session=${sidRef.current}`, {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ shapeIds: ids }),
+              });
+              if (!resp.ok) return;
+              const data = await resp.json();
+              setFeatures(data?.features || []);
+            } catch { /* ignore */ }
+          };
+        }
+      } catch { /* ignore */ }
 
       // Mobile: start with the Tools panel collapsed to declutter the small screen.
       // (The wrapped showToolsPanel above keeps the X/Y/Z legend visible.) Render the
