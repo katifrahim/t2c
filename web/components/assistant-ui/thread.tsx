@@ -390,7 +390,7 @@ const SelectedFeaturesBar: FC = () => {
           <button
             type="button"
             onClick={() => remove(f.id)}
-            className="hover:text-foreground inline-flex items-center rounded-full p-0.5"
+            className="hover:text-foreground inline-flex cursor-pointer items-center rounded-full p-0.5"
             aria-label={`Remove ${f.label}`}
           >
             <XIcon className="size-3" />
