@@ -148,7 +148,12 @@ const SPIN_SPEED = 0.008;
 const SPEED_UNIT = SPIN_SPEED / 20;
 function rotationTick(ref) {
   const v = ref.current.viewer;
-  const g = v?.rendered?.nestedGroup?.rootGroup;
+  // `rendered` is a getter that THROWS (not returns undefined) if the viewer was
+  // just disposed during a model swap — optional chaining doesn't guard that, and
+  // this per-frame loop would otherwise crash with "Viewer.render() must be called
+  // before this operation". Swallow it; the next frame runs once the new viewer is up.
+  let g = null;
+  try { g = v?.rendered?.nestedGroup?.rootGroup; } catch { /* viewer not ready */ }
   if (g) {
     if (v._studioManager?.isActive) {
       const { rot, spin, spinAccum, spinSpeed } = ref.current;
