@@ -11,6 +11,7 @@ export const MODELS = [
   { id: "deepseek/deepseek-v4-flash", label: "DeepSeek V4 Flash (Best)", context: 1048576 }, // Ctx window: 1m toks
   { id: "z-ai/glm-5.2", label: "GLM-5.2 (Best)", context: 1048576 }, // Ctx window: 1m toks
   { id: "openai/gpt-oss-120b", label: "GPT-OSS 120B (Good)", context: 131072 }, // Ctx window: 131k toks
+  { id: "openai/gpt-5.6-luna-pro", label: "GPT 5.6 Luna Max (Vision)", context: 1050000, vision: true }, // Ctx window: 1M
   { id: "xiaomi/mimo-v2.5", label: "Xiaomi Mimo V2.5 (Vision)", context: 1048576, vision: true }, // Ctx window: 1m toks
 ];
 
@@ -25,6 +26,7 @@ export const MODEL_PRICING = {
   "openai/gpt-oss-120b": { input: 0.04e-6, output: 0.17e-6 },
   "deepseek/deepseek-v4-flash": { input: 0.14e-6, output: 0.28e-6 },
   "z-ai/glm-5.2": { input: 0.67e-6, output: 2.1e-6 },
+  "openai/gpt-5.6-luna-pro": { input: 1e-6, output: 6e-6 },
   "xiaomi/mimo-v2.5": { input: 0.14e-6, output: 0.28e-6 },
 };
 
