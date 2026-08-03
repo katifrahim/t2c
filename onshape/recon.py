@@ -41,6 +41,8 @@ def fingerprint(wp) -> Body | None:
     if val is None or not hasattr(val, "Volume"):
         return None
     try:
+        if not val.Solids():      # a wire/face/empty compound is not a solid body
+            return None           # (Wire.Volume() misleadingly returns its perimeter)
         vol = val.Volume()
         area = sum(f.Area() for f in val.Faces())
         bb = val.BoundingBox()
@@ -69,6 +71,10 @@ class Engine:
     def __init__(self):
         _mcp._sessions.pop(_mcp._LOCAL_SID, None)
         self.sess = _mcp._get_session(_mcp._LOCAL_SID)
+        # Search runs each candidate through the real workplane_api, but the viewer
+        # tessellation (_show) on every trial is pure waste (hundreds of renders) — and
+        # heavy enough to OOM. No-op it; reconstruction only needs the geometry.
+        _mcp._show = lambda *a, **k: None
         self.live: list[str] = []
         self.steps: list[dict] = []
         self._n = 0
@@ -104,35 +110,199 @@ class Engine:
                 bodies.append(fp)
         return State(bodies=bodies)
 
-    def try_candidate(self, payloads: list[dict], live_after: list[str]) -> State | None:
-        """Run a candidate (list of workplane_api payloads) on a snapshot; return the
-        resulting live-body State, then roll back. None if any payload errors."""
+    def _run_candidate(self, cand: "Candidate", record: bool):
+        """Apply a candidate's payloads (skip-chaining if requested); return the applied
+        payloads and the resulting live-body list. Raises on hard failure of a
+        non-skip candidate."""
+        if not cand.skip_failures:
+            for p in cand.payloads:
+                self._apply(p)
+                if record:
+                    self.steps.append({"step": f"Step {len(self.steps) + 1}",
+                                       "toolName": "workplane_api", "input": p})
+            return cand.live_after
+        last = cand.target
+        for p in cand.payloads:
+            p = dict(p); p["start_from"] = last
+            try:
+                self._apply(p)
+            except Exception:  # noqa: BLE001 — this edge can't take the op; skip it
+                continue
+            last = p["store_as"]
+            if record:
+                self.steps.append({"step": f"Step {len(self.steps) + 1}",
+                                   "toolName": "workplane_api", "input": p})
+        return [last if x == cand.target else x for x in (cand.base_live or [])]
+
+    def try_candidate(self, cand: "Candidate") -> tuple[State | None, list[str] | None]:
+        """Run a candidate on a snapshot; return (resulting live State, live_after) then
+        roll back. (None, None) if the candidate fails outright."""
         snap = self.snapshot()
         try:
-            for p in payloads:
-                self._apply(p)
-            return self.state_of(live_after)
+            live = self._run_candidate(cand, record=False)
+            return self.state_of(live), live
         except Exception:  # noqa: BLE001
-            return None
+            return None, None
         finally:
             self.restore(snap)
 
-    def commit(self, payloads: list[dict], live_after: list[str]):
-        for p in payloads:
-            self._apply(p)
-            self.steps.append({"step": f"Step {len(self.steps) + 1}",
-                               "toolName": "workplane_api", "input": p})
-        self.live = list(live_after)
+    def commit(self, cand: "Candidate"):
+        self.live = list(self._run_candidate(cand, record=True))
+
+
+# --- crash/hang-isolated engine (persistent worker subprocess) -------------------
+# A bad candidate (invalid boolean, degenerate fillet) can hang OCCT uninterruptibly
+# or blow memory. In-process, that kills the whole search. So candidates run in a
+# persistent child: the parent enforces a wall-clock timeout, and on hang/crash kills
+# the child, respawns it, and replays the committed steps to rebuild state. One child
+# amortizes process cost across all trials (vs spawn-per-candidate).
+def _child_apply(payload: dict):
+    out = asyncio.run(_mcp.workplane_api(ctx=None, **payload))
+    r = json.loads(out) if isinstance(out, str) else out
+    if r.get("status") != "success":
+        raise RuntimeError(r.get("error") or r.get("message") or "step failed")
+
+
+def _child_run(sess, cand: dict) -> list[str]:
+    """Apply a candidate dict in the child; return resulting live names."""
+    if not cand["skip_failures"]:
+        for p in cand["payloads"]:
+            _child_apply(p)
+        return cand["live_after"]
+    last = cand["target"]
+    for p in cand["payloads"]:
+        p = dict(p); p["start_from"] = last
+        try:
+            _child_apply(p)
+        except Exception:  # noqa: BLE001
+            continue
+        last = p["store_as"]
+    return [last if x == cand["target"] else x for x in (cand["base_live"] or [])]
+
+
+def _child_main(conn):
+    _mcp._sessions.pop(_mcp._LOCAL_SID, None)
+    _mcp._show = lambda *a, **k: None
+    sess = _mcp._get_session(_mcp._LOCAL_SID)
+    while True:
+        try:
+            kind, arg = conn.recv()
+        except EOFError:
+            break
+        if kind == "stop":
+            break
+        if kind == "apply":  # a committed step (state persists)
+            try:
+                _child_apply(arg); conn.send(("ok", None))
+            except Exception as e:  # noqa: BLE001
+                conn.send(("err", str(e)[:200]))
+        elif kind == "try":  # trial on a snapshot; state rolled back after
+            snap = (dict(sess.state), dict(sess.counters), sess.current)
+            try:
+                live = _child_run(sess, arg)
+                st = State(bodies=[fp for n in live
+                                   if (fp := fingerprint(sess.state.get(n))) is not None])
+                conn.send(("ok", (st, live)))
+            except Exception as e:  # noqa: BLE001
+                conn.send(("rej", str(e)[:120]))
+            finally:
+                sess.state.clear(); sess.state.update(snap[0])
+                sess.counters.clear(); sess.counters.update(snap[1])
+                sess.current = snap[2]
+
+
+class WorkerEngine:
+    """Same interface as Engine (name/live/steps/try_candidate/commit) but every trial
+    runs in a crash- and hang-isolated child process."""
+
+    def __init__(self, timeout: float = 20.0):
+        import multiprocessing as mp
+        self._mp = mp.get_context("spawn")
+        self.timeout = timeout
+        self.live: list[str] = []
+        self.steps: list[dict] = []
+        self._committed: list[dict] = []   # payloads to replay after a respawn
+        self._n = 0
+        self._start()
+
+    def _start(self):
+        self._pconn, cconn = self._mp.Pipe()
+        self.proc = self._mp.Process(target=_child_main, args=(cconn,), daemon=True)
+        self.proc.start()
+        for p in self._committed:            # rebuild committed state in the fresh child
+            self._pconn.send(("apply", p))
+            self._pconn.recv()
+
+    def _restart(self):
+        try:
+            self.proc.terminate(); self.proc.join(3)
+        except Exception:  # noqa: BLE001
+            pass
+        self._start()
+
+    def name(self) -> str:
+        self._n += 1
+        return f"body{self._n}"
+
+    def _cand_dict(self, cand: "Candidate") -> dict:
+        return {"payloads": cand.payloads, "skip_failures": cand.skip_failures,
+                "target": cand.target, "base_live": cand.base_live,
+                "live_after": cand.live_after}
+
+    def try_candidate(self, cand: "Candidate"):
+        self._pconn.send(("try", self._cand_dict(cand)))
+        if not self._pconn.poll(self.timeout):    # hang -> kill, respawn, reject
+            self._restart()
+            return None, None
+        tag, val = self._pconn.recv()
+        if tag == "ok":
+            return val
+        return None, None                          # rejected (bad geometry)
+
+    def commit(self, cand: "Candidate"):
+        live = cand.live_after
+        if not cand.skip_failures:
+            for p in cand.payloads:
+                self._pconn.send(("apply", p)); self._pconn.recv()
+                self._committed.append(p)
+                self.steps.append({"step": f"Step {len(self.steps) + 1}",
+                                   "toolName": "workplane_api", "input": p})
+        else:
+            last = cand.target
+            for p in cand.payloads:
+                p = dict(p); p["start_from"] = last
+                self._pconn.send(("apply", p))
+                tag, _ = self._pconn.recv()
+                if tag != "ok":
+                    continue
+                last = p["store_as"]
+                self._committed.append(p)
+                self.steps.append({"step": f"Step {len(self.steps) + 1}",
+                                   "toolName": "workplane_api", "input": p})
+            live = [last if x == cand.target else x for x in (cand.base_live or [])]
+        self.live = list(live)
+
+    def close(self):
+        try:
+            self._pconn.send(("stop", None)); self.proc.join(2)
+        except Exception:  # noqa: BLE001
+            pass
 
 
 # --- candidate generators (translators) ------------------------------------------
 @dataclass
 class Candidate:
     """A way to realize a feature: the payloads to run + the resulting live-body names.
-    `label` is for diagnostics (which convention won)."""
+    `label` is for diagnostics (which convention won). When `skip_failures` is set the
+    payloads are a resilient chain over `target` — each is start_from the last SUCCESS
+    and failures are skipped (per-edge fillet/chamfer on topology OCCT can't do at once);
+    `base_live` is the live set the chain result substitutes into."""
     payloads: list[dict]
     live_after: list[str]
     label: str = ""
+    skip_failures: bool = False
+    target: str | None = None
+    base_live: list[str] | None = None
 
 
 def profile_variants(sketch_profiles: list[ir.Profile]) -> list[tuple[str, list[ir.Profile]]]:
@@ -170,31 +340,206 @@ def extrude_candidates(engine: Engine, plane: ir.Plane, profiles: list[ir.Profil
             ex = {"method": "extrude", "params": {"until": dist, "combine": False, "both": sym}}
             tool = engine.name()
             make = {"operations": prof_ops + [ex], "init_params": init, "store_as": tool}
-            if op == "new":
+            if op == "new" or not base_live:
                 cands.append(Candidate([make], base_live + [tool], f"{pname}|{dname}|new"))
-            else:  # add/cut/intersect: the tool solid is booleaned into a target body
-                meth = {"add": "union", "cut": "cut", "intersect": "intersect"}[op]
-                for ti, target in enumerate(base_live):
+                continue
+            if op == "add":  # ADD may stay a separate body — let the oracle decide
+                cands.append(Candidate([make], base_live + [tool], f"{pname}|{dname}|add-sep"))
+            meth = {"add": "union", "cut": "cut", "intersect": "intersect"}[op]
+            for ti, target in enumerate(base_live):  # ...or merge into an existing body
+                res = engine.name()
+                boolean = {"operations": [{"method": meth, "args": [{"_ref": tool}]}],
+                           "start_from": target, "store_as": res}
+                new_live = [res if x == target else x for x in base_live]
+                cands.append(Candidate([make, boolean], new_live, f"{pname}|{dname}|{op}->{ti}"))
+            if op in ("cut", "intersect") and len(base_live) > 1:
+                # a REMOVE spanning several bodies (patterned holes): cut the one tool
+                # from EVERY body — non-intersecting bodies are unchanged (a no-op).
+                payloads, new_live = [make], []
+                for target in base_live:
                     res = engine.name()
-                    boolean = {"operations": [{"method": meth, "args": [{"_ref": tool}]}],
-                               "start_from": target, "store_as": res}
-                    new_live = [res if x == target else x for x in base_live]
-                    cands.append(Candidate([make, boolean], new_live,
-                                           f"{pname}|{dname}|{op}->{ti}"))
+                    payloads.append({"operations": [{"method": meth, "args": [{"_ref": tool}]}],
+                                     "start_from": target, "store_as": res})
+                    new_live.append(res)
+                cands.append(Candidate(payloads, new_live, f"{pname}|{dname}|{op}-all"))
     return cands
 
 
-def pick(engine: Engine, cands: list[Candidate], target: State) -> Candidate | None:
-    """Return the candidate whose resulting live State matches the oracle target, or the
-    closest by total-volume error if none match exactly (caller decides to accept)."""
+def pattern_candidates(engine: Engine, count: int, angle: float, equal_space: bool,
+                       axis_o: list[float], axis_d: list[float],
+                       base_live: list[str]) -> list[Candidate]:
+    """Circular pattern: rotate-copy a source body into `count` instances. We don't
+    hand-pick the source — every live body is offered and the oracle selects the one
+    whose copies land where Onshape's do (handles the 'which body gets patterned')."""
+    k = max(int(count), 1)
+    step = (angle / count) if equal_space else angle
+    a0 = list(axis_o)
+    a1 = [axis_o[0] + axis_d[0], axis_o[1] + axis_d[1], axis_o[2] + axis_d[2]]
+    cands: list[Candidate] = []
+    for si, src in enumerate(base_live):
+        payloads, new = [], []
+        for j in range(1, k):
+            copy = engine.name()
+            payloads.append({"operations": [{"method": "rotate", "args": [a0, a1, j * step]}],
+                             "start_from": src, "store_as": copy})
+            new.append(copy)
+        if payloads:
+            cands.append(Candidate(payloads, base_live + new, f"pattern src{si} x{k}"))
+    return cands
+
+
+def boolean_candidates(engine: Engine, op: str, base_live: list[str]) -> list[Candidate]:
+    """Boolean of multiple bodies. Union-all is the common case (washer merges 5->1);
+    for cut/intersect we offer base-vs-rest. The oracle confirms operand grouping."""
+    if len(base_live) < 2:
+        return []
+    meth = {"union": "union", "cut": "cut", "intersect": "intersect"}.get(op, "union")
+    res = engine.name()
+    ops = [{"method": meth, "args": [{"_ref": b}]} for b in base_live[1:]]
+    return [Candidate([{"operations": ops, "start_from": base_live[0], "store_as": res}],
+                      [res], f"{op}-all")]
+
+
+def round_candidates(engine: Engine, kind: str, points: list[list[float]], amount: float,
+                     base_live: list[str]) -> list[Candidate]:
+    """fillet/chamfer: select target edges by 3D fingerprint (NearestToPoint), apply the
+    op. Two candidates PER target body — all-at-once, and per-edge-skipping (OCCT often
+    fails the combined pass on messy topology but succeeds edge-by-edge). skip_failures
+    lets the per-edge candidate drop only the edges OCCT rejects."""
+    from onshape.emit import _point_selector
+    meth = "fillet" if kind == "fillet" else "chamfer"
+    cands: list[Candidate] = []
+    for ti, target in enumerate(base_live):
+        res = engine.name()
+        all_ops = [{"method": "edges", "args": [_point_selector(points)]},
+                   {"method": meth, "args": [amount]}]
+        cands.append(Candidate([{"operations": all_ops, "start_from": target, "store_as": res}],
+                               [res if x == target else x for x in base_live],
+                               f"{kind}-all->{ti}"))
+        # per-edge: each edge its own step (re-selected by point), chained; skip failures
+        payloads, cur = [], target
+        for pi, p in enumerate(points):
+            nxt = engine.name()
+            payloads.append({"operations": [
+                {"method": "edges", "args": [{"_type": "NearestToPointSelector", "pnt": p}]},
+                {"method": meth, "args": [amount]}], "start_from": cur, "store_as": nxt})
+            cur = nxt
+        cands.append(Candidate(payloads, [], f"{kind}-seq->{ti}",
+                               skip_failures=True, target=target, base_live=list(base_live)))
+    return cands
+
+
+def pick(engine: Engine, cands: list[Candidate], target: State,
+         **tol) -> tuple[Candidate | None, bool]:
+    """Return (candidate, exact) — the candidate whose resulting live State matches the
+    oracle (exact=True), else the closest by total-volume error (exact=False), else
+    (None, False)."""
     best, best_err = None, float("inf")
     for c in cands:
-        st = engine.try_candidate(c.payloads, c.live_after)
+        st, _ = engine.try_candidate(c)
         if st is None:
             continue
-        if st.matches(target):
-            return c
+        if st.matches(target, **tol):
+            return c, True
         err = abs(st.total_volume - target.total_volume)
         if err < best_err:
             best, best_err = c, err
-    return best  # best-effort (may not be within tolerance)
+    return best, False
+
+
+# --- the full closed-loop driver -------------------------------------------------
+def reconstruct(api, ps, verbose: bool = True):
+    """Reconstruct a whole Part Studio feature-by-feature, each verified against the
+    oracle. Returns (steps, report) where report[i] = (index, type, name, label, exact).
+    No feature's conventions are hand-decided: every feature offers candidates and the
+    oracle picks. A feature that no candidate matches is flagged (later: B-rep fallback)."""
+    from onshape.normalize import (_msg, _params, _enum, _sketch_profiles, caps_to_profiles,
+                                   _cap_distance, parse_length_mm, _parse_angle_deg,
+                                   _extrude_op, _BOOL_OP)
+    from onshape.extract import resolve_extrude_caps, resolve_created_faces
+    from onshape.oracle import body_states
+
+    feats = api.features(ps).get("features", [])
+    sk = {s["featureId"]: s for s in api.sketches(ps).get("sketches", [])}
+    sketch_ids = set(sk)
+    oracle = body_states(api, ps, len(feats))
+
+    extrudes = [(_msg(f)["featureId"], i + 1) for i, f in enumerate(feats)
+                if _msg(f).get("featureType") == "extrude" and not _msg(f).get("suppressed")]
+    caps = resolve_extrude_caps(api, ps, extrudes)
+    mod_ids = [_msg(f)["featureId"] for f in feats
+               if _msg(f).get("featureType") in ("fillet", "chamfer") and not _msg(f).get("suppressed")]
+    edge_pts = resolve_created_faces(api, ps, mod_ids)
+
+    eng = WorkerEngine()
+    last_sketch = None
+    report: list[tuple] = []
+
+    for i, f in enumerate(feats):
+        m = _msg(f)
+        ft, fid, nm = m.get("featureType"), m.get("featureId"), m.get("name") or ""
+        if m.get("suppressed"):
+            continue
+        tgt = oracle.get(i + 1)
+        cands: list[Candidate] = []
+
+        if ft == "newSketch":
+            last_sketch = fid
+            report.append((i, ft, nm, "sketch (no solid)", True))
+            if verbose:
+                print(f"  --  f{i:2d} {ft:15s} {nm[:20]:20s}")
+            continue
+        elif ft == "extrude":
+            op, _why = _extrude_op(f, sketch_ids, last_sketch)
+            ref = op.profile_ref
+            matrix = (sk.get(ref) or {}).get("sketchMatrix")
+            plane = explicit_plane(matrix) if matrix else ir.Plane(name="XY")
+            depth = op.distance
+            sources: list[tuple[str, list]] = []
+            if ref in sk:
+                sources.append(("sk", _sketch_profiles(sk[ref])))
+            if fid in caps and matrix:
+                sources.append(("caps", caps_to_profiles(caps[fid], matrix)))
+                if depth is None:
+                    d = _cap_distance(caps[fid], matrix)
+                    depth = abs(d) if d else None
+            for _src, profs in sources:
+                if profs:
+                    cands += extrude_candidates(eng, plane, profs, depth, op.op, eng.live)
+        elif ft == "circularPattern":
+            P = _params(f)
+            count = parse_length_mm((P.get("instanceCount") or {}).get("expression"))
+            angle = _parse_angle_deg((P.get("angle") or {}).get("expression"))
+            eq = bool((P.get("equalSpace") or {}).get("value", True))
+            if count and angle is not None:
+                cands = pattern_candidates(eng, int(round(count)), angle, eq,
+                                           [0, 0, 0], [0, 0, 1], eng.live)
+        elif ft == "booleanBodies":
+            bop = _BOOL_OP.get(_enum(_params(f).get("operationType")), "union")
+            cands = boolean_candidates(eng, bop, eng.live)
+        elif ft in ("fillet", "chamfer"):
+            faces = edge_pts.get(fid) or []
+            points = [x["at"] for x in faces if isinstance(x, dict) and "at" in x]
+            P = _params(f)
+            if ft == "fillet":
+                amt = parse_length_mm((P.get("radius") or {}).get("expression"))
+                if amt is None:
+                    rs = [x.get("r") for x in faces if x.get("r")]
+                    amt = sum(rs) / len(rs) if rs else None
+            else:
+                amt = parse_length_mm((P.get("width") or P.get("length") or {}).get("expression"))
+            if points and amt:
+                cands = round_candidates(eng, ft, points, amt, eng.live)
+
+        win, exact = pick(eng, cands, tgt) if (cands and tgt is not None) else (None, False)
+        if win:
+            eng.commit(win)
+        label = win.label if win else "no candidate"
+        report.append((i, ft, nm, label, bool(win and exact)))
+        if verbose:
+            flag = "OK " if (win and exact) else ("~~ " if win else "XX ")
+            print(f"  {flag}f{i:2d} {ft:15s} {nm[:20]:20s} -> {label}"
+                  + ("" if exact else "   [NOT EXACT]"))
+    steps = list(eng.steps)
+    eng.close()
+    return steps, report
