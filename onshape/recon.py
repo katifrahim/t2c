@@ -543,3 +543,52 @@ def reconstruct(api, ps, verbose: bool = True):
     steps = list(eng.steps)
     eng.close()
     return steps, report
+
+
+# --- CLI -------------------------------------------------------------------------
+def _cli(argv: list[str]) -> int:
+    """python -m onshape.recon <part-studio-url> [--out FILE.json] [--name NAME]
+
+    Reconstructs the model through the closed loop, verifies the emitted steps
+    end-to-end against Onshape's mass-properties, and writes the templates.steps."""
+    if not argv:
+        print(_cli.__doc__)
+        return 2
+    from onshape.client import Onshape, parse_url
+    url = argv[0]
+    out = argv[argv.index("--out") + 1] if "--out" in argv else None
+    name = argv[argv.index("--name") + 1] if "--name" in argv else None
+
+    api = Onshape()
+    ps = parse_url(url)
+    steps, report = reconstruct(api, ps)
+    matched = sum(1 for r in report if r[4])
+    print(f"\nfeatures matched: {matched}/{len(report)}   steps: {len(steps)}")
+
+    verified, deltas = None, None
+    if steps:
+        from onshape.verify import run_steps_guarded, fetch_ground_truth, compare, Geometry
+        try:
+            props = run_steps_guarded(steps, timeout=90)
+            res = compare(Geometry.from_mcp_props(props), fetch_ground_truth(ps, api))
+            verified, deltas = res.ok, res.deltas
+            print(f"end-to-end verified: {res.ok} | {res.reason}")
+        except Exception as e:  # noqa: BLE001
+            verified = False
+            print(f"end-to-end verify failed: {str(e)[:160]}")
+
+    if out:
+        record = {
+            "model": name, "url": url, "verified": verified, "verify": deltas,
+            "features_total": len(report), "features_matched": matched,
+            "n_steps": len(steps), "steps": steps,
+            "report": [{"index": i, "type": t, "name": n, "how": lbl, "exact": ex}
+                       for (i, t, n, lbl, ex) in report],
+        }
+        json.dump(record, open(out, "w"), indent=1)
+        print(f"wrote {out}")
+    return 0 if verified in (True, None) else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(_cli(sys.argv[1:]))
