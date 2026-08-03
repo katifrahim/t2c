@@ -321,47 +321,87 @@ def profile_variants(sketch_profiles: list[ir.Profile]) -> list[tuple[str, list[
     return out
 
 
+def _dist_variants(depth: float | None):
+    """(label, distance, symmetric) trials for a known magnitude — the oracle picks the
+    real sign / symmetry, so no direction convention is hand-coded."""
+    if not depth:
+        return []
+    m = abs(depth)
+    return [(f"+{m}", m, False), (f"-{m}", -m, False), (f"±{m}", m, True)]
+
+
+def _ex(dist: float, sym: bool) -> dict:
+    return {"method": "extrude", "params": {"until": dist, "combine": False, "both": sym}}
+
+
+def _op_candidates(engine: Engine, tool_payloads: list[dict], tool: str, op: str,
+                   base_live: list[str], prefix: str) -> list[Candidate]:
+    """Given payloads that build a `tool` solid, enumerate how it joins the world:
+    new body / add-separate / merge-into-each / cut-or-intersect-each / cut-all. The
+    oracle selects which actually happened."""
+    if op == "new" or not base_live:
+        return [Candidate(tool_payloads, base_live + [tool], f"{prefix}|new")]
+    cands: list[Candidate] = []
+    if op == "add":                      # ADD may stay a separate body
+        cands.append(Candidate(tool_payloads, base_live + [tool], f"{prefix}|add-sep"))
+    meth = {"add": "union", "cut": "cut", "intersect": "intersect"}[op]
+    for ti, target in enumerate(base_live):    # ...or combine into an existing body
+        res = engine.name()
+        boolean = {"operations": [{"method": meth, "args": [{"_ref": tool}]}],
+                   "start_from": target, "store_as": res}
+        cands.append(Candidate(tool_payloads + [boolean],
+                               [res if x == target else x for x in base_live],
+                               f"{prefix}|{op}->{ti}"))
+    if op in ("cut", "intersect") and len(base_live) > 1:
+        # a REMOVE spanning several bodies (patterned holes): apply to EVERY body.
+        payloads, new_live = list(tool_payloads), []
+        for target in base_live:
+            res = engine.name()
+            payloads.append({"operations": [{"method": meth, "args": [{"_ref": tool}]}],
+                             "start_from": target, "store_as": res})
+            new_live.append(res)
+        cands.append(Candidate(payloads, new_live, f"{prefix}|{op}-all"))
+    return cands
+
+
 def extrude_candidates(engine: Engine, plane: ir.Plane, profiles: list[ir.Profile],
                        depth: float | None, op: str, base_live: list[str]) -> list[Candidate]:
-    """Enumerate {region-set} x {distance ±, symmetric} x {target body, for add/cut}.
-    depth may be None (unknown) -> the sign/magnitude falls to search over caps later;
-    here we search sign when a magnitude is known."""
+    """Flat path: all loops drawn on one workplane (even-odd holes) x distance x op.
+    Fine for a disc, a single annulus, or disjoint regions; the per-region path handles
+    the cases even-odd can't (several nested rings)."""
     init = _plane_init(plane)
-    mags = [depth] if depth else []
-    dists: list[tuple[str, float, bool]] = []
-    for m in mags:
-        dists.append((f"+{m}", abs(m), False))
-        dists.append((f"-{m}", -abs(m), False))
-        dists.append((f"±{m}", abs(m), True))  # symmetric
     cands: list[Candidate] = []
     for pname, profs in profile_variants(profiles):
         prof_ops = _profile_ops(profs)
-        for dname, dist, sym in dists:
-            ex = {"method": "extrude", "params": {"until": dist, "combine": False, "both": sym}}
+        for dname, dist, sym in _dist_variants(depth):
             tool = engine.name()
-            make = {"operations": prof_ops + [ex], "init_params": init, "store_as": tool}
-            if op == "new" or not base_live:
-                cands.append(Candidate([make], base_live + [tool], f"{pname}|{dname}|new"))
-                continue
-            if op == "add":  # ADD may stay a separate body — let the oracle decide
-                cands.append(Candidate([make], base_live + [tool], f"{pname}|{dname}|add-sep"))
-            meth = {"add": "union", "cut": "cut", "intersect": "intersect"}[op]
-            for ti, target in enumerate(base_live):  # ...or merge into an existing body
-                res = engine.name()
-                boolean = {"operations": [{"method": meth, "args": [{"_ref": tool}]}],
-                           "start_from": target, "store_as": res}
-                new_live = [res if x == target else x for x in base_live]
-                cands.append(Candidate([make, boolean], new_live, f"{pname}|{dname}|{op}->{ti}"))
-            if op in ("cut", "intersect") and len(base_live) > 1:
-                # a REMOVE spanning several bodies (patterned holes): cut the one tool
-                # from EVERY body — non-intersecting bodies are unchanged (a no-op).
-                payloads, new_live = [make], []
-                for target in base_live:
-                    res = engine.name()
-                    payloads.append({"operations": [{"method": meth, "args": [{"_ref": tool}]}],
-                                     "start_from": target, "store_as": res})
-                    new_live.append(res)
-                cands.append(Candidate(payloads, new_live, f"{pname}|{dname}|{op}-all"))
+            make = {"operations": prof_ops + [_ex(dist, sym)], "init_params": init, "store_as": tool}
+            cands += _op_candidates(engine, [make], tool, op, base_live, f"{pname}|{dname}")
+    return cands
+
+
+def region_extrude_candidates(engine: Engine, plane: ir.Plane, regions: list, depth: float | None,
+                              op: str, base_live: list[str]) -> list[Candidate]:
+    """Per-region path: extrude EACH cap-face region as its own solid (even-odd within
+    the region -> its own holes), union them into one tool, then apply the op. Robust
+    for multi-region extrudes (e.g. concentric rings) that a flat even-odd corrupts.
+    `regions` is caps_to_regions output: list of regions, each a list of loops."""
+    if len(regions) < 2:
+        return []                        # single region is already covered by the flat path
+    init = _plane_init(plane)
+    cands: list[Candidate] = []
+    for dname, dist, sym in _dist_variants(depth):
+        payloads, solids = [], []
+        for loops in regions:
+            profs = [ir.Profile(loop) for loop in loops]
+            rs = engine.name()
+            payloads.append({"operations": _profile_ops(profs) + [_ex(dist, sym)],
+                             "init_params": init, "store_as": rs})
+            solids.append(rs)
+        tool = engine.name()
+        payloads.append({"operations": [{"method": "union", "args": [{"_ref": s}]} for s in solids[1:]],
+                         "start_from": solids[0], "store_as": tool})
+        cands += _op_candidates(engine, payloads, tool, op, base_live, f"regions[{len(regions)}]|{dname}")
     return cands
 
 
@@ -456,8 +496,8 @@ def reconstruct(api, ps, verbose: bool = True, dump: set | None = None):
     No feature's conventions are hand-decided: every feature offers candidates and the
     oracle picks. A feature that no candidate matches is flagged (later: B-rep fallback)."""
     from onshape.normalize import (_msg, _params, _enum, _sketch_profiles, caps_to_profiles,
-                                   _cap_distance, parse_length_mm, _parse_angle_deg,
-                                   _extrude_op, _BOOL_OP)
+                                   caps_to_regions, _cap_distance, parse_length_mm,
+                                   _parse_angle_deg, _extrude_op, _BOOL_OP)
     from onshape.extract import resolve_extrude_caps, resolve_created_faces
     from onshape.oracle import body_states
 
@@ -508,6 +548,10 @@ def reconstruct(api, ps, verbose: bool = True, dump: set | None = None):
             for _src, profs in sources:
                 if profs:
                     cands += extrude_candidates(eng, plane, profs, depth, op.op, eng.live)
+            # per-region path (robust for multi-region / nested-ring extrudes)
+            if fid in caps and matrix:
+                regions = caps_to_regions(caps[fid], matrix)
+                cands += region_extrude_candidates(eng, plane, regions, depth, op.op, eng.live)
         elif ft == "circularPattern":
             P = _params(f)
             count = parse_length_mm((P.get("instanceCount") or {}).get("expression"))

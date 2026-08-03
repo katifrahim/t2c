@@ -187,6 +187,37 @@ def _profile_sig(prof: ir.Profile):
     return tuple(sorted(pts))
 
 
+def caps_to_regions(faces: list[dict], matrix: list[float]) -> list[list[list["ir.Curve"]]]:
+    """Rollback cap faces -> exact regions GROUPED BY FACE. Returns a list of regions;
+    each region is a list of loops (its outer boundary + hole loops); each loop is a list
+    of ir.Curve. One planar cap face == one region. Emitting each region as its own
+    extrude and unioning them is robust where a flat even-odd over the loops of SEVERAL
+    regions breaks (e.g. two concentric rings -> 4 nested circles produces garbage)."""
+    ndir = (matrix[2], matrix[6], matrix[10])
+    regions: list[list[list[ir.Curve]]] = []
+    seen = set()
+    for face in faces:
+        n = face.get("n", [0, 0, 0])
+        if abs(n[0] * ndir[0] + n[1] * ndir[1] + n[2] * ndir[2]) < 0.9:
+            continue  # side wall, not a cap
+        circles, segs = [], []
+        for edge in face.get("edges", []):
+            if len(edge) < 3:
+                continue
+            c = _edge_to_curve_2d([_project_2d(p, matrix) for p in edge])
+            (circles if c.kind == "circle" else segs).append(c)
+        loops = [loop for loop in _assemble_loops(segs)] + [[c] for c in circles]
+        loops = [loop for loop in loops if loop]
+        if not loops:
+            continue
+        sig = frozenset(_profile_sig(ir.Profile(loop)) for loop in loops)
+        if sig in seen:            # top and bottom caps share the same 2D region
+            continue
+        seen.add(sig)
+        regions.append(loops)
+    return regions
+
+
 def caps_to_profiles(faces: list[dict], matrix: list[float]) -> list[ir.Profile]:
     """Rollback-resolved cap faces -> exact 2D regions (outer loops + holes),
     deduplicated across the start/end caps."""

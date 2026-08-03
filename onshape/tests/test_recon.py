@@ -61,6 +61,27 @@ def test_profile_variants_annulus_offers_all_and_each():
     assert "region[0]" in labels and "region[1]" in labels
 
 
+def _circle_edge(r):
+    # a closed boundary edge sampled at params 0/0.5/1 (p0==p1) -> classified as a circle
+    return [[r, 0, 0], [-r, 0, 0], [r, 0, 0]]
+
+
+def test_caps_to_regions_groups_loops_by_face():
+    from onshape.normalize import caps_to_regions
+    identity = [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1]
+    # two annular cap faces (two concentric rings): each face carries its own 2 circles
+    faces = [
+        {"n": [0, 0, 1], "edges": [_circle_edge(2.45), _circle_edge(3.5)]},
+        {"n": [0, 0, 1], "edges": [_circle_edge(7.0), _circle_edge(7.75)]},
+    ]
+    regions = caps_to_regions(faces, identity)
+    assert len(regions) == 2                 # grouped by face, not flattened to 4 circles
+    assert all(len(loops) == 2 for loops in regions)   # each region = outer + hole loop
+    # a side wall (normal perpendicular to extrude dir) is ignored
+    assert caps_to_regions(faces + [{"n": [1, 0, 0], "edges": [_circle_edge(1.0)]}],
+                           identity) == regions
+
+
 def test_extrude_candidates_search_space():
     # a NEW extrude on an empty world: region variants x sign/symmetric, all 'new'
     eng = Engine()
