@@ -366,25 +366,27 @@ def extrude_candidates(engine: Engine, plane: ir.Plane, profiles: list[ir.Profil
 
 
 def pattern_candidates(engine: Engine, count: int, angle: float, equal_space: bool,
-                       axis_o: list[float], axis_d: list[float],
+                       axes: list[tuple[list[float], list[float]]],
                        base_live: list[str]) -> list[Candidate]:
-    """Circular pattern: rotate-copy a source body into `count` instances. We don't
-    hand-pick the source — every live body is offered and the oracle selects the one
-    whose copies land where Onshape's do (handles the 'which body gets patterned')."""
+    """Circular pattern: rotate-copy a source body into `count` instances. Neither the
+    source body NOR the axis is hand-picked — every (live body, candidate axis) pair is
+    offered and the oracle selects the combination whose copies land where Onshape's do.
+    `axes` is a small set of (origin, direction) covering the common cases (principal
+    directions through the origin / the pattern's own centre)."""
     k = max(int(count), 1)
     step = (angle / count) if equal_space else angle
-    a0 = list(axis_o)
-    a1 = [axis_o[0] + axis_d[0], axis_o[1] + axis_d[1], axis_o[2] + axis_d[2]]
     cands: list[Candidate] = []
-    for si, src in enumerate(base_live):
-        payloads, new = [], []
-        for j in range(1, k):
-            copy = engine.name()
-            payloads.append({"operations": [{"method": "rotate", "args": [a0, a1, j * step]}],
-                             "start_from": src, "store_as": copy})
-            new.append(copy)
-        if payloads:
-            cands.append(Candidate(payloads, base_live + new, f"pattern src{si} x{k}"))
+    for ai, (a0, ad) in enumerate(axes):
+        a1 = [a0[0] + ad[0], a0[1] + ad[1], a0[2] + ad[2]]
+        for si, src in enumerate(base_live):
+            payloads, new = [], []
+            for j in range(1, k):
+                copy = engine.name()
+                payloads.append({"operations": [{"method": "rotate", "args": [a0, a1, j * step]}],
+                                 "start_from": src, "store_as": copy})
+                new.append(copy)
+            if payloads:
+                cands.append(Candidate(payloads, base_live + new, f"pattern src{si} axis{ai} x{k}"))
     return cands
 
 
@@ -448,7 +450,7 @@ def pick(engine: Engine, cands: list[Candidate], target: State,
 
 
 # --- the full closed-loop driver -------------------------------------------------
-def reconstruct(api, ps, verbose: bool = True):
+def reconstruct(api, ps, verbose: bool = True, dump: set | None = None):
     """Reconstruct a whole Part Studio feature-by-feature, each verified against the
     oracle. Returns (steps, report) where report[i] = (index, type, name, label, exact).
     No feature's conventions are hand-decided: every feature offers candidates and the
@@ -512,8 +514,16 @@ def reconstruct(api, ps, verbose: bool = True):
             angle = _parse_angle_deg((P.get("angle") or {}).get("expression"))
             eq = bool((P.get("equalSpace") or {}).get("value", True))
             if count and angle is not None:
-                cands = pattern_candidates(eng, int(round(count)), angle, eq,
-                                           [0, 0, 0], [0, 0, 1], eng.live)
+                # Candidate axes: principal directions through the origin and through the
+                # pattern's own centre (mean of the resulting bodies' centroids lies ON a
+                # circular pattern's axis). The oracle selects the real one.
+                pts = [[0.0, 0.0, 0.0]]
+                if tgt and tgt.bodies:
+                    cs = [b.centroid for b in tgt.bodies]
+                    pts.append([sum(c[k] for c in cs) / len(cs) for k in range(3)])
+                axes = [(o, d) for o in pts
+                        for d in ([1, 0, 0], [0, 1, 0], [0, 0, 1])]
+                cands = pattern_candidates(eng, int(round(count)), angle, eq, axes, eng.live)
         elif ft == "booleanBodies":
             bop = _BOOL_OP.get(_enum(_params(f).get("operationType")), "union")
             cands = boolean_candidates(eng, bop, eng.live)
@@ -531,6 +541,16 @@ def reconstruct(api, ps, verbose: bool = True):
             if points and amt:
                 cands = round_candidates(eng, ft, points, amt, eng.live)
 
+        if dump and i in dump and cands:
+            print(f"    [dump f{i}] oracle target: nB={len(tgt.bodies) if tgt else '?'} "
+                  f"totV={tgt.total_volume if tgt else '?'}")
+            for c in cands:
+                st, _ = eng.try_candidate(c)
+                if st is None:
+                    print(f"      {c.label:32s} -> FAIL/reject")
+                else:
+                    print(f"      {c.label:32s} -> nB={len(st.bodies)} totV={st.total_volume:.2f}"
+                          + ("  <-- MATCH" if (tgt and st.matches(tgt)) else ""))
         win, exact = pick(eng, cands, tgt) if (cands and tgt is not None) else (None, False)
         if win:
             eng.commit(win)
