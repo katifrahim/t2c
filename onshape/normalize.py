@@ -182,6 +182,8 @@ def _profile_sig(prof: ir.Profile):
         for k in ("start", "end", "center", "mid"):
             if k in c.data:
                 pts.append((round(c.data[k][0], 3), round(c.data[k][1], 3)))
+        if "radius" in c.data:  # concentric circles share a center; radius separates
+            pts.append((round(c.data["radius"], 3), 0.0))  # (else an annulus dedups to a disc)
     return tuple(sorted(pts))
 
 
