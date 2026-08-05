@@ -14,6 +14,7 @@ export const MODELS = [
   { id: "xiaomi/mimo-v2.5", label: "Xiaomi Mimo V2.5 (Vision)", context: 1048576, vision: true }, // Ctx window: 1m toks
   { id: "openai/gpt-5.6-luna-pro", label: "GPT 5.6 Luna (Vision)", context: 1050000, vision: true }, // Ctx window: 1M
   { id: "qwen/qwen3.8-max", label: "Qwen 3.8 Max (Vision)", reasoning: "high", context: 262144, vision: true }, // Ctx window: 1M
+  { id: "x-ai/grok-4.5", label: "Grok 4.5 (Vision)", context: 262144, vision: true }, // Ctx window: 500K
 ];
 
 // Default: DeepSeek V4 Flash — cheap and a 1M-token context so long/complex
@@ -30,6 +31,7 @@ export const MODEL_PRICING = {
   "xiaomi/mimo-v2.5": { input: 0.14e-6, output: 0.28e-6 },
   "openai/gpt-5.6-luna-pro": { input: 1e-6, output: 6e-6 },
   "qwen/qwen3.8-max": { input: 2e-6, output: 6e-6 },
+  "x-ai/grok-4.5": { input: 2e-6, output: 6e-6 },
 };
 
 // 1 credit = $0.001, so $2.50 of usage → 2500 credits.
