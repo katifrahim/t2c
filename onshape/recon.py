@@ -526,6 +526,30 @@ def pattern_candidates(engine: Engine, count: int, angle: float, equal_space: bo
     return cands
 
 
+def mirror_candidates(engine: Engine, planes: list[tuple[list[float], list[float]]],
+                      base_live: list[str]) -> list[Candidate]:
+    """Mirror a source body across a candidate plane. Neither the source nor the mirror
+    plane is hand-picked — every (body, plane) pair is offered, in both `separate` (the
+    mirror image is a new body) and `merge` (unioned back into the source) forms, and the
+    oracle selects. `planes` is (normal, base_point) world-space planes (principal planes
+    through the origin and through the resulting bodies' centroid, which lies on the plane
+    of symmetry)."""
+    cands: list[Candidate] = []
+    for pi, (normal, base) in enumerate(planes):
+        for si, src in enumerate(base_live):
+            copy = engine.name()
+            make = {"operations": [{"method": "mirror", "args": [list(normal), list(base), False]}],
+                    "start_from": src, "store_as": copy}
+            cands.append(Candidate([make], base_live + [copy], f"mirror src{si} plane{pi} sep"))
+            res = engine.name()
+            merge = {"operations": [{"method": "union", "args": [{"_ref": copy}]}],
+                     "start_from": src, "store_as": res}
+            cands.append(Candidate([make, merge],
+                                   [res if x == src else x for x in base_live],
+                                   f"mirror src{si} plane{pi} merge"))
+    return cands
+
+
 def boolean_candidates(engine: Engine, op: str, base_live: list[str]) -> list[Candidate]:
     """Boolean of multiple bodies. Union-all is the common case (washer merges 5->1);
     for cut/intersect we offer base-vs-rest. The oracle confirms operand grouping."""
@@ -751,6 +775,17 @@ def reconstruct(api, ps, verbose: bool = True, dump: set | None = None,
                 axes = [((0, 0, 0), (0, 1, 0)), ((0, 0, 0), (1, 0, 0)),
                         ((cx, cy, 0), (cx, cy + 1, 0)), ((cx, cy, 0), (cx + 1, cy, 0))]
                 cands = revolve_candidates(eng, plane, profs, angle, full, axes, op, eng.live)
+        elif ft == "mirror":
+            # The mirror plane is an opaque reference; search the principal planes through
+            # the origin AND through the resulting bodies' centroid (which lies ON the plane
+            # of symmetry). The oracle selects the plane + source that reproduce the copy.
+            normals = [[1, 0, 0], [0, 1, 0], [0, 0, 1]]
+            planes = [(n, [0, 0, 0]) for n in normals]
+            if tgt and tgt.bodies:
+                cs = [b.centroid for b in tgt.bodies]
+                c = [sum(x[k] for x in cs) / len(cs) for k in range(3)]
+                planes += [(n, c) for n in normals]
+            cands = mirror_candidates(eng, planes, eng.live)
         elif ft == "circularPattern":
             P = _params(f)
             count = parse_length_mm((P.get("instanceCount") or {}).get("expression"))

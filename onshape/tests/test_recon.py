@@ -113,3 +113,26 @@ def test_revolve_candidates_reconstructs_a_torus():
     win, exact = pick(eng, cands, target)
     assert exact and win is not None
     assert "axis1" in win.label            # the Y-axis candidate (index 1) won
+
+
+def test_mirror_candidates_reconstructs_a_mirror():
+    # Self-validating: a box at x∈[3,7] mirrored across the YZ plane must yield two boxes;
+    # the search picks the YZ plane (normal (1,0,0) through origin) over XZ/XY decoys.
+    import cadquery as cq
+    from onshape.recon import (Engine, mirror_candidates, pick, fingerprint, Candidate,
+                               _plane_init)
+    from onshape.oracle import State
+    eng = Engine()
+    init = _plane_init(ir.Plane(name="XY"))
+    base = Candidate([{"operations": [{"method": "center", "args": [5, 0]},
+                                      {"method": "box", "args": [4, 2, 2]}],
+                       "init_params": init, "store_as": "b0"}], ["b0"], "base")
+    eng.commit(base)                                     # engine now holds the box at x∈[3,7]
+    orig = cq.Workplane("XY").center(5, 0).box(4, 2, 2)
+    mir = cq.Workplane("XY").center(-5, 0).box(4, 2, 2)
+    target = State(bodies=[fingerprint(orig), fingerprint(mir)])   # both boxes
+    planes = [([1, 0, 0], [0, 0, 0]), ([0, 1, 0], [0, 0, 0]), ([0, 0, 1], [0, 0, 0])]
+    cands = mirror_candidates(eng, planes, eng.live)
+    win, exact = pick(eng, cands, target)
+    assert exact and win is not None
+    assert "plane0" in win.label and "sep" in win.label   # YZ plane, separate-body mirror
