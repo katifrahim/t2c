@@ -1,90 +1,100 @@
 # onshape → verified text2cad templates
 
-Mines **natively-built** Onshape Part Studios and transpiles their parametric design
+Mines **natively-built** Onshape Part Studios and reconstructs their parametric design
 history into MCP tool-call sequences (`templates.steps`) that the text2cad agent can
-replay/adapt. Every emitted template is **geometrically verified** against Onshape's
-own mass-properties before it is kept — unverifiable models are flagged, never shipped.
+replay/adapt. Every reconstruction is **geometrically verified against Onshape's own
+geometry at every feature** — nothing is kept that doesn't provably match.
 
-Branch: `feat/onshape`. Runs in the `mcp_server` venv (CadQuery 2.7.0). Onshape API
-keys from `ONSHAPE_ACCESS_KEY/SECRET_KEY`, falling back to `../../onshape-exp/.env`.
+Branch: `feat/onshape`. Runs in the `mcp_server` venv (CadQuery 2.7.0). Onshape API keys
+from `ONSHAPE_ACCESS_KEY/SECRET_KEY`, falling back to `../../onshape-exp/.env`.
 
 ```bash
-mcp_server/.venv/bin/python -m onshape.classify "<url>"   # native? (exit 0/1)
-mcp_server/.venv/bin/python -m onshape.pipeline  "<url>"  # transpile + verify
+# reconstruct a model, verify end-to-end, write the steps:
+mcp_server/.venv/bin/python -m onshape.recon "<part-studio-url>" --name NAME --out onshape/out/NAME_recon.json
 mcp_server/.venv/bin/python -m pytest onshape/tests
 ```
 
-## Pipeline
+> **New here / resuming? Read [`HANDOFF.md`](HANDOFF.md) first.** It has the full
+> architecture, how to add feature types, the model URLs, and what's next.
+
+## Architecture: closed-loop, oracle-driven reconstruction
+
+The old approach (still in `normalize.py`/`emit.py`/`pipeline.py`, now retiring) hand-coded
+every feature's conventions and verified once at the end — so every wrong convention was a
+manual debugging session. It could not scale to L4 (169 features). The **closed loop**
+(`oracle.py` + `recon.py`) replaces it:
+
+For each feature, in tree order:
+1. **Generate candidates** — a small set of op-sequences enumerating the *genuinely
+   ambiguous* choices (extrude direction ±, which loops form a region, which body an op
+   targets, which sketch plane, which edges a fillet hits, the exact amount).
+2. **Execute each** through the real `t2c_mcp` engine in a crash/hang-isolated worker.
+3. **The oracle picks** — keep the candidate whose resulting solids match Onshape's own
+   geometry at that feature (per-body volume / area / bbox / centroid).
+
+Conventions are **discovered per feature, not encoded**. An error is caught at the feature
+that causes it. Coverage gaps fail loudly (flagged, never a silent wrong answer).
 
 ```
-client.py    Onshape REST auth + typed calls; 429 backoff, throttle, disk cache
-             (incl. /featurescript POSTs) so reconstruction iterates OFFLINE
-classify.py  native vs imported (import-family feature types; NOT the imports field)
-extract.py   FeatureScript resolution (see below)
-ir.py        engine-neutral IR (Plane/Profile/Curve/Extrude/Revolve/Fillet/Chamfer/
-             CircularPattern/Boolean/Model; Model.body_flow)
-normalize.py Onshape features -> IR
-emit.py      IR -> {step,toolName,input} steps (the templates.steps format)
-verify.py    execute steps via the REAL t2c_mcp engine in a spawn subprocess (hang-proof)
-             + compare volume/area(=Onshape "periphery")/bbox, converting SI->mm
-pipeline.py  classify -> extract -> normalize -> emit -> verify
+oracle.py    Onshape's exact geometry at every rollback: per-body {volume, area,
+             centroid, bbox}. Body.matches / State.matches are the accept test.
+recon.py     the engine + translators + driver:
+               Engine / WorkerEngine  — run candidates; WorkerEngine isolates each
+                                        trial in a persistent child (kill+respawn+replay
+                                        committed steps on OCCT hang)
+               *_candidates(...)       — per-feature translators (extrude, pattern,
+                                        boolean, fillet/chamfer); each yields Candidates
+               reconstruct(api, ps)    — the feature loop + pick()  (CLI: __main__)
+extract.py   rollback FeatureScript: resolve_extrude_caps (per-extrude cap faces),
+             resolve_modifier_faces (fillet/chamfer created faces at THEIR rollback),
+             resolve_body_flow (legacy)
+normalize.py sketch geometry + caps_to_profiles / caps_to_regions (loop grouping)
+verify.py    run steps through real t2c_mcp in a spawn subprocess; compare to Onshape
+client.py    Onshape REST: auth, 429 backoff (fails fast on daily cap), throttle, disk
+             cache of GETs AND /featurescript POSTs (incl. ?rollbackBarIndex=N)
 ```
 
-## The key technique: rollback evaluation
+## Key techniques
 
-Onshape's `/featurescript?rollbackBarIndex=N` evaluates the model at feature N's
-checkpoint — **before later features fragment its geometry**. This dissolved the
-opaque-`qCompressed`-query wall (region/body references don't resolve at the final
-state; regions are consumed, faces fragmented). `extract.py` uses it for:
+- **Rollback evaluation** — `/featurescript?rollbackBarIndex=N` evaluates the model at
+  feature N's checkpoint, before later features fragment its geometry. Dissolves the
+  opaque-`qCompressed` wall. Used for the oracle, cap-face regions, and modifier edges.
+- **Per-region extrudes** (`caps_to_regions` + `region_extrude_candidates`) — one planar
+  cap face = one region (outer + holes); extrude each region on its own workplane and
+  union. Robust where a flat even-odd over several regions' loops corrupts (nested rings).
+- **Robust edge selection** (`round_candidates` + `_edge_selector`) — `NearestToPoint`
+  picks by centroid, so concentric circles tie. Query the live bodies' real edges, map
+  fingerprint points to nearby edges by *true* distance, and isolate a circle with a
+  `SubtractSelector` of two bbox `BoxSelector`s (radius band at its plane).
+- **Candidate sketch planes** — when an extrude's profile is a `qCompressed` query, the
+  plane link is unreliable; offer any sketch whose plane is parallel to and a cap-or-
+  cap±depth offset from the caps, and let the oracle pick the plane+direction that abuts.
+- **Amount perturbation** — offer a chamfer/fillet's exact value AND ×0.9999; OCCT rejects
+  an op that exactly consumes a feature (1mm on a 1mm wall) where Onshape's kernel does not.
 
-- **Per-extrude regions + distance** (`resolve_extrude_caps`): at the extrude's rollback,
-  read its created planar cap faces; sample each boundary edge at params 0/0.5/1 (3
-  points classify any line/arc/circle); keep caps whose normal ∥ extrude dir; project to
-  the sketch 2D frame; assemble loops. Solves **multi-region sketches** and **up-to-*
-  terminations** (distance = far cap's normal-offset). Also incidentally handles engraved
-  text (letter outlines become regions).
-- **Fillet/chamfer edge points** (`resolve_created_faces`): midpoint of each created
-  face's **longest boundary edge** (a tangent line for straight edges, a boundary circle
-  for circular ones). NOT the centroid — that's on the axis for surfaces of revolution.
-- **Cross-rollback body-matcher** (`resolve_body_flow` + `emit._Bodies`): solid centroids
-  per feature; track live bodies as [onshape_centroid, mcp_name]; cut applies to every
-  body, pattern finds its source by rotation-matching new centroids, ADD merges into the
-  touched body; re-key centroids after each feature.
+## Coverage (all verify end-to-end)
 
-Selection is emitted as `NearestToPointSelector` / `SumSelector` on those 3D points, so
-it never depends on either engine's opaque topological ids.
+| model | features | steps | note |
+|-------|----------|-------|------|
+| washer | 12/12 | 22 | centered-annulus base, ×3 patterns, boolean, fillet, cut |
+| can_jig | 2/2 | 1 | sketch + extrude |
+| bearing_press | 6/6 | 6 | multi-region shared sketch |
+| backstop | 8/8 | 7 | |
+| bearing_presser | 8/8 | 11 | concentric-circle chamfers + 1mm-on-1mm (perturbed) |
 
-## Coverage
+**KPI target: L4 "Speed_toolhead"** (169 features: 59 extrude, 42 sketch, 18 fillet, 14
+chamfer, 13 moveFace, 7 mirror, 5 cPlane, 3 sweep, 2 revolve/replaceFace, shell, hole,
+splitPart, lighten). Adding a feature type = a new `*_candidates` translator; the oracle
+keeps it honest. See `HANDOFF.md` → "What's next".
 
-| model | result |
-|-------|--------|
-| can jig | ✅ verified, volume rel 3.8e-16 |
-| bearing_press (19+10-region shared sketch, engraved text, fillet) | ✅ verified, rel 5.8e-7 |
-| bearing_presser | ❌ 1mm chamfer on a 1mm-tall feature (OCCT geometric limit) |
-| backstop | ❌ non-planar up-to surface (6% flat approximation) |
-| **washer (KPI)** | ❌ fully resolves, but OCCT **hangs** on a multi-body boolean |
+## Gotchas
 
-## Next task: washer OCCT robustness
-
-The washer's every feature resolves and the body-matcher engages correctly (ring +
-ADD-tab → pattern1 ×3 → cut all 3 → pattern2 → union 5 → fillet → cut). But a multi-body
-boolean **hangs in OCCT**. Hypothesis: patterning the **centered annulus** creates
-coincident ring copies that CadQuery/OCCT can't union cleanly. Direction: detect
-symmetric/coincident pattern copies (union with `glue`, or skip coincident copies), and
-make booleans/fillets resilient (`clean`/tolerance, per-edge fallback). Iterate with
-`verify.run_steps_guarded(steps[:k])` to find the hanging step.
-
-Prereq to iterate offline: run the pipeline **once** so every rollback `/featurescript`
-call is cached — until 2026-08-01 these were silently NOT cached (the cache key check
-ignored the `?rollbackBarIndex=N` query string, now fixed in `client.py`), so each debug
-run re-hit the API and could exhaust the ~daily quota. The washer's rollback data still
-needs one clean fetch (key was rate-limited, `Retry-After` ~21h, when this was found).
-
-## Notes / gotchas
-
-- Onshape enforces a hard ~daily API cap; never burst (see the rate-limit memory). The
-  disk cache + `resolve_*` design let you iterate reconstruction logic fully offline
-  after one fetch.
-- `verify` runs steps in a spawn subprocess because OCCT hangs are uninterruptible from
-  Python (SIGALRM won't stop them).
-- The error message step index in `verify` is 0-based; emit labels are 1-based.
+- Onshape enforces a hard ~daily API cap; **never burst**. Cache + `resolve_*` let you
+  iterate reconstruction fully offline after one fetch. The cap is per-ACCOUNT (a second
+  key does not dodge it). Client now fails fast on a multi-hour `Retry-After`.
+- The reconstruction runs candidates through `workplane_api`; the CLI entry MUST be under
+  `if __name__ == "__main__"` (the worker uses spawn). Viewer tessellation is disabled in
+  the engine (it OOMs during search).
+- `verify`/worker run steps in a spawn subprocess because OCCT hangs are uninterruptible.
+- Do NOT touch production `mcp_server/src/t2c_mcp.py` for reconstruction robustness — it
+  belongs in the recon candidate search. (An in-engine fillet fallback was reverted.)
