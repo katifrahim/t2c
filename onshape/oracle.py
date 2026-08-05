@@ -53,10 +53,15 @@ class Body:
 
     def matches(self, other: "Body", *, vol_tol=1e-3, area_tol=2e-3, bbox_tol=0.05) -> bool:
         """True if two bodies are the same solid within tolerance (relative on
-        volume/area, absolute mm on the box)."""
+        volume/area, absolute mm on the box AND centroid). The centroid check
+        disambiguates placement — two solids can share volume/area/bbox yet sit in
+        different spots (e.g. a boss on the left vs the right of a symmetric base),
+        which would otherwise let a mis-placed candidate pass and corrupt later features."""
         def rel(a, b):
             return abs(a - b) / max(abs(b), 1e-9)
         if rel(self.volume, other.volume) > vol_tol or rel(self.area, other.area) > area_tol:
+            return False
+        if any(abs(a - b) > bbox_tol for a, b in zip(self.centroid, other.centroid)):
             return False
         return all(abs(a - b) <= bbox_tol
                    for a, b in zip(self.bbox_min + self.bbox_max,

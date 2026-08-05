@@ -145,3 +145,22 @@ def resolve_created_faces(api: Onshape, ps: PartStudio, feature_ids: list[str]) 
         raise  # a global stop, not a per-feature miss -- don't emit a broken model
     except Exception:  # noqa: BLE001
         return {}
+
+
+def resolve_modifier_faces(api: Onshape, ps: PartStudio, modifiers: list[tuple]) -> dict:
+    """Like resolve_created_faces but evaluates EACH modifier at its OWN rollback (the
+    index just after it), so its created faces are clean — not fragmented/moved by later
+    features (which corrupts the sampled edge points). `modifiers` is [(featureId, rb)]."""
+    out: dict = {}
+    for fid, rb in modifiers:
+        try:
+            res = api.call(f"{ps.path}/featurescript?rollbackBarIndex={rb}",
+                           {"script": _FS_CREATED % ('["%s"]' % fid), "queries": {}})
+            u = _unwrap(res.get("result", {})) or {}
+            if u.get(fid):
+                out[fid] = u[fid]
+        except RateLimited:
+            raise
+        except Exception:  # noqa: BLE001
+            continue
+    return out

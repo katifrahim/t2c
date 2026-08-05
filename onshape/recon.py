@@ -110,6 +110,18 @@ class Engine:
                 bodies.append(fp)
         return State(bodies=bodies)
 
+    def edges(self, names: list[str]) -> dict:
+        out = {}
+        for n in names:
+            wp = self.sess.state.get(n)
+            if wp is None:
+                continue
+            try:
+                out[n] = [_edge_info(e) for e in wp.val().Edges()]
+            except Exception:  # noqa: BLE001
+                out[n] = []
+        return out
+
     def _run_candidate(self, cand: "Candidate", record: bool):
         """Apply a candidate's payloads (skip-chaining if requested); return the applied
         payloads and the resulting live-body list. Raises on hard failure of a
@@ -163,6 +175,25 @@ def _child_apply(payload: dict):
         raise RuntimeError(r.get("error") or r.get("message") or "step failed")
 
 
+def _edge_info(e) -> dict:
+    """Geometry a robust edge selector needs: type, bbox, centroid, and sample points
+    along the edge (for true point-to-edge distance, unlike the centroid NearestToPoint
+    uses)."""
+    try:
+        gt = e.geomType()
+    except Exception:  # noqa: BLE001
+        gt = "OTHER"
+    bb, c = e.BoundingBox(), e.Center()
+    try:
+        pts = [e.positionAt(i / 8.0) for i in range(9)]
+        samples = [[p.x, p.y, p.z] for p in pts]
+    except Exception:  # noqa: BLE001
+        samples = [[c.x, c.y, c.z]]
+    return {"kind": "circle" if gt == "CIRCLE" else "other",
+            "bbox": [bb.xmin, bb.ymin, bb.zmin, bb.xmax, bb.ymax, bb.zmax],
+            "center": [c.x, c.y, c.z], "samples": samples}
+
+
 def _child_run(sess, cand: dict) -> list[str]:
     """Apply a candidate dict in the child; return resulting live names."""
     if not cand["skip_failures"]:
@@ -196,6 +227,17 @@ def _child_main(conn):
                 _child_apply(arg); conn.send(("ok", None))
             except Exception as e:  # noqa: BLE001
                 conn.send(("err", str(e)[:200]))
+        elif kind == "edges":  # geometry of each live body's edges (for edge selection)
+            res = {}
+            for n in (arg or []):
+                wp = sess.state.get(n)
+                if wp is None:
+                    continue
+                try:
+                    res[n] = [_edge_info(e) for e in wp.val().Edges()]
+                except Exception:  # noqa: BLE001
+                    res[n] = []
+            conn.send(("ok", res))
         elif kind == "try":  # trial on a snapshot; state rolled back after
             snap = (dict(sess.state), dict(sess.counters), sess.current)
             try:
@@ -248,6 +290,14 @@ class WorkerEngine:
         return {"payloads": cand.payloads, "skip_failures": cand.skip_failures,
                 "target": cand.target, "base_live": cand.base_live,
                 "live_after": cand.live_after}
+
+    def edges(self, names: list[str]) -> dict:
+        self._pconn.send(("edges", list(names)))
+        if not self._pconn.poll(self.timeout):
+            self._restart()
+            return {}
+        tag, val = self._pconn.recv()
+        return val if tag == "ok" else {}
 
     def try_candidate(self, cand: "Candidate"):
         self._pconn.send(("try", self._cand_dict(cand)))
@@ -442,32 +492,76 @@ def boolean_candidates(engine: Engine, op: str, base_live: list[str]) -> list[Ca
                       [res], f"{op}-all")]
 
 
-def round_candidates(engine: Engine, kind: str, points: list[list[float]], amount: float,
+def _edge_point_dist(einfo: dict, p: list[float]) -> float:
+    return min((s[0] - p[0])**2 + (s[1] - p[1])**2 + (s[2] - p[2])**2
+               for s in einfo["samples"]) ** 0.5
+
+
+def _edge_selector(einfo: dict) -> dict:
+    """A selector that robustly isolates ONE edge. A concentric circle can't be picked by
+    NearestToPoint (all concentric circles share the axis centroid), so a circle is
+    isolated by SubtractSelector of two bbox BoxSelectors — radius in (r-0.1, r+eps] at
+    its own plane. Non-circular edges use NearestToPoint on a mid sample."""
+    if einfo["kind"] != "circle":
+        return {"_type": "NearestToPointSelector", "pnt": einfo["samples"][len(einfo["samples"]) // 2]}
+    bb, c = einfo["bbox"], einfo["center"]
+    o0, o1, i0, i1 = [], [], [], []
+    for a in range(3):
+        ext, cen = (bb[a + 3] - bb[a]) / 2, c[a]
+        if ext > 0.2:                       # a wide axis of the circle's plane
+            o0.append(cen - ext - 0.02); o1.append(cen + ext + 0.02)
+            i0.append(cen - (ext - 0.1)); i1.append(cen + (ext - 0.1))
+        else:                               # the plane-normal axis (flat)
+            o0.append(cen - 0.05); o1.append(cen + 0.05)
+            i0.append(cen - 0.05); i1.append(cen + 0.05)
+    return {"_type": "SubtractSelector",
+            "left": {"_type": "BoxSelector", "point0": o0, "point1": o1, "boundingbox": True},
+            "right": {"_type": "BoxSelector", "point0": i0, "point1": i1, "boundingbox": True}}
+
+
+def round_candidates(engine, kind: str, points: list[list[float]], amount: float,
                      base_live: list[str]) -> list[Candidate]:
-    """fillet/chamfer: select target edges by 3D fingerprint (NearestToPoint), apply the
-    op. Two candidates PER target body — all-at-once, and per-edge-skipping (OCCT often
-    fails the combined pass on messy topology but succeeds edge-by-edge). skip_failures
-    lets the per-edge candidate drop only the edges OCCT rejects."""
-    from onshape.emit import _point_selector
+    """fillet/chamfer, made robust two ways the oracle then confirms:
+    - edge selection: query the live bodies' real edges, map each fingerprint point to a
+      few nearest edges (TRUE distance, not centroid), and isolate each with _edge_selector
+      (handles concentric circles). Search the combinations.
+    - amount: offer the exact value AND a hair-perturbed one (x0.9999) — OCCT rejects a
+      chamfer/fillet that exactly consumes a feature (e.g. 1mm on a 1mm wall) where
+      Onshape's kernel does not; the tiny perturbation dodges the degeneracy in tolerance.
+    Candidates come in all-at-once and per-edge-skipping forms."""
+    import itertools
     meth = "fillet" if kind == "fillet" else "chamfer"
+    edges_by_body = engine.edges(base_live)
+    amounts = [amount, amount * 0.9999]
     cands: list[Candidate] = []
     for ti, target in enumerate(base_live):
-        res = engine.name()
-        all_ops = [{"method": "edges", "args": [_point_selector(points)]},
-                   {"method": meth, "args": [amount]}]
-        cands.append(Candidate([{"operations": all_ops, "start_from": target, "store_as": res}],
-                               [res if x == target else x for x in base_live],
-                               f"{kind}-all->{ti}"))
-        # per-edge: each edge its own step (re-selected by point), chained; skip failures
-        payloads, cur = [], target
-        for pi, p in enumerate(points):
-            nxt = engine.name()
-            payloads.append({"operations": [
-                {"method": "edges", "args": [{"_type": "NearestToPointSelector", "pnt": p}]},
-                {"method": meth, "args": [amount]}], "start_from": cur, "store_as": nxt})
-            cur = nxt
-        cands.append(Candidate(payloads, [], f"{kind}-seq->{ti}",
-                               skip_failures=True, target=target, base_live=list(base_live)))
+        edges = edges_by_body.get(target, [])
+        if not edges:
+            continue
+        per_point = [sorted(range(len(edges)), key=lambda i: _edge_point_dist(edges[i], p))[:3]
+                     for p in points]
+        combos = list(itertools.product(*per_point))[:16]
+        for combo in combos:
+            chosen = list(dict.fromkeys(combo))          # dedup edge indices
+            sels = [_edge_selector(edges[i]) for i in chosen]
+            allsel = sels[0]
+            for s in sels[1:]:
+                allsel = {"_type": "SumSelector", "left": allsel, "right": s}
+            for amt in amounts:
+                res = engine.name()
+                cands.append(Candidate(
+                    [{"operations": [{"method": "edges", "args": [allsel]},
+                                     {"method": meth, "args": [amt]}],
+                      "start_from": target, "store_as": res}],
+                    [res if x == target else x for x in base_live],
+                    f"{kind}-all[{ti}]x{len(chosen)}@{amt:.4g}"))
+                payloads = []
+                for s in sels:
+                    nxt = engine.name()
+                    payloads.append({"operations": [{"method": "edges", "args": [s]},
+                                                    {"method": meth, "args": [amt]}], "store_as": nxt})
+                cands.append(Candidate(payloads, [], f"{kind}-seq[{ti}]x{len(chosen)}@{amt:.4g}",
+                                       skip_failures=True, target=target, base_live=list(base_live)))
     return cands
 
 
@@ -498,7 +592,7 @@ def reconstruct(api, ps, verbose: bool = True, dump: set | None = None):
     from onshape.normalize import (_msg, _params, _enum, _sketch_profiles, caps_to_profiles,
                                    caps_to_regions, _cap_distance, parse_length_mm,
                                    _parse_angle_deg, _extrude_op, _BOOL_OP)
-    from onshape.extract import resolve_extrude_caps, resolve_created_faces
+    from onshape.extract import resolve_extrude_caps, resolve_modifier_faces
     from onshape.oracle import body_states
 
     feats = api.features(ps).get("features", [])
@@ -509,9 +603,9 @@ def reconstruct(api, ps, verbose: bool = True, dump: set | None = None):
     extrudes = [(_msg(f)["featureId"], i + 1) for i, f in enumerate(feats)
                 if _msg(f).get("featureType") == "extrude" and not _msg(f).get("suppressed")]
     caps = resolve_extrude_caps(api, ps, extrudes)
-    mod_ids = [_msg(f)["featureId"] for f in feats
-               if _msg(f).get("featureType") in ("fillet", "chamfer") and not _msg(f).get("suppressed")]
-    edge_pts = resolve_created_faces(api, ps, mod_ids)
+    mods = [(_msg(f)["featureId"], i + 1) for i, f in enumerate(feats)
+            if _msg(f).get("featureType") in ("fillet", "chamfer") and not _msg(f).get("suppressed")]
+    edge_pts = resolve_modifier_faces(api, ps, mods)
 
     eng = WorkerEngine()
     last_sketch = None
@@ -534,24 +628,50 @@ def reconstruct(api, ps, verbose: bool = True, dump: set | None = None):
         elif ft == "extrude":
             op, _why = _extrude_op(f, sketch_ids, last_sketch)
             ref = op.profile_ref
-            matrix = (sk.get(ref) or {}).get("sketchMatrix")
-            plane = explicit_plane(matrix) if matrix else ir.Plane(name="XY")
-            depth = op.distance
-            sources: list[tuple[str, list]] = []
-            if ref in sk:
-                sources.append(("sk", _sketch_profiles(sk[ref])))
-            if fid in caps and matrix:
-                sources.append(("caps", caps_to_profiles(caps[fid], matrix)))
-                if depth is None:
-                    d = _cap_distance(caps[fid], matrix)
+            fcaps = caps.get(fid) or []
+            # Candidate sketch planes. The linked sketch is unreliable when the extrude's
+            # profile is an opaque qCompressed query (falls back to last_sketch, which can
+            # be the WRONG plane -> wrong extrude direction). So also offer any sketch whose
+            # plane COINCIDES with one of this extrude's cap faces (its true plane, found
+            # geometrically). The oracle then picks the plane+direction that actually abuts.
+            cand_sids: list[str] = [ref] if ref in sk else []
+            if fcaps:
+                cn = fcaps[0].get("n", [0, 0, 1])
+                cap_offs = [sum(face["edges"][0][0][k] * cn[k] for k in range(3))
+                            for face in fcaps if face.get("edges")]
+                # The sketch plane coincides with a cap OR sits a full depth from one (only
+                # the FAR cap is 'created' when an ADD merges its near face into the body).
+                accept = set(cap_offs)
+                if op.distance:
+                    for co in list(cap_offs):
+                        accept.add(co + abs(op.distance)); accept.add(co - abs(op.distance))
+                for sid, s in sk.items():
+                    sm = s.get("sketchMatrix")
+                    if not sm or sid in cand_sids:
+                        continue
+                    n = [sm[2], sm[6], sm[10]]
+                    if abs(sum(n[k] * cn[k] for k in range(3))) < 0.99:
+                        continue
+                    o = [sm[3] * 1e3, sm[7] * 1e3, sm[11] * 1e3]
+                    off = sum(o[k] * cn[k] for k in range(3))
+                    if any(abs(off - a) < 0.05 for a in accept):
+                        cand_sids.append(sid)
+            for sid in (cand_sids or [ref]):
+                matrix = (sk.get(sid) or {}).get("sketchMatrix")
+                plane = explicit_plane(matrix) if matrix else ir.Plane(name="XY")
+                depth = op.distance
+                if depth is None and fcaps and matrix:
+                    d = _cap_distance(fcaps, matrix)
                     depth = abs(d) if d else None
-            for _src, profs in sources:
-                if profs:
-                    cands += extrude_candidates(eng, plane, profs, depth, op.op, eng.live)
-            # per-region path (robust for multi-region / nested-ring extrudes)
-            if fid in caps and matrix:
-                regions = caps_to_regions(caps[fid], matrix)
-                cands += region_extrude_candidates(eng, plane, regions, depth, op.op, eng.live)
+                if sid in sk:
+                    profs = _sketch_profiles(sk[sid])
+                    if profs:
+                        cands += extrude_candidates(eng, plane, profs, depth, op.op, eng.live)
+                if fcaps and matrix:
+                    cands += extrude_candidates(eng, plane, caps_to_profiles(fcaps, matrix),
+                                                depth, op.op, eng.live)
+                    cands += region_extrude_candidates(eng, plane, caps_to_regions(fcaps, matrix),
+                                                       depth, op.op, eng.live)
         elif ft == "circularPattern":
             P = _params(f)
             count = parse_length_mm((P.get("instanceCount") or {}).get("expression"))
