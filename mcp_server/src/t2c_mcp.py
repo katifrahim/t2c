@@ -77,7 +77,7 @@ import cadquery as cq
 from cadquery import (
     Workplane, Sketch, Assembly,
     Vector, Plane, Location, Matrix,
-    Vertex, Edge, Wire, Face, Shell, Solid, Compound,
+    Vertex, Edge, Wire, Face, Shell, Solid, Compound, Shape,
     Color,
 )
 from cadquery.selectors import (
@@ -91,6 +91,87 @@ from cadquery.selectors import (
 )
 
 # =============================================================================
+# EXTENSION PLUGINS  (gear generators + mechanical-part library)
+# =============================================================================
+# Optional parametric-part plugins layered ON TOP of the core API and surfaced to
+# the model through the `extension_api` tool. One plugin is purely additive (it adds
+# a Workplane.gear() builder). The other ships a large mechanical-part library and,
+# as a side effect of import, monkeypatches ~40 core Shape methods. Only ONE of those
+# overrides misbehaves on this build's geometry kernel — Shape.copy:
+#   • the native copy rebuilds via self.__class__(...): fine for plain/gear geometry,
+#     but can't reconstruct the library's parts (they have custom constructors).
+#   • the library's copy (a serialize/deserialize deep-copy) handles its own parts,
+#     but corrupts complex gear geometry.
+# So we install a type-aware dispatcher that routes each shape to the copy that works
+# for it. With that in place both plugins coexist and core behaviour stays identical
+# to stock (verified: an ops battery is byte-for-byte the same with/without the load).
+
+_EXT_BASE_SHAPES = {Shape, Solid, Face, Wire, Edge, Vertex, Compound, Shell}
+_EXT_CATALOG: Dict[str, Dict[str, Any]] = {}   # part name -> {"cls": type, "family": str}
+EXT_AVAILABLE = False
+
+
+def _register_ext(cls: type, family: str) -> None:
+    _EXT_CATALOG[cls.__name__] = {"cls": cls, "family": family}
+
+
+def _scan_ext(module: Any, base: type, family: str, origin: str) -> None:
+    """Register every concrete public part class in `module` that subclasses `base`.
+    Introspection-driven so new library classes are picked up automatically."""
+    for name in dir(module):
+        if name.startswith("_"):
+            continue
+        obj = getattr(module, name)
+        if (isinstance(obj, type) and issubclass(obj, base) and obj is not base
+                and not inspect.isabstract(obj)
+                and (getattr(obj, "__module__", "") or "").startswith(origin)):
+            _register_ext(obj, family)
+
+
+def _load_extension_plugins() -> None:
+    """Import the plugins, install the copy dispatcher, and build the part catalog.
+    Guarded: if the plugins aren't installed the core server still runs normally."""
+    global EXT_AVAILABLE
+    _native_copy = Shape.copy
+    try:
+        import cq_warehouse.extensions          # noqa: F401  (import applies the monkeypatches)
+        import cq_warehouse.fastener as _fa
+        import cq_warehouse.bearing as _be
+        import cq_warehouse.thread as _th
+        import cq_warehouse.sprocket as _sp
+        import cq_warehouse.chain as _ch
+        import cq_warehouse.drafting as _dr
+        import cq_gears as _gears
+    except Exception as e:  # plugins are optional
+        print(f"[t2c] extension plugins unavailable: {e}", file=sys.stderr, flush=True)
+        return
+
+    _cqw_copy = Shape.copy                       # the library's deep-copy (post-import)
+
+    def _dispatch_copy(self, mesh: bool = False):
+        # base + gear geometry -> native copy; library custom-ctor parts -> library copy
+        return (_native_copy if type(self) in _EXT_BASE_SHAPES else _cqw_copy)(self, mesh)
+
+    for _c in _EXT_BASE_SHAPES:
+        _c.copy = _dispatch_copy
+
+    _GearBase = next(b for b in _gears.SpurGear.__mro__ if b.__name__ == "GearBase")
+    _scan_ext(_gears, _GearBase, "gear", "cq_gears")
+    for _base in (_fa.Screw, _fa.Nut, _fa.Washer):
+        _scan_ext(_fa, _base, "fastener", "cq_warehouse")
+    _scan_ext(_be, _be.Bearing, "bearing", "cq_warehouse")
+    # Thread classes (IsoThread, AcmeThread, …) subclass Solid directly, not a shared
+    # Thread base, so key off the module origin instead.
+    _scan_ext(_th, Shape, "thread", "cq_warehouse.thread")
+    _register_ext(_sp.Sprocket, "sprocket")
+    _register_ext(_ch.Chain, "chain")
+    _register_ext(_dr.Draft, "drafting")
+    EXT_AVAILABLE = True
+
+
+_load_extension_plugins()
+
+# =============================================================================
 # SERVER
 # =============================================================================
 
@@ -101,6 +182,7 @@ mcp = FastMCP(
         "  • workplane_api  — 3D modeling via Workplane API method chaining\n"
         "  • sketch_api     — 2D profiles via Sketch API (face or edge workflows)\n"
         "  • assembly_api   — multi-part assemblies via Assembly API add/constrain/solve\n"
+        "  • extension_api  — build ready-made parametric parts: gears, fasteners, bearings, threads, sprockets, chains\n"
         "  • select_model   — re-activate an earlier model by name (shows it in the viewer and makes it exportable)\n"
         "  • query_docs     — fetch official detailed docs of specific methods and their parameters\n\n"
         "All tools share a persistent object store. Reference stored objects with "
@@ -679,7 +761,30 @@ def _construct_type(spec: dict) -> Any:
     elif t == "InverseSelector":
         return InverseSelector(resolve_value(spec["selector"]))
 
+    # ── Extension-plugin parts (gears, fasteners, bearings, threads, …) ────────
+    # Example: {"_type": "SpurGear", "params": {"module": 1, "teeth_number": 20,
+    #           "width": 5, "bore_d": 5}, "plane": "XY"}
+    elif t in _EXT_CATALOG:
+        return _build_ext_part(spec)
+
     raise ValueError(f"Unknown _type: '{t}'")
+
+
+def _build_ext_part(spec: dict) -> Any:
+    """Construct a catalog part and normalise it to a native object the rest of the
+    pipeline stores/renders. spec = {"_type": <part>, "params": {...}, "plane"?: str}.
+    Gears build through the plugin's Workplane.gear() builder; every other part is
+    already (or exposes via .cq_object) a native shape/assembly."""
+    entry = _EXT_CATALOG[spec["_type"]]
+    params = resolve_value(spec.get("params", {})) or {}
+    obj = entry["cls"](**params)
+    if entry["family"] == "gear":
+        return cq.Workplane(spec.get("plane", "XY")).gear(obj)
+    if isinstance(obj, (Workplane, Sketch, Assembly, Shape)):
+        return obj
+    if hasattr(obj, "cq_object"):
+        return obj.cq_object
+    return obj
 
 # =============================================================================
 # HELPERS
@@ -689,6 +794,7 @@ def _construct_type(spec: dict) -> Any:
 # a geometry method the model needs, not a stack name).
 _BRAND_RE = re.compile(
     r"open\s*cascade(\s*technology)?|\bocct\b|\bocp[_\s-]?vscode\b|\bocp\b"
+    r"|\bcq[_\s-]?gears\b|\bcq[_\s-]?warehouse\b|\bmeadiode\b|\bgumyr\b"
     r"|\bcadquery\b|\bcq\b|\bfast\s*mcp\b|\bfastmcp\b|\bpython\b",
     re.IGNORECASE)
 
@@ -2866,6 +2972,147 @@ async def select_model(name: str, ctx: Context = None) -> str:
         return _error(str(e), traceback.format_exc())
 
 # =============================================================================
+# TOOL — extension_api
+# =============================================================================
+
+def _ext_options(part: str, fastener_type: Optional[str]) -> dict:
+    """Introspect a catalog part: its constructor params and — for data-driven parts
+    (fasteners/bearings/threads) — the exact valid standard types and sizes, read live
+    from the part's own tables (never hardcoded)."""
+    cls = _EXT_CATALOG[part]["cls"]
+    out: Dict[str, Any] = {"part": part, "family": _EXT_CATALOG[part]["family"]}
+    try:
+        sig = inspect.signature(cls.__init__)
+        out["params"] = [
+            (f"{p.name}={p.default!r}" if p.default is not inspect.Parameter.empty else f"{p.name} [required]")
+            for p in sig.parameters.values() if p.name != "self"
+        ]
+    except (TypeError, ValueError):
+        pass
+    if callable(getattr(cls, "types", None)):
+        try:
+            types = sorted(cls.types())
+            out["standard_types"] = types
+            ft = fastener_type or (types[0] if types else None)
+            if ft and callable(getattr(cls, "sizes", None)):
+                out["sizes_for_type"] = ft
+                out["sizes"] = list(cls.sizes(ft))
+        except Exception:
+            pass
+    return out
+
+
+@mcp.tool(name="extension_api")
+async def extension_api(
+    op: str = "build",
+    part: Optional[str] = None,
+    params: Optional[dict] = None,
+    plane: Optional[str] = None,
+    fastener_type: Optional[str] = None,
+    store_as: Optional[str] = None,
+    ctx: Context = None,
+) -> str:
+    """
+    Build specialized, ready-made parametric PARTS that would be impractical or
+    impossible to model from primitives — precision gears (true involute teeth),
+    standards-based fasteners, bearings, threads, sprockets and roller chains.
+
+    Use this whenever the user asks for such a part instead of approximating it with
+    boxes/cylinders. Everything you build here is stored under a name and behaves like
+    any other model: you can keep editing it in workplane_api (start_from="<name>") and
+    combine it in assembly_api.
+
+    ── OPERATIONS (op) ─────────────────────────────────────────────────────────
+    • op="list"    → all available parts grouped by family. Call this first if unsure
+                     what exists.
+    • op="options" → for one `part`: its constructor parameters, and (for fasteners/
+                     bearings/threads) the EXACT valid standard types and sizes read
+                     live from the part's own tables. ALWAYS call this before building a
+                     fastener/bearing/thread — their `size`/`type` strings must match
+                     exactly (e.g. "M3-0.5", "iso4762") or construction fails. Pass
+                     `fastener_type` to list the sizes for a specific standard.
+    • op="build"   → construct `part` with `params` and store it (default op).
+
+    ── build ARGS ──────────────────────────────────────────────────────────────
+    part:    class name of the part (see op="list"), e.g. "SpurGear", "SocketHeadCapScrew".
+    params:  keyword arguments for that part, e.g. {"module":1,"teeth_number":20,"width":5,"bore_d":5}.
+    plane:   (gears only) the workplane the gear is built on. Default "XY".
+    store_as: name to store the result under (auto-generated if omitted).
+
+    Returns {status, name, obj_type, properties}, same as the other build tools.
+
+    ── FAMILIES ────────────────────────────────────────────────────────────────
+    • gear     — SpurGear (set helix_angle>0 for a helical gear), HerringboneGear,
+                 BevelGear, RingGear, RackGear, Worm, PlanetaryGearset, … Build params
+                 like module, teeth_number, width, bore_d, pressure_angle, helix_angle.
+    • fastener — screws (SocketHeadCapScrew, HexHeadScrew, CounterSunkScrew, SetScrew, …),
+                 nuts (HexNut, SquareNut, DomedCapNut, HeatSetNut, …), washers. Params:
+                 size, fastener_type, length (screws). Pass simple=true for a fast plain
+                 body, or omit for real thread geometry.
+    • bearing  — SingleRowDeepGrooveBallBearing, …; params size, bearing_type.
+    • thread   — IsoThread, AcmeThread, MetricTrapezoidalThread, …
+    • sprocket / chain — Sprocket (num_teeth, chain_pitch, …); Chain across sprockets.
+    • drafting — Draft (dimension/annotation config); call its methods via {"_call": …}.
+
+    ── FASTENER HOLES & PLACEMENT (in the OTHER tools) ──────────────────────────
+    Matching holes for a fastener are cut in workplane_api, not here — call these
+    methods there on a workplane, passing the built fastener via {"_ref":"<name>"}:
+      clearanceHole, tapHole, threadedHole, insertHole (for HeatSetNut).
+    To place fasteners into an assembly, use pushFastenerLocations / the hole methods'
+    baseAssembly argument in assembly_api. query_docs any of these for exact params.
+
+    ── EXAMPLES ────────────────────────────────────────────────────────────────
+    Two meshing gears (module 1; centre distance = module*(z1+z2)/2 = 30):
+      extension_api(part="SpurGear", params={"module":1,"teeth_number":20,"width":6,"bore_d":5}, store_as="pinion")
+      extension_api(part="SpurGear", params={"module":1,"teeth_number":40,"width":6,"bore_d":6}, store_as="gear")
+      # then place them 30 mm apart in assembly_api.
+
+    An M3 socket-head cap screw (check the size/type first):
+      extension_api(op="options", part="SocketHeadCapScrew")            # → types + sizes
+      extension_api(part="SocketHeadCapScrew", params={"size":"M3-0.5","fastener_type":"iso4762","length":16}, store_as="screw1")
+
+    A plate with a clearance hole for that screw (in workplane_api):
+      workplane_api(start_from="plate", operations=[
+        {"method":"faces","args":[">Z"]}, {"method":"workplane"},
+        {"method":"clearanceHole","params":{"fastener":{"_ref":"screw1"},"counterSunk":false}}], store_as="plate")
+
+    To learn a part's exact constructor parameters, call
+      query_docs(cls="<PartName>", methods=["__init__"]).
+    """
+    _bind(_sid_from_ctx(ctx))
+    try:
+        if not EXT_AVAILABLE:
+            return _error("Specialized parts are currently unavailable.")
+
+        if op == "list":
+            fams: Dict[str, List[str]] = {}
+            for name, entry in sorted(_EXT_CATALOG.items()):
+                fams.setdefault(entry["family"], []).append(name)
+            return json.dumps({"status": "success", "parts_by_family": fams})
+
+        if op == "options":
+            if not part or part not in _EXT_CATALOG:
+                return _error(f"Unknown part '{part}'. Use op='list' to see available parts.")
+            return json.dumps({"status": "success", **_ext_options(part, fastener_type)})
+
+        if op == "build":
+            if not part or part not in _EXT_CATALOG:
+                return _error(f"Unknown part '{part}'. Use op='list' to see available parts.")
+            spec = {"_type": part, "params": params or {}}
+            if plane:
+                spec["plane"] = plane
+            obj = await anyio.to_thread.run_sync(_build_ext_part, spec)
+            name = store_as or _auto_name(_EXT_CATALOG[part]["family"])
+            _store(name, obj)
+            await anyio.to_thread.run_sync(_show, obj)
+            return json.dumps({"status": "success", "name": name,
+                               "obj_type": _obj_type(obj), "properties": _properties(obj)})
+
+        return _error(f"Unknown op '{op}'. Use 'build', 'list', or 'options'.")
+    except Exception as e:
+        return _error(str(e), traceback.format_exc())
+
+# =============================================================================
 # TOOL 5 — query_docs
 # =============================================================================
 
@@ -2881,6 +3128,8 @@ def _resolve_cls(name: str):
         obj = getattr(module, name, None)
         if isinstance(obj, type):
             return obj
+    if name in _EXT_CATALOG:            # extension_api part classes (docs on __init__)
+        return _EXT_CATALOG[name]["cls"]
     raise ValueError(f"Unknown class: '{name}'")
 
 
