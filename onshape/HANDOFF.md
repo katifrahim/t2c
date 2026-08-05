@@ -15,6 +15,38 @@ feature against Onshape's own geometry.
 The **KPI is L4 "Speed_toolhead"** (169 features) and models beyond it. So the whole design
 is about being **universal and automatic** — no per-model hand-tuning.
 
+## SESSION UPDATE (2026-08-05, later) — goal reframed + L4 tail started
+
+**Goal reframed** (see `~/.claude/plans/hey-continue-with-the-prancy-bentley.md`): the target
+is **100% coverage of Onshape's op vocabulary** for onshape-NATIVE models, not just L4's few
+missing features. Key findings this session:
+- Onshape exposes **91 UI features** (`featurespecs`), all decomposing into **~49 `op*`
+  primitives** (`opExtrude`, `opRevolve`, `opMoveFace`, `opReplaceFace`, `opDraft`, …). Target
+  the primitives → universal + model-agnostic.
+- **Direct-edit ops are NOT impossible.** We have native models' full history, so it's
+  deterministic transpilation (vs. ML B-rep→program, which is the no-history problem). All
+  the direct-edit OCCT algorithms exist in our OCP kernel: `BRepTools_Modifier`,
+  `BRepAlgoAPI_Defeaturing` (deleteFace), `BRepOffsetAPI_DraftAngle` (draft) — proven on a box
+  in `onshape/tests/test_direct_edit.py`. Plan: **editable-first** (re-express as boolean/
+  sketch ops), escalate to an OCCT primitive only when the oracle rejects the re-expression.
+  `BRepTools_Modification` can't be subclassed in OCP → general moveFace uses boolean-delta /
+  `BRepTools_ReShape` / `BRepFeat`, not the Modifier.
+
+**Done this session:** multi-key API **failover** + persisted lockout (`client.py`,
+`out/key_state.json`) + **cache-only offline mode** (auto-on when all keys capped, raises
+`CacheMiss`); `reconstruct(stop_after=N)` for cheap prefix runs; **datum no-ops**
+(cPlane/cPoint/mateConnector — verified: L4 f2 OK); **revolve** + **mirror** translators, each
+with a self-validating synthetic test (torus / two-body mirror); full **L4 oracle cached
+170/170**.
+
+**BLOCKED (~21h):** both API keys hit their daily cap. Cached for L4: oracle 170/170,
+sketches, features, **27/59 extrude caps, 0/32 modifier faces**. Offline chain reconstructs
+f0–f5 then breaks at f6 (up-to-face extrude needs uncached caps). **Next reset (task #5):**
+fetch the missing ~64 calls (32 caps + 32 fillet/chamfer modifier faces) → L4 becomes fully
+reconstructable offline; then verify revolve@13/@80 + mirror against the real oracle and
+continue sweep/shell/hole/draft (need path/point/face resolution — oracle-dependent).
+Keys: A `on_jG5pI…` (primary), B `on_keK1…` (`_2`); both in `../../onshape-exp/.env`.
+
 ## Current status (2026-08-05)
 
 **The closed-loop engine works and generalizes. All 5 bench models reconstruct feature-by-
