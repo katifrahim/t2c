@@ -42,6 +42,12 @@ class _KeyCapped(Exception):
         self.retry_after = retry_after
 
 
+class CacheMiss(RuntimeError):
+    """Raised in cache-only mode when a request isn't already on disk. It is NOT a
+    RateLimited, so the per-feature resolvers (extract.py) treat it as an ordinary miss
+    and skip that feature, letting reconstruction run offline on whatever IS cached."""
+
+
 def _throttle() -> None:
     global _last_request
     now = time.monotonic()
@@ -96,7 +102,8 @@ def parse_url(url: str) -> PartStudio:
 class Onshape:
     """Minimal authenticated Onshape API client."""
 
-    def __init__(self, base: str | None = None, load_dotenv: bool = True, cache: bool = True):
+    def __init__(self, base: str | None = None, load_dotenv: bool = True, cache: bool = True,
+                 cache_only: bool | None = None):
         if load_dotenv:
             load_env()
         self.cache = cache  # cache GET responses on disk (dev iteration; avoids 429s)
@@ -109,6 +116,10 @@ class Onshape:
         if not self._keys:  # pragma: no cover - config error
             raise RuntimeError("Set ONSHAPE_ACCESS_KEY and ONSHAPE_SECRET_KEY (or provide a .env)")
         self._locks: dict = self._load_locks()
+        # Cache-only when asked, OR automatically when every key is currently capped: serve
+        # from disk and raise CacheMiss (not RateLimited) on a miss, so offline iteration
+        # runs on whatever's cached instead of aborting on the first uncached call.
+        self.cache_only = cache_only if cache_only is not None else (self._available_key() is None)
 
     @staticmethod
     def _load_keys() -> list[dict]:
@@ -174,6 +185,9 @@ class Onshape:
             cache_path = os.path.join(_CACHE_DIR, f"{key}.json")
             if os.path.exists(cache_path):
                 return json.load(open(cache_path))
+
+        if self.cache_only:                      # offline: never touch the network
+            raise CacheMiss(f"cache-only: not cached: {path}")
 
         while True:                              # fail over across keys on a daily cap
             ki = self._available_key()

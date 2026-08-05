@@ -455,6 +455,52 @@ def region_extrude_candidates(engine: Engine, plane: ir.Plane, regions: list, de
     return cands
 
 
+def _rev(angle: float, a0, a1) -> dict:
+    # combine=False: build the revolved solid in isolation, then _op_candidates joins it.
+    return {"method": "revolve", "args": [angle, list(a0), list(a1), False]}
+
+
+def _profiles_centroid(profiles: list[ir.Profile]) -> list[float]:
+    """A representative 2D point of a sketch profile set (circle centres / curve endpoints
+    averaged) — used only to seed candidate revolve axes near the profile."""
+    pts: list[list[float]] = []
+    for p in profiles:
+        for c in p.curves:
+            d = c.params
+            if c.kind == "circle":
+                pts.append(list(d["center"]))
+            else:
+                for k in ("start", "end", "mid"):
+                    if k in d:
+                        pts.append(list(d[k]))
+    if not pts:
+        return [0.0, 0.0]
+    return [sum(p[0] for p in pts) / len(pts), sum(p[1] for p in pts) / len(pts)]
+
+
+def revolve_candidates(engine: Engine, plane: ir.Plane, profiles: list[ir.Profile],
+                       angle: float, full: bool, axes: list[tuple],
+                       op: str, base_live: list[str]) -> list[Candidate]:
+    """Revolve a profile about an axis. Neither the region, the axis, nor (for a partial
+    revolve) the direction is hand-picked — candidates enumerate them and the oracle picks.
+    `axes` are (p0, p1) segments in the profile plane's LOCAL frame (revolve axes are
+    coplanar with the sketch, so cq's local-coord axis matches the sketch's 2D frame).
+    `full` = a 360deg (FULL) revolve, where direction is irrelevant."""
+    init = _plane_init(plane)
+    angles = [360.0] if full else [abs(angle), -abs(angle)]
+    cands: list[Candidate] = []
+    for pname, profs in profile_variants(profiles):
+        prof_ops = _profile_ops(profs)
+        for ai, (a0, a1) in enumerate(axes):
+            for adeg in angles:
+                tool = engine.name()
+                make = {"operations": prof_ops + [_rev(adeg, a0, a1)],
+                        "init_params": init, "store_as": tool}
+                cands += _op_candidates(engine, [make], tool, op, base_live,
+                                        f"{pname}|axis{ai}|{adeg:g}")
+    return cands
+
+
 def pattern_candidates(engine: Engine, count: int, angle: float, equal_space: bool,
                        axes: list[tuple[list[float], list[float]]],
                        base_live: list[str]) -> list[Candidate]:
@@ -584,11 +630,13 @@ def pick(engine: Engine, cands: list[Candidate], target: State,
 
 
 # --- the full closed-loop driver -------------------------------------------------
-def reconstruct(api, ps, verbose: bool = True, dump: set | None = None):
+def reconstruct(api, ps, verbose: bool = True, dump: set | None = None,
+                stop_after: int | None = None):
     """Reconstruct a whole Part Studio feature-by-feature, each verified against the
     oracle. Returns (steps, report) where report[i] = (index, type, name, label, exact).
     No feature's conventions are hand-decided: every feature offers candidates and the
-    oracle picks. A feature that no candidate matches is flagged (later: B-rep fallback)."""
+    oracle picks. A feature that no candidate matches is flagged (later: B-rep fallback).
+    `stop_after` halts after that feature index (dev: iterate a prefix offline cheaply)."""
     from onshape.normalize import (_msg, _params, _enum, _sketch_profiles, caps_to_profiles,
                                    caps_to_regions, _cap_distance, parse_length_mm,
                                    _parse_angle_deg, _extrude_op, _BOOL_OP)
@@ -612,6 +660,8 @@ def reconstruct(api, ps, verbose: bool = True, dump: set | None = None):
     report: list[tuple] = []
 
     for i, f in enumerate(feats):
+        if stop_after is not None and i > stop_after:
+            break
         m = _msg(f)
         ft, fid, nm = m.get("featureType"), m.get("featureId"), m.get("name") or ""
         if m.get("suppressed"):
@@ -681,6 +731,26 @@ def reconstruct(api, ps, verbose: bool = True, dump: set | None = None):
                                                 depth, op.op, eng.live)
                     cands += region_extrude_candidates(eng, plane, caps_to_regions(fcaps, matrix),
                                                        depth, op.op, eng.live)
+        elif ft == "revolve":
+            P = _params(f)
+            optype = _enum(P.get("operationType"))
+            op = {"NEW": "new", "ADD": "add", "REMOVE": "cut",
+                  "INTERSECT": "intersect"}.get(optype, "new")
+            full = _enum(P.get("revolveType")) == "FULL"
+            angle = _parse_angle_deg((P.get("angle") or {}).get("expression")) or 360.0
+            # Profile from the current sketch (its world matrix fixes the plane). The axis
+            # is an opaque query, so search candidate axes IN THE SKETCH-LOCAL frame: the
+            # plane's own X/Y through the origin and through the profile centroid (a revolve
+            # axis is coplanar with the sketch). The oracle selects the real axis.
+            sid = last_sketch
+            matrix = (sk.get(sid) or {}).get("sketchMatrix")
+            plane = explicit_plane(matrix) if matrix else ir.Plane(name="XY")
+            profs = _sketch_profiles(sk[sid]) if sid in sk else []
+            if profs:
+                cx, cy = _profiles_centroid(profs)
+                axes = [((0, 0, 0), (0, 1, 0)), ((0, 0, 0), (1, 0, 0)),
+                        ((cx, cy, 0), (cx, cy + 1, 0)), ((cx, cy, 0), (cx + 1, cy, 0))]
+                cands = revolve_candidates(eng, plane, profs, angle, full, axes, op, eng.live)
         elif ft == "circularPattern":
             P = _params(f)
             count = parse_length_mm((P.get("instanceCount") or {}).get("expression"))

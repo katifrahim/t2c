@@ -92,3 +92,24 @@ def test_extrude_candidates_search_space():
     assert "all-regions|+2.0|new" in labels
     assert "all-regions|-2.0|new" in labels      # the sign the oracle will choose from
     assert all(c.label.endswith("new") for c in cands)
+
+
+def test_revolve_candidates_reconstructs_a_torus():
+    # End-to-end self-validating proof of the revolve translator (no network): the oracle
+    # target is a torus (offset circle revolved 360deg about the local Y axis); the axis
+    # search must pick Y over a decoy X axis (which would make a sphere) purely by geometry.
+    import cadquery as cq
+    from onshape.recon import revolve_candidates, pick, fingerprint
+    from onshape.oracle import State
+    ref = cq.Workplane("XY").moveTo(3, 0).circle(1).revolve(360, (0, 0, 0), (0, 1, 0), False)
+    target = State(bodies=[fingerprint(ref)])
+    assert target.bodies[0] is not None
+    eng = Engine()
+    prof = ir.Profile([ir.Curve("circle", {"center": [3, 0], "radius": 1})])
+    axes = [((0, 0, 0), (1, 0, 0)),          # decoy: revolves the circle into a sphere
+            ((0, 0, 0), (0, 1, 0))]          # the real axis -> the torus
+    cands = revolve_candidates(eng, ir.Plane(name="XY"), [prof], angle=360.0, full=True,
+                               axes=axes, op="new", base_live=[])
+    win, exact = pick(eng, cands, target)
+    assert exact and win is not None
+    assert "axis1" in win.label            # the Y-axis candidate (index 1) won
