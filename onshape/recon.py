@@ -625,6 +625,15 @@ def reconstruct(api, ps, verbose: bool = True, dump: set | None = None):
             if verbose:
                 print(f"  --  f{i:2d} {ft:15s} {nm[:20]:20s}")
             continue
+        elif ft in ("cPlane", "cPoint", "mateConnector"):
+            # Datums create no solid body, so the oracle state is unchanged and the live
+            # set carries through untouched. Downstream sketches reference the world frame
+            # via their own absolute sketchMatrix (explicit_plane), so the datum itself
+            # never needs reconstructing. Pure no-op.
+            report.append((i, ft, nm, "datum (no solid)", True))
+            if verbose:
+                print(f"  --  f{i:2d} {ft:15s} {nm[:20]:20s}")
+            continue
         elif ft == "extrude":
             op, _why = _extrude_op(f, sketch_ids, last_sketch)
             ref = op.profile_ref
