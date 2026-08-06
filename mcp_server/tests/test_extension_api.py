@@ -12,7 +12,7 @@ import pytest
 
 from src.t2c_mcp import (
     EXT_AVAILABLE, _EXT_CATALOG, _build_ext_part,
-    extension_api, workplane_api,
+    extension_api, workplane_api, query_docs,
     _bind, _sess, _show, _payload_is_empty, _ocp_convert,
 )
 
@@ -184,6 +184,20 @@ def test_empty_payload_never_updates_viewer():
     assert not _payload_is_empty(_ocp_convert(dim)[0])
     _show(dim)
     assert _sess().viewer["version"] == v0 + 1        # real geometry → updates
+
+
+def test_query_docs_resolves_part_names_directly():
+    """A part/op name alone returns its docs — no cls / methods=['__init__'] dance."""
+    d = asyncio.run(query_docs(methods=["SpurGear"]))
+    assert "SpurGear" in d and "teeth_number" in d
+
+    op = asyncio.run(query_docs(methods=["dimension_line"]))
+    assert "dimension_line" in op and "path" in op
+
+    # legacy convention still works, and core methods are unaffected
+    legacy = asyncio.run(query_docs(methods=["__init__"], cls="SocketHeadCapScrew"))
+    assert "fastener_type" in legacy
+    assert "box" in asyncio.run(query_docs(methods=["box"]))
 
 
 def test_finger_jointed_box_in_workplane():

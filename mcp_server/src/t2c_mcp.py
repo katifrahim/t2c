@@ -3106,10 +3106,8 @@ async def extension_api(
     • bearing  — SingleRowDeepGrooveBallBearing, …; params size, bearing_type.
     • thread   — IsoThread, AcmeThread, MetricTrapezoidalThread, …
     • sprocket / chain — Sprocket (num_teeth, chain_pitch, …); Chain across sprockets.
-    • drafting — dimension_line / extension_line / callout: dimension & annotation
-                 assemblies. params are the op's own args (e.g. dimension_line takes
-                 {"path":[[0,0,0],[20,0,0]]}) plus optional look settings (font_size,
-                 units, arrow_length, decimal_precision, …). op="options" lists both.
+    • drafting — dimension_line, extension_line, callout: dimension & annotation
+                 assemblies; params are the op's args (e.g. path) plus look settings.
 
     ── FASTENER HOLES & PLACEMENT (in the OTHER tools) ──────────────────────────
     Matching holes for a fastener are cut in workplane_api, not here — call these
@@ -3123,8 +3121,7 @@ async def extension_api(
     (materialThickness, targetFingerWidth) on that workplane.
 
 
-    To learn a part's exact constructor parameters, call
-      query_docs(cls="<PartName>", methods=["__init__"]).
+    To learn a part's exact parameters, call query_docs(methods=["<PartName>"]).
     """
     _bind(_sid_from_ctx(ctx))
     try:
@@ -3271,29 +3268,49 @@ async def query_docs(methods: List[str], cls: Optional[str] = None) -> str:
                  AndSelector, SumSelector, SubtractSelector, InverseSelector, 
                  StringSyntaxSelector (default)
              Omit to search Workplane, Sketch, and Assembly.
+             For an extension_api part or op, just pass its name as a method — e.g.
+             methods=["SpurGear"] or ["dimension_line"] — no cls needed; you get its
+             parameter docs directly.
 
     Returns plain-text docs per entry: signature, summary, params, full docstring.
     """
     # "Edge", "Wire", "Face", "Shell", "Solid", "Compound", "Shape" - add this once there is a direct_api tool
-    
-    if cls:
-        try:
-            classes = [(cls, _resolve_cls(cls))]
-        except ValueError as e:
-            return str(e)
-    else:
-        classes = [(k.__name__, k) for k in _DOC_DEFAULTS]
+
     results = []
-    for display_name, klass in classes:
-        for mname in methods:
+
+    # extension_api parts/ops self-document: a part documents its constructor and a
+    # drafting op documents its method, whether the name is given as `cls` or a method.
+    for name in {n for n in ([cls] if cls else []) + methods if n in _EXT_CATALOG}:
+        entry = _EXT_CATALOG[name]
+        tname = entry.get("method", "__init__")
+        target = getattr(entry["cls"], tname, None)
+        if callable(target):
             try:
-                m = getattr(klass, mname, None)
-                if not callable(m):
+                results.append(_doc_render(name, tname, target, inspect.signature(target)))
+            except (TypeError, ValueError):
+                pass
+
+    # Everything else is looked up on the requested class (or the defaults).
+    remaining = [m for m in methods if m not in _EXT_CATALOG and m not in ("__init__", cls)]
+    if remaining:
+        if cls:
+            try:
+                klass = _EXT_CATALOG[cls]["cls"] if cls in _EXT_CATALOG else _resolve_cls(cls)
+            except ValueError as e:
+                return "\n".join(results) if results else str(e)
+            classes = [(cls, klass)]
+        else:
+            classes = [(k.__name__, k) for k in _DOC_DEFAULTS]
+        for display_name, klass in classes:
+            for mname in remaining:
+                try:
+                    m = getattr(klass, mname, None)
+                    if not callable(m):
+                        continue
+                    sig = inspect.signature(m)
+                except Exception:
                     continue
-                sig = inspect.signature(m)
-            except Exception:
-                continue
-            results.append(_doc_render(display_name, mname, m, sig))
+                results.append(_doc_render(display_name, mname, m, sig))
 
     return "\n".join(results) if results else f"No docs found for: {', '.join(methods)}"
 
