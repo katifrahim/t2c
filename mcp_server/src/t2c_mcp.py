@@ -165,7 +165,11 @@ def _load_extension_plugins() -> None:
     _scan_ext(_th, Shape, "thread", "cq_warehouse.thread")
     _register_ext(_sp.Sprocket, "sprocket")
     _register_ext(_ch.Chain, "chain")
-    _register_ext(_dr.Draft, "drafting")
+    # Drafting is config + method, not a standalone part: register the annotation
+    # OPERATIONS (each builds a Draft then returns a real dimension/callout assembly)
+    # rather than the bare Draft config, which would render nothing.
+    for _method in ("dimension_line", "extension_line", "callout"):
+        _EXT_CATALOG[_method] = {"cls": _dr.Draft, "family": "drafting", "method": _method}
     EXT_AVAILABLE = True
 
 
@@ -773,10 +777,13 @@ def _construct_type(spec: dict) -> Any:
 def _build_ext_part(spec: dict) -> Any:
     """Construct a catalog part and normalise it to a native object the rest of the
     pipeline stores/renders. spec = {"_type": <part>, "params": {...}, "plane"?: str}.
-    Gears build through the plugin's Workplane.gear() builder; every other part is
-    already (or exposes via .cq_object) a native shape/assembly."""
+    Gears build through the plugin's Workplane.gear() builder; drafting ops build a
+    dimension/callout assembly; every other part is already (or exposes via
+    .cq_object) a native shape/assembly."""
     entry = _EXT_CATALOG[spec["_type"]]
     params = resolve_value(spec.get("params", {})) or {}
+    if entry.get("method"):                       # drafting annotation op
+        return _build_drafting(entry["cls"], entry["method"], params)
     obj = entry["cls"](**params)
     if entry["family"] == "gear":
         return cq.Workplane(spec.get("plane", "XY")).gear(obj)
@@ -785,6 +792,32 @@ def _build_ext_part(spec: dict) -> Any:
     if hasattr(obj, "cq_object"):
         return obj.cq_object
     return obj
+
+
+def _draft_config_keys(draft_cls: type) -> set:
+    return set(inspect.signature(draft_cls.__init__).parameters) - {"self"}
+
+
+def _build_drafting(draft_cls: type, method: str, params: dict) -> Any:
+    """Build a Draft from the config-subset of params (font_size, units, …), then call
+    the requested annotation method (dimension_line/extension_line/callout) with the
+    rest. Returns a real assembly, so it renders and never pushes an empty scene."""
+    cfg_keys = _draft_config_keys(draft_cls)
+    cfg = {k: v for k, v in params.items() if k in cfg_keys}
+    args = {k: v for k, v in params.items() if k not in cfg_keys}
+    # dimension_line/extension_line accept coordinate lists directly, but callout()
+    # wants Vector origin/tail — coerce plain points so the model can pass coordinates
+    # uniformly across all three ops.
+    if method == "callout":
+        # origin is a single point (wants a Vector); coerce a flat coordinate list.
+        o = args.get("origin")
+        if isinstance(o, (list, tuple)) and 2 <= len(o) <= 3 and all(isinstance(x, (int, float)) for x in o):
+            args["origin"] = Vector(*o)
+        # callout takes EITHER origin OR tail; passing both hits a library bug (it
+        # follows origin but still draws the tail arrow). origin wins — drop the tail.
+        if args.get("origin") is not None and args.get("tail") is not None:
+            args.pop("tail")
+    return getattr(draft_cls(**cfg), method)(**args)
 
 # =============================================================================
 # HELPERS
@@ -1166,6 +1199,16 @@ def _assembly_report(asm) -> dict:
     return report
 
 
+def _payload_is_empty(payload: Any) -> bool:
+    """True when a tessellation payload has nothing to render (no instances and no
+    parts). Pushing such a payload tears the viewer down mid-swap and blanks the web
+    app, so callers skip the viewer update and keep the last good model instead."""
+    data = payload.get("data", {}) if isinstance(payload, dict) else {}
+    if data.get("instances"):
+        return False
+    return not (data.get("shapes", {}) or {}).get("parts")
+
+
 def _show_tessellate(obj: Any) -> None:
     """http: tessellate obj into the three-cad-viewer payload and store it for
     /model. Replaces the ocp_vscode websocket push (which can't work over HTTPS)."""
@@ -1179,6 +1222,11 @@ def _show_tessellate(obj: Any) -> None:
         # progress to stdout; mute both so the stdio JSON-RPC stream stays clean.
         with contextlib.redirect_stderr(io.StringIO()), contextlib.redirect_stdout(io.StringIO()):
             payload, mapping = _ocp_convert(obj)
+        # An object with no renderable geometry (e.g. an annotation config) yields an
+        # empty payload; don't bump the viewer version, so the frontend keeps showing
+        # the previous model rather than crashing on an empty scene.
+        if _payload_is_empty(payload):
+            return
         _inject_studio_materials(payload)  # resolve builtin/texture material tags → appearance entries
         payload["config"]["reset_camera"] = "iso"  # frame the part on each render
         sess = _sess()
@@ -2979,16 +3027,22 @@ def _ext_options(part: str, fastener_type: Optional[str]) -> dict:
     """Introspect a catalog part: its constructor params and — for data-driven parts
     (fasteners/bearings/threads) — the exact valid standard types and sizes, read live
     from the part's own tables (never hardcoded)."""
-    cls = _EXT_CATALOG[part]["cls"]
-    out: Dict[str, Any] = {"part": part, "family": _EXT_CATALOG[part]["family"]}
+    entry = _EXT_CATALOG[part]
+    cls = entry["cls"]
+    out: Dict[str, Any] = {"part": part, "family": entry["family"]}
+    # For a drafting op the caller passes the method's args; for every other part they
+    # pass the constructor's kwargs.
+    target = getattr(cls, entry["method"]) if entry.get("method") else cls.__init__
     try:
-        sig = inspect.signature(cls.__init__)
+        sig = inspect.signature(target)
         out["params"] = [
             (f"{p.name}={p.default!r}" if p.default is not inspect.Parameter.empty else f"{p.name} [required]")
             for p in sig.parameters.values() if p.name != "self"
         ]
     except (TypeError, ValueError):
         pass
+    if entry.get("method"):   # drafting: config knobs can also be passed in params
+        out["draft_config_params"] = sorted(_draft_config_keys(cls))
     if callable(getattr(cls, "types", None)):
         try:
             types = sorted(cls.types())
@@ -3052,7 +3106,10 @@ async def extension_api(
     • bearing  — SingleRowDeepGrooveBallBearing, …; params size, bearing_type.
     • thread   — IsoThread, AcmeThread, MetricTrapezoidalThread, …
     • sprocket / chain — Sprocket (num_teeth, chain_pitch, …); Chain across sprockets.
-    • drafting — Draft (dimension/annotation config); call its methods via {"_call": …}.
+    • drafting — dimension_line / extension_line / callout: dimension & annotation
+                 assemblies. params are the op's own args (e.g. dimension_line takes
+                 {"path":[[0,0,0],[20,0,0]]}) plus optional look settings (font_size,
+                 units, arrow_length, decimal_precision, …). op="options" lists both.
 
     ── FASTENER HOLES & PLACEMENT (in the OTHER tools) ──────────────────────────
     Matching holes for a fastener are cut in workplane_api, not here — call these
@@ -3061,20 +3118,10 @@ async def extension_api(
     To place fasteners into an assembly, use pushFastenerLocations / the hole methods'
     baseAssembly argument in assembly_api. query_docs any of these for exact params.
 
-    ── EXAMPLES ────────────────────────────────────────────────────────────────
-    Two meshing gears (module 1; centre distance = module*(z1+z2)/2 = 30):
-      extension_api(part="SpurGear", params={"module":1,"teeth_number":20,"width":6,"bore_d":5}, store_as="pinion")
-      extension_api(part="SpurGear", params={"module":1,"teeth_number":40,"width":6,"bore_d":6}, store_as="gear")
-      # then place them 30 mm apart in assembly_api.
+    A finger-jointed (laser-cut) box is likewise made in workplane_api, not here: build
+    the box, select its vertical edges, then call the makeFingerJoints method
+    (materialThickness, targetFingerWidth) on that workplane.
 
-    An M3 socket-head cap screw (check the size/type first):
-      extension_api(op="options", part="SocketHeadCapScrew")            # → types + sizes
-      extension_api(part="SocketHeadCapScrew", params={"size":"M3-0.5","fastener_type":"iso4762","length":16}, store_as="screw1")
-
-    A plate with a clearance hole for that screw (in workplane_api):
-      workplane_api(start_from="plate", operations=[
-        {"method":"faces","args":[">Z"]}, {"method":"workplane"},
-        {"method":"clearanceHole","params":{"fastener":{"_ref":"screw1"},"counterSunk":false}}], store_as="plate")
 
     To learn a part's exact constructor parameters, call
       query_docs(cls="<PartName>", methods=["__init__"]).

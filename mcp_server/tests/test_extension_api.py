@@ -13,6 +13,7 @@ import pytest
 from src.t2c_mcp import (
     EXT_AVAILABLE, _EXT_CATALOG, _build_ext_part,
     extension_api, workplane_api,
+    _bind, _sess, _show, _payload_is_empty, _ocp_convert,
 )
 
 pytestmark = pytest.mark.skipif(not EXT_AVAILABLE, reason="extension plugins not installed")
@@ -147,3 +148,51 @@ def test_core_behaviour_unaffected():
     """Base-shape ops must behave exactly as stock despite the loaded plugins."""
     v = cq.Workplane("XY").box(20, 20, 20).edges("|Z").fillet(2).faces(">Z").shell(-1.5).val().Volume()
     assert round(v, 2) == 2588.80
+
+
+# ── Drafting: real annotation geometry, not an empty config ──────────────────
+@pytest.mark.parametrize("part,params", [
+    ("dimension_line", {"path": [[0, 0, 0], [20, 0, 0]], "font_size": 4}),
+    ("callout", {"label": "M3", "origin": [0, 0, 0]}),
+    ("callout", {"label": "weld", "tail": [[0, 0, 0], [10, 10, 0]]}),
+    ("extension_line", {"object_edge": [[0, 0, 0], [20, 0, 0]], "offset": 5}),
+])
+def test_drafting_ops_build(part, params):
+    obj = _build_ext_part({"_type": part, "params": params})
+    assert isinstance(obj, cq.Assembly) and len(obj.children) > 0
+
+
+def test_callout_both_origin_and_tail_is_safe():
+    """Passing both origin and tail hits a library bug; we drop tail so it can't crash."""
+    obj = _build_ext_part({"_type": "callout",
+                           "params": {"label": "x", "origin": [0, 0, 0], "tail": [10, 10, 0]}})
+    assert isinstance(obj, cq.Assembly)
+
+
+@pytest.mark.skipif(_ocp_convert is None, reason="tessellation unavailable")
+def test_empty_payload_never_updates_viewer():
+    """A geometry-less object (a bare drafting config) must NOT bump the viewer
+    version — that empty push is what blanked/crashed the web app. Real geometry does."""
+    import cq_warehouse.drafting as dr
+    _bind(None)
+    assert _payload_is_empty(_ocp_convert(dr.Draft())[0])
+    v0 = _sess().viewer["version"]
+    _show(dr.Draft())
+    assert _sess().viewer["version"] == v0            # empty → no update
+
+    dim = _build_ext_part({"_type": "dimension_line", "params": {"path": [[0, 0, 0], [20, 0, 0]]}})
+    assert not _payload_is_empty(_ocp_convert(dim)[0])
+    _show(dim)
+    assert _sess().viewer["version"] == v0 + 1        # real geometry → updates
+
+
+def test_finger_jointed_box_in_workplane():
+    """Finger-jointed boxes are a workplane_api method (makeFingerJoints), not a part."""
+    r = json.loads(asyncio.run(workplane_api(
+        init_params={"plane": "XY"},
+        operations=[
+            {"method": "box", "args": [40, 30, 20]},
+            {"method": "makeFingerJoints", "params": {"materialThickness": 3, "targetFingerWidth": 5}},
+        ], store_as="fjbox")))
+    assert r["status"] == "success"
+    assert r["properties"]["volume"] > 0
