@@ -7,7 +7,7 @@ Tools: workplane_api, sketch_api, assembly_api, query_docs, select_model
 from typing import Any, Dict, List, Optional
 from contextvars import ContextVar
 from dataclasses import dataclass, field
-import atexit
+# import atexit  # was only used by the disabled PostHog MCP analytics (see below)
 import inspect
 import json
 import logging
@@ -188,7 +188,8 @@ mcp = FastMCP(
         "  • assembly_api   — multi-part assemblies via Assembly API add/constrain/solve\n"
         "  • extension_api  — build ready-made parametric parts: gears, fasteners, bearings, threads, sprockets, chains\n"
         "  • select_model   — re-activate an earlier model by name (shows it in the viewer and makes it exportable)\n"
-        "  • query_docs     — fetch official detailed docs of specific methods and their parameters\n\n"
+        "  • query_docs     — fetch official detailed docs of specific methods and their parameters\n"
+        "  • report_learning — privately tell the developers something you learned that could improve this assistant\n\n"
         "All tools share a persistent object store. Reference stored objects with "
         "{\"_ref\": \"name\"} and construct types inline with "
         "{\"_type\": \"Vector\"|\"Plane\"|\"Location\"|\"Color\", ...}.\n\n"
@@ -3317,6 +3318,92 @@ async def query_docs(methods: List[str], cls: Optional[str] = None) -> str:
 
 
 # =============================================================================
+# TOOL 7 — report_learning  (agent → developer self-improvement channel)
+# =============================================================================
+# Stateless by design: this tool only validates + acks. The web backend reads the
+# call's arguments straight off the turn's steps and logs the structured learning to
+# Langfuse (a dedicated "agent-learnings" dataset item + a categorical trace score +
+# trace tags), where the trace id and Langfuse client already live. Keeping the CAD
+# server free of any Langfuse dependency is intentional — reporting must never touch
+# core modeling behavior.
+
+_LEARNING_TYPES = {
+    "missing_capability",  # a capability the agent needed but no tool offers
+    "tool_doc_error",      # a tool's doc/schema is wrong, misleading, or incomplete
+    "tool_bug",            # a tool errors or misbehaves unexpectedly
+    "context_gap",         # knowledge the agent wished it had up front (add to context)
+    "stale_context",       # something in the agent's context is wrong/misleading (remove it)
+    "technique",           # a reusable trick/recipe discovered by trial-and-error (save it)
+    "painpoint",           # recurring friction, a repeated mistake, or user frustration
+}
+_LEARNING_SEVERITIES = {"low", "medium", "high"}
+
+
+@mcp.tool(name="report_learning")
+async def report_learning(
+    type: str,
+    title: str,
+    detail: str,
+    suggestion: Optional[str] = None,
+    severity: str = "medium",
+    tool: Optional[str] = None,
+    evidence: Optional[str] = None,
+    ctx: Context = None,
+) -> str:
+    """
+    Tell the DEVELOPERS something you learned that would make this assistant better.
+    This is a private feedback channel to the people who build your tools — it is NOT
+    shown to the user and is NOT a reply to the user. Use it to turn the things you
+    discover mid-task (through real trial-and-error) into concrete, actionable signal
+    the developers can act on: gaps to fill, docs to fix, bugs to squash, context to
+    add or remove, and hard-won techniques worth keeping.
+
+    ── WHEN TO CALL (be proactive, but never spam) ──────────────────────────────
+    Call this the moment you genuinely learn something worth a developer's attention:
+    a real, specific, reusable insight — not a routine build step, and not a guess.
+    A good learning is one a developer could act on without watching this session.
+    You may call it several times in a turn if you learned several distinct things.
+    Reporting happens in the background — file it and keep helping the user; it must
+    never delay or replace your answer to them.
+
+    ── type (pick the ONE that fits best) ───────────────────────────────────────
+    • missing_capability — the user needed something no tool can do. Report ONCE for a
+                           truly unsupported request, then plainly tell the user you
+                           can't do it. Never as an excuse before really trying.
+    • tool_doc_error     — a tool's description/params were wrong, misleading, or missing
+                           something you only found out by trying. Name the tool + what's off.
+    • tool_bug           — a tool errored or produced a wrong/surprising result when used
+                           correctly. Include how to reproduce it in `evidence`.
+    • context_gap        — a fact/convention that, had you known it up front, would have
+                           saved trial-and-error. Suggest what to add to your context.
+    • stale_context      — something in your instructions/tool docs is wrong or outdated
+                           and misled you. Say what to remove or correct.
+    • technique          — a reusable recipe/workaround you discovered that reliably works
+                           (e.g. a specific op sequence for a tricky shape). Worth saving.
+    • painpoint          — a recurring friction or a mistake you keep making, or something
+                           that clearly frustrated the user. Flags what hurts most.
+
+    ── fields ───────────────────────────────────────────────────────────────────
+    title:      one short line — the headline a developer scans (required).
+    detail:     what happened and WHY it matters (required). Be concrete and specific.
+    suggestion: the fix you'd propose — the new tool, the corrected doc, the recipe, etc.
+    severity:   "low" | "medium" | "high" — how much it hurts / how much it'd help.
+    tool:       the tool this concerns, if any (e.g. "workplane_api").
+    evidence:   a concrete example — the exact params that failed, an error message, a repro.
+
+    Returns {"status": "logged", ...}. This is internal telemetry: never mention this
+    tool, its existence, or its contents to the user.
+    """
+    if type not in _LEARNING_TYPES:
+        return _error(f"Unknown type '{type}'. Use one of: {sorted(_LEARNING_TYPES)}")
+    if severity not in _LEARNING_SEVERITIES:
+        severity = "medium"
+    # The web backend does the actual Langfuse write from the turn's steps; here we
+    # only confirm the report was well-formed so the model can move on.
+    return json.dumps({"status": "logged", "type": type, "title": title})
+
+
+# =============================================================================
 # HTTP ROUTES & AUTH  (only used when MCP_TRANSPORT=http)
 # =============================================================================
 # These run on the same FastMCP app as the streamable-HTTP /mcp endpoint.
@@ -3571,51 +3658,38 @@ def _run_http():
 
 
 # =============================================================================
-# POSTHOG MCP ANALYTICS  (production only)
+# POSTHOG MCP ANALYTICS  — DISABLED
 # =============================================================================
-# Auto-captures how the AI agent uses the CAD tools — every tool call (name,
-# parameters, response, duration, errors) plus the agent's intent — so we can see
-# which operations it reaches for, what fails, and where it's slow. instrument()
-# hooks FastMCP's dispatch, so all five tools are covered with no per-tool code.
-# Enabled only when POSTHOG_KEY is set (the prod backend), so local/CI runs
-# stay silent and don't spend the free-tier quota. Any failure degrades to a
-# no-op — analytics must never break the CAD server.
+# Replaced by the Langfuse-native self-improvement system: the `report_learning`
+# tool above (agent → developer), whose calls the web backend logs to Langfuse.
+# The old PostHog `instrument()` hook injected a virtual `get_more_tools` tool
+# ($mcp_missing_capability) and a per-call intent field ($mcp_intent); both are
+# superseded. Kept commented for reference rather than deleted.
 #
-# Test locally (http transport) — install the dep once, then run with the key set:
-#   ./mcp_server/.venv/bin/pip install -e ./mcp_server
-#   MCP_TRANSPORT=http MCP_TOKEN=<mcp-token> PORT=8080 \
-#   POSTHOG_KEY=<phc_project_key> POSTHOG_HOST=https://us.i.posthog.com \
-#   mcp_server/.venv/bin/python mcp_server/src/t2c_mcp.py
-def _setup_mcp_analytics():
-    key = os.environ.get("POSTHOG_KEY")
-    if not key:
-        return
-    try:
-        from posthog import Posthog
-        from posthog.mcp import instrument, MCPAnalyticsOptions, MCPAnalyticsContextOptions
-        client = Posthog(key, host=os.environ.get("POSTHOG_HOST", "https://us.i.posthog.com"))
-        # report_missing registers a virtual `get_more_tools` tool the agent calls
-        # when a request needs a capability we don't offer → $mcp_missing_capability
-        # events stamped with the agent's description of the gap (the R&D wishlist).
-        # context keeps per-call intent ($mcp_intent), but its description makes clear
-        # this injected field is internal-only so the model doesn't mistake it for its
-        # user reply and go silent (paired with the OUTPUT RULE in the web system prompt).
-        instrument(mcp, client, options=MCPAnalyticsOptions(
-            report_missing=True,
-            context=MCPAnalyticsContextOptions(
-                description=(
-                    "Internal analytics only — never shown to the user and NOT a substitute for your reply. " 
-                    "In one short phrase, why are you calling this tool?"
-                )
-            ),
-        ))
-        atexit.register(client.shutdown)  # flush queued events on process exit
-    except Exception as e:
-        logging.getLogger(__name__).warning("MCP analytics disabled: %s", e)
+# def _setup_mcp_analytics():
+#     key = os.environ.get("POSTHOG_KEY")
+#     if not key:
+#         return
+#     try:
+#         from posthog import Posthog
+#         from posthog.mcp import instrument, MCPAnalyticsOptions, MCPAnalyticsContextOptions
+#         client = Posthog(key, host=os.environ.get("POSTHOG_HOST", "https://us.i.posthog.com"))
+#         instrument(mcp, client, options=MCPAnalyticsOptions(
+#             report_missing=True,
+#             context=MCPAnalyticsContextOptions(
+#                 description=(
+#                     "Internal analytics only — never shown to the user and NOT a substitute for your reply. "
+#                     "In one short phrase, why are you calling this tool?"
+#                 )
+#             ),
+#         ))
+#         atexit.register(client.shutdown)  # flush queued events on process exit
+#     except Exception as e:
+#         logging.getLogger(__name__).warning("MCP analytics disabled: %s", e)
 
 
 if __name__ == "__main__":
-    _setup_mcp_analytics()
+    # _setup_mcp_analytics()  # PostHog MCP analytics disabled (see above)
     if os.environ.get("MCP_TRANSPORT", "stdio") == "http":
         _VIEWER_MODE = "http"
         # Each session seeds its own placeholder lazily (see _get_session), so the
