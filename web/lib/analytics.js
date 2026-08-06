@@ -20,7 +20,23 @@ export function identify(userId, email) {
   posthog?.identify?.(userId, email ? { email } : undefined);
 }
 
-// Clear identity on sign-out so the next user isn't merged into this profile.
+// Session replay is disabled at init (see app/layout.js) so anonymous landing
+// traffic never records and burns the free-tier quota. We start it explicitly
+// only for authenticated users. Safe to call repeatedly — PostHog no-ops if a
+// recording is already running.
+export function startReplay() {
+  if (!ANALYTICS_ENABLED) return;
+  posthog?.startSessionRecording?.();
+}
+
+// Stop the current recording (called on sign-out via resetIdentity).
+export function stopReplay() {
+  posthog?.stopSessionRecording?.();
+}
+
+// Clear identity on sign-out so the next user isn't merged into this profile,
+// and stop recording so a subsequent anonymous session isn't captured.
 export function resetIdentity() {
+  stopReplay();
   posthog?.reset?.();
 }
