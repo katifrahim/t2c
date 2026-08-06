@@ -32,20 +32,32 @@ missing features. Key findings this session:
   `BRepTools_Modification` can't be subclassed in OCP → general moveFace uses boolean-delta /
   `BRepTools_ReShape` / `BRepFeat`, not the Modifier.
 
-**Done this session:** multi-key API **failover** + persisted lockout (`client.py`,
-`out/key_state.json`) + **cache-only offline mode** (auto-on when all keys capped, raises
-`CacheMiss`); `reconstruct(stop_after=N)` for cheap prefix runs; **datum no-ops**
-(cPlane/cPoint/mateConnector — verified: L4 f2 OK); **revolve** + **mirror** translators, each
-with a self-validating synthetic test (torus / two-body mirror); full **L4 oracle cached
-170/170**.
+**Infra this session:** multi-key API **failover** (3 keys: A primary, B `_2`, C `_3` in
+`../../onshape-exp/.env`) + persisted lockout (`out/key_state.json`) + **cache-only offline
+mode** (auto-on when all keys capped, raises `CacheMiss`); **`python -m onshape.keys`** prints
+each key's reset time; `reconstruct(stop_after=N)` prefix runs; scratchpad `dev_recon.py` /
+`dev_dump.py` (dump={i} shows every candidate's nB/totV vs oracle — the debug workflow).
 
-**BLOCKED (~21h):** both API keys hit their daily cap. Cached for L4: oracle 170/170,
-sketches, features, **27/59 extrude caps, 0/32 modifier faces**. Offline chain reconstructs
-f0–f5 then breaks at f6 (up-to-face extrude needs uncached caps). **Next reset (task #5):**
-fetch the missing ~64 calls (32 caps + 32 fillet/chamfer modifier faces) → L4 becomes fully
-reconstructable offline; then verify revolve@13/@80 + mirror against the real oracle and
-continue sweep/shell/hole/draft (need path/point/face resolution — oracle-dependent).
-Keys: A `on_jG5pI…` (primary), B `on_keK1…` (`_2`); both in `../../onshape-exp/.env`.
+**Translators/fixes this session:** **datum no-ops** (verified f2); **revolve** + **mirror**
+(self-validating synthetic tests); **direct-edit feasibility proofs** (`test_direct_edit.py`);
+`number*mm`/`*deg` **dimension parser** fix (was None → "no candidate"); **WorkerEngine
+survives child segfaults** (not just hangs); **add-all** extrude convention (bridge N bodies
+→ 1; fixed f6); **resolve_sketch_regions** — Onshape's EXACT sketch regions as extrude
+profiles (our even-odd mis-splits: Sketch 2 has 15 true regions vs 9 extracted).
+
+**L4 progress (real oracle, features 0–12):** f0–f6 now exact (datum no-op, add-all, true
+regions). **Remaining extrude gap:** cuts that use a region SUBSET (f7 removes 404mm³ = a
+specific 2–3 of 15 regions; single/all-region variants don't cover subsets, and `qCreatedBy`
+returns 0 faces for the cut so there's no cap to derive it). **Fix = resolve the extrude's
+`entities` query → exact regions** (the opaque-query wall; not yet cracked). Also
+**performance**: true_region_candidates × multi-region blows up the search (~8min/13 feats) —
+pick() short-circuits on exact match, so fixing correctness fixes most of it; consider
+volume-delta-guided candidate ORDERING (rank regions by area×depth ≈ oracle ΔV).
+
+**BLOCKED — all 3 keys capped** (soonest ~3h, C ~21h). Cached for L4: oracle 170/170,
+sketches, features, caps 58/59, modifier faces 30/31, and a PARTIAL set of sketch regions
+(early sketches through ~rollback 121). On reset: finish `resolve_sketch_regions` (the tail
+sketches), then crack the `entities`-query region subset for cuts.
 
 ## Current status (2026-08-05)
 
