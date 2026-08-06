@@ -292,19 +292,31 @@ class WorkerEngine:
                 "live_after": cand.live_after}
 
     def edges(self, names: list[str]) -> dict:
-        self._pconn.send(("edges", list(names)))
-        if not self._pconn.poll(self.timeout):
+        try:
+            self._pconn.send(("edges", list(names)))
+            if not self._pconn.poll(self.timeout):
+                self._restart()
+                return {}
+            tag, val = self._pconn.recv()
+        except (EOFError, BrokenPipeError, OSError):
             self._restart()
             return {}
-        tag, val = self._pconn.recv()
         return val if tag == "ok" else {}
 
     def try_candidate(self, cand: "Candidate"):
-        self._pconn.send(("try", self._cand_dict(cand)))
-        if not self._pconn.poll(self.timeout):    # hang -> kill, respawn, reject
+        # A candidate can HANG OCCT (caught by the poll timeout) OR crash the child outright
+        # (an OCCT segfault on degenerate revolve/boolean geometry closes the pipe -> recv
+        # raises EOFError). Both must respawn the child and reject the candidate, else one
+        # bad candidate kills the whole reconstruction.
+        try:
+            self._pconn.send(("try", self._cand_dict(cand)))
+            if not self._pconn.poll(self.timeout):    # hang -> kill, respawn, reject
+                self._restart()
+                return None, None
+            tag, val = self._pconn.recv()
+        except (EOFError, BrokenPipeError, OSError):   # child died mid-candidate
             self._restart()
             return None, None
-        tag, val = self._pconn.recv()
         if tag == "ok":
             return val
         return None, None                          # rejected (bad geometry)
