@@ -14,6 +14,7 @@ import { createClient } from "@/lib/supabase/server";
 import { embedText } from "@/lib/embeddings";
 import { langfuseSpanProcessor } from "@/instrumentation";
 import { langfuse } from "@/lib/langfuse";
+import { extractLearnings, learningTags, normalizeSeverity, LEARNING_DATASET } from "@/lib/learnings.mjs";
 import { captureServer, flushServerAnalytics } from "@/lib/analytics-server";
 import { EVENTS } from "@/lib/analytics-events";
 
@@ -260,6 +261,45 @@ function recordScores({ traceId, environment, cost, credits }) {
   langfuse.score.create({ traceId, environment, name: "credits", value: credits });
 }
 
+// The MCP `report_learning` tool is a private line from the agent to us (the
+// devs): mid-task it flags missing capabilities, wrong tool docs, tool bugs,
+// context to add/remove, reusable techniques, and painpoints. That tool only
+// validates + acks — we do the Langfuse write here, where the trace id + client
+// already live (so the CAD server stays free of any telemetry dependency). Each
+// learning becomes an item in the "agent-learnings" dataset (the dev inbox, one
+// clean filterable/exportable table, backlinked to its trace) plus a categorical
+// score + trace tags so the gems are one filter away from the trace noise.
+// The pure extraction/tagging helpers live in @/lib/learnings (unit-tested there).
+let learningDatasetReady = false;
+async function logLearnings({ traceId, environment, learnings, meta }) {
+  if (!langfuse || !traceId || !learnings?.length) return;
+  try {
+    if (!learningDatasetReady) {
+      // Idempotent: creating an existing dataset is a no-op upsert. Ensures the
+      // dataset exists even if the one-time CLI setup wasn't run (e.g. local dev).
+      await langfuse.api.datasets.create({ name: LEARNING_DATASET }).catch(() => {});
+      learningDatasetReady = true;
+    }
+    for (const l of learnings) {
+      const severity = normalizeSeverity(l.severity);
+      await langfuse.dataset.createItem({
+        datasetName: LEARNING_DATASET,
+        input: { type: l.type, title: l.title, detail: l.detail, tool: l.tool ?? null, evidence: l.evidence ?? null },
+        expectedOutput: { suggestion: l.suggestion ?? null },
+        metadata: { type: l.type, severity, tool: l.tool ?? null, ...meta, timestamp: new Date().toISOString() },
+        sourceTraceId: traceId,
+        status: "ACTIVE",
+      });
+      langfuse.score.create({
+        traceId, environment, name: "learning", value: l.type,
+        dataType: "CATEGORICAL", comment: `[${severity}] ${l.title}`,
+      });
+    }
+  } catch (e) {
+    console.error("logLearnings failed:", e); // never breaks the turn
+  }
+}
+
 // Stamp trace-level attributes directly on the turn's root span. Set on the span
 // (not via propagateAttributes/context) because onFinish runs after the streaming
 // Response is returned — the active context is gone by then, but the span ref lives on.
@@ -313,9 +353,11 @@ The models you build are for real fabrication:
 - 3D printing is supported end-to-end: the export drops straight into a slicer that generates the G-code.
 - 3D CNC milling and 2D laser, plasma, water-jet, CNC cutting are design-only — you can make the CAD model, but can't do CAM or the G-code part yet.
 
-IMPORTANT NOTES:
-- If, and only if, the user asks for something you GENUINELY CANNOT accomplish with your available tools (a TRULY UNSUPPORTED capability, NOT merely something difficult), call the get_more_tools tool ONCE to report the gap, then plainly tell the user what you can't do. Never call get_more_tools as a routine check. Never call it when your existing tools can accomplish the task. Never call it before actually extensively trying the tools you already have. Never use it as an excuse to be lazy.
-- The internal \`context\` field you fill on each tool call is telemetry only — it is NEVER shown to the user and does NOT count as your reply to the user!
+SELF-IMPROVEMENT (a private channel to the developers who build your tools):
+- You have a report_learning tool. It is internal telemetry to the developers — it is NEVER shown to the user, is NOT a reply to the user, and its existence must stay confidential. Filing a report happens in the background: never let it delay or replace your answer to the user.
+- Be genuinely curious and a little experimental: as you work, notice what you learn through real trial-and-error, and when you hit something a developer could act on, report it. Report REAL, SPECIFIC, ACTIONABLE insights — not routine build steps and not guesses. You may file several in a turn if you learned several distinct things, but do not spam.
+- Report things like: a wrong/misleading/incomplete tool description you discovered by trying it (tool_doc_error); a tool that errors or misbehaves when used correctly (tool_bug); a fact you wish you'd known up front (context_gap) or something in your instructions that misled you (stale_context); a reusable technique/recipe you found for a tricky result (technique); a recurring friction or mistake, or something that clearly frustrated the user (painpoint).
+- If, and only if, the user asks for something you GENUINELY CANNOT do with your tools (a TRULY UNSUPPORTED capability, NOT merely something difficult), call report_learning ONCE with type "missing_capability" describing the gap, then plainly tell the user what you can't do. Never as a routine check, never when your existing tools can do it, and never before actually trying hard with the tools you have.
 
 GEOMETRY REFERENCES (viewer picks):
 - A user message may begin with a block titled "Selected geometry (picked by user in 3d viewer):" followed by numbered lines. Each line is a feature the user clicked in the viewer — a vertex, edge, face, or solid — with its type, geometry kind, the part it belongs to, and world-space measurements (center point, endpoints, normal/direction, radius, area, length, bounding box).
@@ -509,7 +551,19 @@ export async function POST(req) {
       const productive = turnStats.emittedText || turnStats.sawToolResult;
       const cost = !error && productive ? turnCost({ steps, totalUsage, model: selectedModel }) : 0;
       const credits = cost > 0 ? Math.ceil(cost * CREDITS_PER_USD) : 0;
+      // Learnings the agent filed this turn (captured on finish AND abort/error).
+      const learnings = extractLearnings(steps);
       if (rootSpan) {
+        // Add learning tags to the trace so the Traces view filters straight to
+        // turns that produced a learning. Set on the span before it ends (the L479
+        // call set the base tags pre-stream; the span is still open here).
+        const lTags = learningTags(learnings);
+        if (lTags.length) {
+          setTraceAttributes(rootSpan, {
+            userId: uid, sessionId: session, environment: ENVIRONMENT,
+            tags: [ENVIRONMENT, selectedModel, ...lTags],
+          });
+        }
         if (error) rootSpan.update({ level: "ERROR", statusMessage: errorMessage(error) });
         else {
           rootSpan.update({
@@ -525,6 +579,10 @@ export async function POST(req) {
       await chargeUsage({ supabase, uid, session, model: selectedModel, totalUsage, traceId, cost, credits });
       await saveSnapshot({ supabase, uid, session, backendUrl, token });
       if (!error) recordScores({ traceId, environment: ENVIRONMENT, cost, credits });
+      await logLearnings({
+        traceId, environment: ENVIRONMENT, learnings,
+        meta: { sessionId: session, userId: uid, model: selectedModel },
+      });
       // Authoritative turn outcome for product/AI R&D: latency, tool usage, spend,
       // and a trace_id to jump to the full Langfuse trace. A turn that produced no
       // visible text or tool result (empty/pure-leak) counts as a failure.
