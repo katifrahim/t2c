@@ -414,6 +414,16 @@ def _op_candidates(engine: Engine, tool_payloads: list[dict], tool: str, op: str
         cands.append(Candidate(tool_payloads + [boolean],
                                [res if x == target else x for x in base_live],
                                f"{prefix}|{op}->{ti}"))
+    if op == "add" and len(base_live) > 1:
+        # an ADD that BRIDGES several bodies into one (the tool overlaps 2+ existing
+        # bodies): union the tool AND all bodies into a single merged solid. Without this
+        # the volume is right but the body COUNT is wrong (N bodies instead of 1).
+        res = engine.name()
+        ops = ([{"method": "union", "args": [{"_ref": tool}]}]
+               + [{"method": "union", "args": [{"_ref": b}]} for b in base_live[1:]])
+        cands.append(Candidate(tool_payloads
+                               + [{"operations": ops, "start_from": base_live[0], "store_as": res}],
+                               [res], f"{prefix}|add-all"))
     if op in ("cut", "intersect") and len(base_live) > 1:
         # a REMOVE spanning several bodies (patterned holes): apply to EVERY body.
         payloads, new_live = list(tool_payloads), []
