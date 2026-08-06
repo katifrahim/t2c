@@ -18,7 +18,9 @@ MM = 1e3  # metres -> millimetres
 # Onshape length units -> millimetres.
 _UNIT_MM = {"mm": 1.0, "cm": 10.0, "m": 1000.0, "meter": 1000.0, "millimeter": 1.0,
             "centimeter": 10.0, "in": 25.4, "inch": 25.4, "ft": 304.8, "foot": 304.8, "yd": 914.4}
-_NUM_UNIT = re.compile(r"^\s*(-?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?)\s*([a-zA-Z]*)\s*$")
+# Onshape expressions come in two forms: user-entered "18 mm" and computed
+# "46.199999999999996*mm" (FeatureScript number*unit). Allow an optional '*' separator.
+_NUM_UNIT = re.compile(r"^\s*(-?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?)\s*\*?\s*([a-zA-Z]*)\s*$")
 
 # Onshape operationType enum -> IR boolean op.
 _OP = {"NEW": "new", "ADD": "add", "REMOVE": "cut", "INTERSECT": "intersect"}
@@ -345,7 +347,7 @@ def _extrude_use_counts(feats: list, sketch_ids: set) -> dict:
 def _parse_angle_deg(expr: str | None) -> float | None:
     if not expr:
         return None
-    m = re.match(r"^\s*(-?\d+(?:\.\d+)?)\s*(deg|rad|degree|radian)?\s*$", expr)
+    m = re.match(r"^\s*(-?\d+(?:\.\d+)?)\s*\*?\s*(deg|rad|degree|radian)?\s*$", expr)
     if not m:
         return None
     v = float(m.group(1))
