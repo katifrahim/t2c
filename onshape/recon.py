@@ -477,6 +477,24 @@ def region_extrude_candidates(engine: Engine, plane: ir.Plane, regions: list, de
     return cands
 
 
+def true_region_candidates(engine: Engine, plane: ir.Plane, regions: list, depth: float | None,
+                           op: str, base_live: list[str]) -> list[Candidate]:
+    """Extrude each of Onshape's EXACT sketch regions as ONE atomic profile (even-odd over
+    that region's own loops -> its holes) x dist x op. This is the reliable profile source:
+    unlike our even-odd loop grouping it never mis-splits a complex sketch, so the specific
+    region an extrude uses is always present for the oracle to pick. `regions` is
+    caps_to_regions output (list of regions, each a list of loops)."""
+    init = _plane_init(plane)
+    cands: list[Candidate] = []
+    for ri, loops in enumerate(regions):
+        prof_ops = _profile_ops([ir.Profile(loop) for loop in loops])
+        for dname, dist, sym in _dist_variants(depth):
+            tool = engine.name()
+            make = {"operations": prof_ops + [_ex(dist, sym)], "init_params": init, "store_as": tool}
+            cands += _op_candidates(engine, [make], tool, op, base_live, f"R[{ri}]|{dname}")
+    return cands
+
+
 def _rev(angle: float, a0, a1) -> dict:
     # combine=False: build the revolved solid in isolation, then _op_candidates joins it.
     return {"method": "revolve", "args": [angle, list(a0), list(a1), False]}
@@ -686,7 +704,8 @@ def reconstruct(api, ps, verbose: bool = True, dump: set | None = None,
     from onshape.normalize import (_msg, _params, _enum, _sketch_profiles, caps_to_profiles,
                                    caps_to_regions, _cap_distance, parse_length_mm,
                                    _parse_angle_deg, _extrude_op, _BOOL_OP)
-    from onshape.extract import resolve_extrude_caps, resolve_modifier_faces
+    from onshape.extract import (resolve_extrude_caps, resolve_modifier_faces,
+                                  resolve_sketch_regions)
     from onshape.oracle import body_states
 
     feats = api.features(ps).get("features", [])
@@ -697,6 +716,11 @@ def reconstruct(api, ps, verbose: bool = True, dump: set | None = None,
     extrudes = [(_msg(f)["featureId"], i + 1) for i, f in enumerate(feats)
                 if _msg(f).get("featureType") == "extrude" and not _msg(f).get("suppressed")]
     caps = resolve_extrude_caps(api, ps, extrudes)
+    # Onshape's EXACT sketch regions (see resolve_sketch_regions): our even-odd extraction
+    # mis-splits complex sketches, so an extrude's true profile region may be missing.
+    sketches = [(_msg(f)["featureId"], i + 1) for i, f in enumerate(feats)
+                if _msg(f).get("featureType") == "newSketch" and not _msg(f).get("suppressed")]
+    sketch_regions = resolve_sketch_regions(api, ps, sketches)
     mods = [(_msg(f)["featureId"], i + 1) for i, f in enumerate(feats)
             if _msg(f).get("featureType") in ("fillet", "chamfer") and not _msg(f).get("suppressed")]
     edge_pts = resolve_modifier_faces(api, ps, mods)
@@ -768,6 +792,12 @@ def reconstruct(api, ps, verbose: bool = True, dump: set | None = None,
                 if depth is None and fcaps and matrix:
                     d = _cap_distance(fcaps, matrix)
                     depth = abs(d) if d else None
+                # Onshape's EXACT regions for this sketch (the reliable profile source).
+                true_regs = caps_to_regions(sketch_regions.get(sid) or [], matrix) if matrix else []
+                if true_regs:
+                    cands += true_region_candidates(eng, plane, true_regs, depth, op.op, eng.live)
+                    if len(true_regs) >= 2:
+                        cands += region_extrude_candidates(eng, plane, true_regs, depth, op.op, eng.live)
                 if sid in sk:
                     profs = _sketch_profiles(sk[sid])
                     if profs:

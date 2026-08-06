@@ -80,6 +80,21 @@ _FS_CAPS = """function(context is Context, queries){
 }"""
 
 
+def resolve_sketch_regions(api: Onshape, ps: PartStudio, sketches: list[tuple]) -> dict:
+    """{sketchFeatureId: [{"n": [x,y,z], "edges": [[p0,pmid,p1] mm, ...]}, ...]} — the
+    EXACT closed regions of each sketch, straight from Onshape's kernel.
+
+    A sketch's regions (the faces it bounds) are what an extrude actually selects. Deriving
+    them ourselves from the raw curves (even-odd loop grouping) silently mis-splits complex
+    sketches — e.g. L4 Sketch 2 has 15 regions but our extraction found 9, dropping exactly
+    the small region a later cut needs. So we ask Onshape: at each sketch's own rollback
+    (index just after it, before any extrude consumes its faces) the region faces are
+    pristine; reuse the cap sampler (qCreatedBy -> planar faces -> boundary edges at 0/.5/1).
+    `sketches` is [(sketchFeatureId, rollback_index)]. Same shape as resolve_extrude_caps,
+    so caps_to_regions/caps_to_profiles consume it directly."""
+    return resolve_extrude_caps(api, ps, sketches)
+
+
 def resolve_extrude_caps(api: Onshape, ps: PartStudio, extrudes: list[tuple]) -> dict:
     """{featureId: [{"n": [x,y,z], "edges": [[p0,pmid,p1] mm, ...]}, ...]}.
 
