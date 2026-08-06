@@ -3108,6 +3108,7 @@ async def extension_api(
     • sprocket / chain — Sprocket (num_teeth, chain_pitch, …); Chain across sprockets.
     • drafting — dimension_line, extension_line, callout: dimension & annotation
                  assemblies; params are the op's args (e.g. path) plus look settings.
+                 Refrain from using "callout" unless the user explicitly requests it.
 
     ── FASTENER HOLES & PLACEMENT (in the OTHER tools) ──────────────────────────
     Matching holes for a fastener are cut in workplane_api, not here — call these
