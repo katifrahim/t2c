@@ -222,6 +222,7 @@ class Session:
     state: Dict[str, Any] = field(default_factory=dict)       # name → CadQuery object
     counters: Dict[str, int] = field(default_factory=dict)    # auto-naming counters
     current: Optional[str] = None                             # active object name
+    auto_names: set = field(default_factory=set)              # names we auto-generated (vs explicit store_as)
     # Latest tessellated model the browser polls (/model serves payload; /version
     # lets it detect changes and reports obj_type for 2D-only export formats).
     viewer: Dict[str, Any] = field(
@@ -303,9 +304,12 @@ def _get(name: Optional[str]) -> Any:
 
 
 def _auto_name(prefix: str) -> str:
-    c = _sess().counters
+    sess = _sess()
+    c = sess.counters
     c[prefix] = c.get(prefix, 0) + 1
-    return f"{prefix}_{c[prefix]}"
+    name = f"{prefix}_{c[prefix]}"
+    sess.auto_names.add(name)  # mark as auto so snapshots can prune stale intermediates
+    return name
 
 
 # --- Durable snapshots ---------------------------------------------------------
@@ -322,14 +326,35 @@ def _iter_assemblies(obj: Any):
             yield from _iter_assemblies(c)
 
 
+# How many recent auto-named objects to keep in the durable snapshot beyond the
+# active + explicitly-named models. A recency window protects fresh intermediates
+# the agent may still reference next turn while shedding old superseded ones.
+SNAPSHOT_KEEP_RECENT = int(os.environ.get("SNAPSHOT_KEEP_RECENT", 10))
+
+
+def _prune_for_snapshot(sess: "Session") -> Dict[str, Any]:
+    """The subset of the object store worth persisting. Keeps: the active model
+    (viewer + resume anchor — never dropped), every explicitly-named model (the
+    agent references these by name), and the most recently created objects (recency
+    window). Superseded older auto-named intermediates are dropped from the DURABLE
+    copy only — the live session keeps everything, so nothing is lost mid-chat."""
+    names = list(sess.state.keys())  # dict preserves creation order
+    keep = {n for n in names if n not in sess.auto_names}   # explicit store_as names
+    if sess.current in sess.state:
+        keep.add(sess.current)                              # active model — always
+    keep.update(names[-SNAPSHOT_KEEP_RECENT:])              # recency window
+    return {n: sess.state[n] for n in names if n in keep}   # keep creation order
+
+
 def _snapshot(sess: "Session") -> bytes:
+    objects = _prune_for_snapshot(sess)
     # A solved Assembly caches an OCCT solver result (`_solve_result`) holding a
     # non-picklable SwigPyObject. It's just solver metadata — solve() regenerates
     # it and the solved child locations are already baked in — so strip it for the
     # dump and restore it on the live objects afterward. Constraints (picklable)
     # are kept, so a restored assembly can still be re-solved.
     stripped = []
-    for obj in sess.state.values():
+    for obj in objects.values():
         for a in _iter_assemblies(obj):
             sr = getattr(a, "_solve_result", None)
             if sr is not None:
@@ -337,7 +362,8 @@ def _snapshot(sess: "Session") -> bytes:
                 stripped.append((a, sr))
     try:
         raw = pickle.dumps(
-            {"counters": dict(sess.counters), "current": sess.current, "objects": sess.state},
+            {"counters": dict(sess.counters), "current": sess.current, "objects": objects,
+             "auto_names": [n for n in sess.auto_names if n in objects]},
             protocol=pickle.HIGHEST_PROTOCOL,
         )
         # Deflate: BREP/pickle geometry is highly redundant, so this shrinks the
@@ -399,6 +425,8 @@ def _restore_into(sess: "Session", data: bytes) -> int:
     sess.state = {name: _normalize(o) for name, o in objs.items()}
     sess.counters = d.get("counters", {}) or {}
     sess.current = d.get("current")
+    # Restore auto-name tracking (legacy blobs lack it → treat survivors as explicit).
+    sess.auto_names = set(d.get("auto_names", [])) & set(sess.state)
     return len(sess.state)
 
 # =============================================================================
