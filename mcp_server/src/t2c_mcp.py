@@ -223,6 +223,8 @@ class Session:
     counters: Dict[str, int] = field(default_factory=dict)    # auto-naming counters
     current: Optional[str] = None                             # active object name
     auto_names: set = field(default_factory=set)              # names we auto-generated (vs explicit store_as)
+    rev: int = 0                                              # bumps on every CAD-state mutation
+    exported_rev: int = -1                                    # rev at last /session/export (skip re-export when equal)
     # Latest tessellated model the browser polls (/model serves payload; /version
     # lets it detect changes and reports obj_type for 2D-only export formats).
     viewer: Dict[str, Any] = field(
@@ -291,6 +293,7 @@ def _store(name: str, obj: Any) -> None:
     sess = _sess()
     sess.state[name] = obj
     sess.current = name
+    sess.rev += 1  # CAD state changed → snapshot is now stale (see /session/export)
 
 
 def _get(name: Optional[str]) -> Any:
@@ -427,6 +430,10 @@ def _restore_into(sess: "Session", data: bytes) -> int:
     sess.current = d.get("current")
     # Restore auto-name tracking (legacy blobs lack it → treat survivors as explicit).
     sess.auto_names = set(d.get("auto_names", [])) & set(sess.state)
+    # Restored state == what's already stored, so mark clean: no re-export until a
+    # real mutation. (The route re-shows current for the viewer; that's not a change.)
+    sess.rev = 0
+    sess.exported_rev = 0
     return len(sess.state)
 
 # =============================================================================
@@ -3042,6 +3049,7 @@ async def select_model(name: str, ctx: Context = None) -> str:
     try:
         obj = _get(name)  # raises if name unknown
         sess.current = name
+        sess.rev += 1  # active model changed → snapshot stale (reopened chat must show this one)
         await anyio.to_thread.run_sync(_show, obj)
         return json.dumps({"status": "success", "name": name,
                            "obj_type": _obj_type(obj), "properties": _properties(obj)})
@@ -3477,11 +3485,16 @@ async def _session_export(request):
     sess = _get_session(request.query_params.get("session"))
     if not sess.state:
         return JSONResponse({"error": "empty"}, status_code=404)
+    # Nothing changed since the last export (e.g. a Q&A / doc-only turn) → tell the
+    # web layer to skip the re-upload. Avoids re-writing an identical blob every turn.
+    if sess.rev == sess.exported_rev:
+        return Response(status_code=304)
     try:
         data = _snapshot(sess)
     except Exception as e:
         _log_err(str(e), traceback.format_exc())
         return JSONResponse({"error": "snapshot failed"}, status_code=500)
+    sess.exported_rev = sess.rev
     return Response(data, media_type="application/octet-stream")
 
 

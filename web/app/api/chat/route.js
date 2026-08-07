@@ -157,6 +157,7 @@ async function saveSnapshot({ supabase, uid, session, backendUrl, token }) {
         headers: token ? { Authorization: `Bearer ${token}` } : {},
       });
       if (resp.status === 404) return; // empty session, nothing to save
+      if (resp.status === 304) return; // unchanged since last save — skip the re-upload
       if (!resp.ok) throw new Error(`export ${resp.status}`);
       const b64 = Buffer.from(await resp.arrayBuffer()).toString("base64");
       const { error } = await supabase.from("session_snapshots").upsert({
