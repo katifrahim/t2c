@@ -21,6 +21,9 @@ import { EVENTS } from "@/lib/analytics-events";
 const SUPABASE_ON = !!process.env.NEXT_PUBLIC_SUPABASE_URL;
 const LANGFUSE_ON = !!process.env.LANGFUSE_PUBLIC_KEY;
 const ENVIRONMENT = process.env.VERCEL_ENV || process.env.NODE_ENV || "development";
+// CAD session snapshots live in this private Storage bucket (off Postgres), keyed
+// by "<uid>/<chatId>". See web/supabase/snapshots-storage.sql for bucket + RLS.
+const SNAPSHOT_BUCKET = "cad-snapshots";
 
 // Refuse a new turn once the balance can't cover roughly one more turn, so we
 // never go negative (hard block). ~5 credits ≈ $0.005 ≈ a few messages of margin.
@@ -144,10 +147,12 @@ function makeCleanupTransform(stats) {
     });
 }
 
-// After a turn, snapshot the backend session's CAD objects to Supabase so they
-// survive restarts. 404 means an empty session (nothing to save); any other
-// failure is transient, so retry once before giving up — a swallowed error here
-// is exactly why a reopened chat sometimes shows no model.
+// After a turn, snapshot the backend session's CAD objects so they survive
+// restarts. Stored in Supabase Storage (object storage) under "<uid>/<chat>",
+// NOT Postgres — keeping large CAD blobs off the DB disk + disk-IO budget. 404 =
+// empty session; 304 = unchanged since last save (skip). Other failures are
+// transient, so retry once — a swallowed error here is exactly why a reopened
+// chat sometimes shows no model.
 async function saveSnapshot({ supabase, uid, session, backendUrl, token }) {
   if (!supabase || !uid || !session || session.startsWith("__LOCALID")) return;
   for (let attempt = 0; attempt < 2; attempt++) {
@@ -159,13 +164,13 @@ async function saveSnapshot({ supabase, uid, session, backendUrl, token }) {
       if (resp.status === 404) return; // empty session, nothing to save
       if (resp.status === 304) return; // unchanged since last save — skip the re-upload
       if (!resp.ok) throw new Error(`export ${resp.status}`);
-      const b64 = Buffer.from(await resp.arrayBuffer()).toString("base64");
-      const { error } = await supabase.from("session_snapshots").upsert({
-        chat_id: session,
-        user_id: uid,
-        data: b64,
-        updated_at: new Date().toISOString(),
-      });
+      const bytes = Buffer.from(await resp.arrayBuffer());
+      const { error } = await supabase.storage
+        .from(SNAPSHOT_BUCKET)
+        .upload(`${uid}/${session}`, bytes, {
+          upsert: true,
+          contentType: "application/octet-stream",
+        });
       if (error) throw error;
       return;
     } catch (e) {

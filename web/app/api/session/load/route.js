@@ -1,6 +1,7 @@
 import { createClient } from "@/lib/supabase/server";
 
 const CONFIGURED = !!process.env.NEXT_PUBLIC_SUPABASE_URL;
+const SNAPSHOT_BUCKET = "cad-snapshots";
 
 // POST /api/session/load?session=<chatId> — restore a chat's saved CAD objects
 // into the backend session so a reopened chat's models come back after a restart.
@@ -11,17 +12,31 @@ export async function POST(req) {
   if (!session || session.startsWith("__LOCALID")) return Response.json({ restored: false });
 
   const supabase = await createClient();
-  const { data } = await supabase
-    .from("session_snapshots")
-    .select("data")
-    .eq("chat_id", session)
-    .maybeSingle();
-  if (!data?.data) return Response.json({ restored: false });
+  const { data: claims } = await supabase.auth.getClaims();
+  const uid = claims?.claims?.sub ?? null;
+
+  // Preferred source: the blob in Storage (off Postgres).
+  let bytes = null;
+  if (uid) {
+    const { data: blob } = await supabase.storage
+      .from(SNAPSHOT_BUCKET)
+      .download(`${uid}/${session}`);
+    if (blob) bytes = Buffer.from(await blob.arrayBuffer());
+  }
+  // Legacy fallback: base64 blob in the session_snapshots table (pre-Storage chats).
+  if (!bytes) {
+    const { data } = await supabase
+      .from("session_snapshots")
+      .select("data")
+      .eq("chat_id", session)
+      .maybeSingle();
+    if (data?.data) bytes = Buffer.from(data.data, "base64");
+  }
+  if (!bytes) return Response.json({ restored: false });
 
   const backendUrl = process.env.BACKEND_URL ?? "http://localhost:8080";
   const token = process.env.MCP_TOKEN;
   try {
-    const bytes = Buffer.from(data.data, "base64");
     const resp = await fetch(
       `${backendUrl}/session/import?session=${encodeURIComponent(session)}`,
       {
