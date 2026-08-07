@@ -11,7 +11,13 @@ import "./globals.css";
 const geistSans = Geist({ subsets: ["latin"], variable: "--font-sans" });
 const spaceMono = Space_Mono({ subsets: ["latin"], weight: ["400", "700"], variable: "--font-wordmark" });
 
-export const metadata = { title: "T2C" };
+// default = homepage tab title; template gives sub-pages "<Page> · Cadopy".
+export const metadata = {
+  title: {
+    default: "Cadopy - Text2CAD AI",
+    template: "%s · Cadopy",
+  },
+};
 
 export default function RootLayout({ children }) {
   return (
