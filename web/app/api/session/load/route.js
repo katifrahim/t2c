@@ -24,6 +24,9 @@ export async function POST(req) {
     if (blob) bytes = Buffer.from(await blob.arrayBuffer());
   }
   // Legacy fallback: base64 blob in the session_snapshots table (pre-Storage chats).
+  // TODO(2026-09-07): remove this fallback + `drop table public.session_snapshots`
+  // in the SQL editor. By then every active chat has re-saved to the Storage bucket,
+  // so the table holds nothing of value and is dead weight.
   if (!bytes) {
     const { data } = await supabase
       .from("session_snapshots")
