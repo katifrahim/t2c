@@ -20,6 +20,7 @@ import src.t2c_mcp as m
 from src.t2c_mcp import (
     _bind, _store, _auto_name, _get, _show, _snapshot, _restore_into,
     _prune_for_snapshot, SNAPSHOT_KEEP_RECENT, _session_export, select_model,
+    _session_import, _model,
 )
 
 
@@ -28,10 +29,20 @@ def _box():
 
 
 class _Req:
-    """Minimal stand-in for a Starlette request for the /session/export route."""
+    """Minimal stand-in for a Starlette request for the export/model routes."""
     def __init__(self, sid):
         self.query_params = {"session": sid}
         self.headers = {}
+
+
+class _ImportReq(_Req):
+    """Adds an async body() for the /session/import route."""
+    def __init__(self, sid, body):
+        super().__init__(sid)
+        self._body = body
+
+    async def body(self):
+        return self._body
 
 
 def _fresh(sid):
@@ -164,3 +175,32 @@ def test_restored_session_is_clean_no_immediate_reexport():
     assert asyncio.run(_session_export(_Req(sid))).status_code == 304
     _store("more", _box())
     assert asyncio.run(_session_export(_Req(sid))).status_code == 200   # real change re-exports
+
+
+# ── end-to-end: a simulated server restart restores the model into the viewer ──
+
+def test_restart_restore_shows_last_model_and_reference_works():
+    # Build a chat's models, snapshot it (as the save path does).
+    src = _fresh("sid-a")
+    _store("gearbox", _box())                       # an explicitly-named model
+    for _ in range(4):
+        _store(_auto_name("workplane"), _box())     # intermediates
+    src.current = "gearbox"                          # active model = the named one
+    blob = _snapshot(src)
+
+    # Simulate a server restart: a brand-new empty session, restored via the REAL
+    # /session/import route (exactly what /api/session/load POSTs on chat reopen).
+    _fresh("sid-b")
+    before = m._sessions["sid-b"].viewer["version"]
+    res = asyncio.run(_session_import(_ImportReq("sid-b", blob)))
+    assert res.status_code == 200
+    assert json.loads(res.body)["status"] == "ok"
+
+    sess = m._sessions["sid-b"]
+    # VIEWER: import re-showed the active model, so /model serves it (not a 404).
+    assert sess.viewer["version"] > before          # the active model was (re)shown
+    assert asyncio.run(_model(_Req("sid-b"))).status_code == 200
+    # RESUME/REFERENCE: the active + named models came back and are usable.
+    assert sess.current == "gearbox"
+    assert _get("gearbox").val().Volume() > 0        # (bound to sid-b by _session_import)
+
