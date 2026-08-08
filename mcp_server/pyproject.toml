@@ -18,7 +18,9 @@ dependencies = [    # prod deps
     # Parametric part plugins (gears + mechanical parts), pinned to a commit.
     # Both only need the already-pinned cadquery/numpy, so they don't move the pin.
     "cq_gears @ git+https://github.com/meadiode/cq_gears.git@e73874cf17a25447a99b1e7c22a4d5af38560e9c",
-    "cq_warehouse @ git+https://github.com/gumyr/cq_warehouse.git@daa46507ecc429c0e2dce11d9d5ffd09b12a42af"
+    "cq_warehouse @ git+https://github.com/gumyr/cq_warehouse.git@daa46507ecc429c0e2dce11d9d5ffd09b12a42af",
+    # Adds a Workplane.heatsert() hole builder (M3–M6 presets). No deps of its own.
+    "heatserts @ git+https://github.com/CadQuery/cadquery-plugins.git@364500a1adeb7b99bf06135245850f5ba70b9ae6#subdirectory=plugins/heatserts"
 ]
 
 [project.optional-dependencies]

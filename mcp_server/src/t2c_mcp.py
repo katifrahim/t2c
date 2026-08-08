@@ -142,6 +142,7 @@ def _load_extension_plugins() -> None:
         import cq_warehouse.chain as _ch
         import cq_warehouse.drafting as _dr
         import cq_gears as _gears
+        import heatserts                       # noqa: F401  (import adds Workplane.heatsert)
     except Exception as e:  # plugins are optional
         print(f"[t2c] extension plugins unavailable: {e}", file=sys.stderr, flush=True)
         return
@@ -1636,6 +1637,8 @@ async def workplane_api(
 	        - Makes a countersunk hole for each item on the stack.
         hole(diameter: float, depth: float | None=None, clean: bool=True)
 	        - Makes a simple hole for each item on the stack.
+        heatsert(size: str='M6', bolt_clear: float=0, chamfer=None, clean: bool=True)
+	        - Cuts a heatsert (threaded-insert) hole for each point on the stack; size is 'M3'/'M4'/'M5'/'M6'. For 3D-printed parts. query_docs(["heatsert"]) for params.
       # primitives:
         box(length: float, width: float, height: float, centered: Union[bool, Tuple[bool, bool, bool]]=True, combine: Union[bool, Literal['cut', 'a', 's']]=True, clean: bool=True)
 	        - Return a 3d box with specified dimensions for each object on the stack. 
