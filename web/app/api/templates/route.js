@@ -1,4 +1,5 @@
 import { embedText } from "@/lib/embeddings";
+import { contentHash } from "@/lib/reembed";
 import { createClient } from "@/lib/supabase/server";
 
 // POST /api/templates — store a reviewed template in the shared RAG library. Called
@@ -49,6 +50,9 @@ export async function POST(req) {
     visibility: vis,
     review_status: vis === "public" ? "pending" : null,
     embedding,
+    // Record the text this embedding was made from, so a later re-embed pass skips
+    // this row until its title/description is actually edited.
+    content_hash: contentHash(t, d),
   });
   if (error) {
     console.error("template insert failed:", error);
