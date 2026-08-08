@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8" standalone="no"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 135.46667 135.46667">
+  <style>
+    .ring { fill: #000000; }
+    .core { fill: #ffffff; }
+    @media (prefers-color-scheme: dark) {
+      .ring { fill: #ffffff; }
+      .core { fill: #000000; }
+    }
+  </style>
+  <path class="ring" d="m 67.574111,5.344728 53.861709,31.086998 0.0199,62.142839 -53.841948,31.119335 -53.88086,-31.107285 0.0079,-62.142991 z" />
+  <path class="core" d="m 67.891994,33.063074 29.6698,17.138991 0.0313,34.266939 -29.679632,17.164436 -29.68105,-17.15258 0.0087,-34.299998 z" />
+</svg>

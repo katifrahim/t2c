@@ -10,6 +10,6 @@ export const config = {
   // API routes). ingest/ = PostHog reverse proxy, _vercel/ = Vercel Analytics —
   // both must bypass the auth gate or their scripts get redirected to /login.
   matcher: [
-    "/((?!_next/static|_next/image|favicon.ico|tcv/|ingest/|_vercel/|.*\\.(?:svg|png|jpg|jpeg|gif|webp|ico)$).*)",
+    "/((?!_next/static|_next/image|favicon.ico|manifest.webmanifest|tcv/|ingest/|_vercel/|.*\\.(?:svg|png|jpg|jpeg|gif|webp|ico)$).*)",
   ],
 };
