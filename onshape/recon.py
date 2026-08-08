@@ -1,0 +1,944 @@
+"""Closed-loop reconstruction engine.
+
+Instead of hand-coding each feature's conventions and hoping, we generate a small set
+of candidate op-sequences per feature — enumerating the genuinely ambiguous choices
+(extrude direction ±, which loops form a region, symmetric or not, which body an
+op targets) — execute each through the REAL t2c_mcp engine, and keep the candidate
+whose resulting solids match Onshape's own geometry at that feature (the oracle). So
+conventions are DISCOVERED per feature, not encoded, and any error is caught at the
+feature that causes it. This is what makes translation universal instead of a stream
+of per-model fixes.
+
+This module holds the engine + the sketch/extrude translators (the parametric core).
+Pattern/boolean/fillet/mirror/... plug in the same way: each yields candidates; the
+oracle picks.
+"""
+from __future__ import annotations
+
+import asyncio
+import json
+import os
+import sys
+from dataclasses import dataclass, field
+
+from onshape import ir
+from onshape.emit import _profile_ops, _plane_init  # profile curves -> workplane ops
+from onshape.oracle import Body, State
+
+_MCP_SRC = os.path.join(os.path.dirname(__file__), "..", "mcp_server", "src")
+if _MCP_SRC not in sys.path:
+    sys.path.insert(0, _MCP_SRC)
+import t2c_mcp as _mcp  # noqa: E402
+
+
+# --- fingerprinting a reconstructed body (same shape as an oracle Body) ----------
+def fingerprint(wp) -> Body | None:
+    """CadQuery Workplane -> oracle Body (mm), or None if it holds no solid."""
+    try:
+        val = wp.val()
+    except Exception:  # noqa: BLE001
+        return None
+    if val is None or not hasattr(val, "Volume"):
+        return None
+    try:
+        if not val.Solids():      # a wire/face/empty compound is not a solid body
+            return None           # (Wire.Volume() misleadingly returns its perimeter)
+        vol = val.Volume()
+        area = sum(f.Area() for f in val.Faces())
+        bb = val.BoundingBox()
+        c = val.Center()
+    except Exception:  # noqa: BLE001
+        return None
+    return Body(volume=vol, area=area, centroid=[c.x, c.y, c.z],
+                bbox_min=[bb.xmin, bb.ymin, bb.zmin], bbox_max=[bb.xmax, bb.ymax, bb.zmax])
+
+
+# --- explicit sketch plane (NO canonicalization — keeps the true frame, so extrude
+# direction is unambiguous rather than being recovered by luck) -------------------
+def explicit_plane(matrix: list[float]) -> ir.Plane:
+    o = [matrix[3] * 1e3, matrix[7] * 1e3, matrix[11] * 1e3]
+    x = [matrix[0], matrix[4], matrix[8]]
+    n = [matrix[2], matrix[6], matrix[10]]
+    return ir.Plane(origin=[round(v, 9) for v in o],
+                    x_dir=[round(v, 9) for v in x], normal=[round(v, 9) for v in n])
+
+
+# --- the engine: run steps through real t2c_mcp, with snapshot/restore for search -
+class Engine:
+    """Drives the real workplane_api against a persistent session. `live` tracks the
+    mcp names of the current top-level solids (what the oracle State is compared to)."""
+
+    def __init__(self):
+        _mcp._sessions.pop(_mcp._LOCAL_SID, None)
+        self.sess = _mcp._get_session(_mcp._LOCAL_SID)
+        # Search runs each candidate through the real workplane_api, but the viewer
+        # tessellation (_show) on every trial is pure waste (hundreds of renders) — and
+        # heavy enough to OOM. No-op it; reconstruction only needs the geometry.
+        _mcp._show = lambda *a, **k: None
+        self.live: list[str] = []
+        self.steps: list[dict] = []
+        self._n = 0
+
+    def name(self) -> str:
+        self._n += 1
+        return f"body{self._n}"
+
+    def snapshot(self):
+        return (dict(self.sess.state), dict(self.sess.counters), self.sess.current, list(self.live))
+
+    def restore(self, snap):
+        s = self.sess
+        s.state.clear(); s.state.update(snap[0])
+        s.counters.clear(); s.counters.update(snap[1])
+        s.current = snap[2]
+        self.live = list(snap[3])
+
+    def _apply(self, payload: dict) -> dict:
+        """Execute one workplane_api call on the live session; return its result."""
+        out = asyncio.run(_mcp.workplane_api(ctx=None, **payload))
+        r = json.loads(out) if isinstance(out, str) else out
+        if r.get("status") != "success":
+            raise RuntimeError(r.get("error") or r.get("message") or "step failed")
+        return r
+
+    def state_of(self, names: list[str]) -> State:
+        bodies = []
+        for n in names:
+            wp = self.sess.state.get(n)
+            fp = fingerprint(wp) if wp is not None else None
+            if fp is not None:
+                bodies.append(fp)
+        return State(bodies=bodies)
+
+    def edges(self, names: list[str]) -> dict:
+        out = {}
+        for n in names:
+            wp = self.sess.state.get(n)
+            if wp is None:
+                continue
+            try:
+                out[n] = [_edge_info(e) for e in wp.val().Edges()]
+            except Exception:  # noqa: BLE001
+                out[n] = []
+        return out
+
+    def _run_candidate(self, cand: "Candidate", record: bool):
+        """Apply a candidate's payloads (skip-chaining if requested); return the applied
+        payloads and the resulting live-body list. Raises on hard failure of a
+        non-skip candidate."""
+        if not cand.skip_failures:
+            for p in cand.payloads:
+                self._apply(p)
+                if record:
+                    self.steps.append({"step": f"Step {len(self.steps) + 1}",
+                                       "toolName": "workplane_api", "input": p})
+            return cand.live_after
+        last = cand.target
+        for p in cand.payloads:
+            p = dict(p); p["start_from"] = last
+            try:
+                self._apply(p)
+            except Exception:  # noqa: BLE001 — this edge can't take the op; skip it
+                continue
+            last = p["store_as"]
+            if record:
+                self.steps.append({"step": f"Step {len(self.steps) + 1}",
+                                   "toolName": "workplane_api", "input": p})
+        return [last if x == cand.target else x for x in (cand.base_live or [])]
+
+    def try_candidate(self, cand: "Candidate") -> tuple[State | None, list[str] | None]:
+        """Run a candidate on a snapshot; return (resulting live State, live_after) then
+        roll back. (None, None) if the candidate fails outright."""
+        snap = self.snapshot()
+        try:
+            live = self._run_candidate(cand, record=False)
+            return self.state_of(live), live
+        except Exception:  # noqa: BLE001
+            return None, None
+        finally:
+            self.restore(snap)
+
+    def commit(self, cand: "Candidate"):
+        self.live = list(self._run_candidate(cand, record=True))
+
+
+# --- crash/hang-isolated engine (persistent worker subprocess) -------------------
+# A bad candidate (invalid boolean, degenerate fillet) can hang OCCT uninterruptibly
+# or blow memory. In-process, that kills the whole search. So candidates run in a
+# persistent child: the parent enforces a wall-clock timeout, and on hang/crash kills
+# the child, respawns it, and replays the committed steps to rebuild state. One child
+# amortizes process cost across all trials (vs spawn-per-candidate).
+def _child_apply(payload: dict):
+    out = asyncio.run(_mcp.workplane_api(ctx=None, **payload))
+    r = json.loads(out) if isinstance(out, str) else out
+    if r.get("status") != "success":
+        raise RuntimeError(r.get("error") or r.get("message") or "step failed")
+
+
+def _edge_info(e) -> dict:
+    """Geometry a robust edge selector needs: type, bbox, centroid, and sample points
+    along the edge (for true point-to-edge distance, unlike the centroid NearestToPoint
+    uses)."""
+    try:
+        gt = e.geomType()
+    except Exception:  # noqa: BLE001
+        gt = "OTHER"
+    bb, c = e.BoundingBox(), e.Center()
+    try:
+        pts = [e.positionAt(i / 8.0) for i in range(9)]
+        samples = [[p.x, p.y, p.z] for p in pts]
+    except Exception:  # noqa: BLE001
+        samples = [[c.x, c.y, c.z]]
+    return {"kind": "circle" if gt == "CIRCLE" else "other",
+            "bbox": [bb.xmin, bb.ymin, bb.zmin, bb.xmax, bb.ymax, bb.zmax],
+            "center": [c.x, c.y, c.z], "samples": samples}
+
+
+def _child_run(sess, cand: dict) -> list[str]:
+    """Apply a candidate dict in the child; return resulting live names."""
+    if not cand["skip_failures"]:
+        for p in cand["payloads"]:
+            _child_apply(p)
+        return cand["live_after"]
+    last = cand["target"]
+    for p in cand["payloads"]:
+        p = dict(p); p["start_from"] = last
+        try:
+            _child_apply(p)
+        except Exception:  # noqa: BLE001
+            continue
+        last = p["store_as"]
+    return [last if x == cand["target"] else x for x in (cand["base_live"] or [])]
+
+
+def _child_main(conn):
+    _mcp._sessions.pop(_mcp._LOCAL_SID, None)
+    _mcp._show = lambda *a, **k: None
+    sess = _mcp._get_session(_mcp._LOCAL_SID)
+    while True:
+        try:
+            kind, arg = conn.recv()
+        except EOFError:
+            break
+        if kind == "stop":
+            break
+        if kind == "apply":  # a committed step (state persists)
+            try:
+                _child_apply(arg); conn.send(("ok", None))
+            except Exception as e:  # noqa: BLE001
+                conn.send(("err", str(e)[:200]))
+        elif kind == "edges":  # geometry of each live body's edges (for edge selection)
+            res = {}
+            for n in (arg or []):
+                wp = sess.state.get(n)
+                if wp is None:
+                    continue
+                try:
+                    res[n] = [_edge_info(e) for e in wp.val().Edges()]
+                except Exception:  # noqa: BLE001
+                    res[n] = []
+            conn.send(("ok", res))
+        elif kind == "try":  # trial on a snapshot; state rolled back after
+            snap = (dict(sess.state), dict(sess.counters), sess.current)
+            try:
+                live = _child_run(sess, arg)
+                st = State(bodies=[fp for n in live
+                                   if (fp := fingerprint(sess.state.get(n))) is not None])
+                conn.send(("ok", (st, live)))
+            except Exception as e:  # noqa: BLE001
+                conn.send(("rej", str(e)[:120]))
+            finally:
+                sess.state.clear(); sess.state.update(snap[0])
+                sess.counters.clear(); sess.counters.update(snap[1])
+                sess.current = snap[2]
+
+
+class WorkerEngine:
+    """Same interface as Engine (name/live/steps/try_candidate/commit) but every trial
+    runs in a crash- and hang-isolated child process."""
+
+    def __init__(self, timeout: float = 20.0):
+        import multiprocessing as mp
+        self._mp = mp.get_context("spawn")
+        self.timeout = timeout
+        self.live: list[str] = []
+        self.steps: list[dict] = []
+        self._committed: list[dict] = []   # payloads to replay after a respawn
+        self._n = 0
+        self._start()
+
+    def _start(self):
+        self._pconn, cconn = self._mp.Pipe()
+        self.proc = self._mp.Process(target=_child_main, args=(cconn,), daemon=True)
+        self.proc.start()
+        for p in self._committed:            # rebuild committed state in the fresh child
+            self._pconn.send(("apply", p))
+            self._pconn.recv()
+
+    def _restart(self):
+        try:
+            self.proc.terminate(); self.proc.join(3)
+        except Exception:  # noqa: BLE001
+            pass
+        self._start()
+
+    def name(self) -> str:
+        self._n += 1
+        return f"body{self._n}"
+
+    def _cand_dict(self, cand: "Candidate") -> dict:
+        return {"payloads": cand.payloads, "skip_failures": cand.skip_failures,
+                "target": cand.target, "base_live": cand.base_live,
+                "live_after": cand.live_after}
+
+    def edges(self, names: list[str]) -> dict:
+        try:
+            self._pconn.send(("edges", list(names)))
+            if not self._pconn.poll(self.timeout):
+                self._restart()
+                return {}
+            tag, val = self._pconn.recv()
+        except (EOFError, BrokenPipeError, OSError):
+            self._restart()
+            return {}
+        return val if tag == "ok" else {}
+
+    def try_candidate(self, cand: "Candidate"):
+        # A candidate can HANG OCCT (caught by the poll timeout) OR crash the child outright
+        # (an OCCT segfault on degenerate revolve/boolean geometry closes the pipe -> recv
+        # raises EOFError). Both must respawn the child and reject the candidate, else one
+        # bad candidate kills the whole reconstruction.
+        try:
+            self._pconn.send(("try", self._cand_dict(cand)))
+            if not self._pconn.poll(self.timeout):    # hang -> kill, respawn, reject
+                self._restart()
+                return None, None
+            tag, val = self._pconn.recv()
+        except (EOFError, BrokenPipeError, OSError):   # child died mid-candidate
+            self._restart()
+            return None, None
+        if tag == "ok":
+            return val
+        return None, None                          # rejected (bad geometry)
+
+    def commit(self, cand: "Candidate"):
+        live = cand.live_after
+        if not cand.skip_failures:
+            for p in cand.payloads:
+                self._pconn.send(("apply", p)); self._pconn.recv()
+                self._committed.append(p)
+                self.steps.append({"step": f"Step {len(self.steps) + 1}",
+                                   "toolName": "workplane_api", "input": p})
+        else:
+            last = cand.target
+            for p in cand.payloads:
+                p = dict(p); p["start_from"] = last
+                self._pconn.send(("apply", p))
+                tag, _ = self._pconn.recv()
+                if tag != "ok":
+                    continue
+                last = p["store_as"]
+                self._committed.append(p)
+                self.steps.append({"step": f"Step {len(self.steps) + 1}",
+                                   "toolName": "workplane_api", "input": p})
+            live = [last if x == cand.target else x for x in (cand.base_live or [])]
+        self.live = list(live)
+
+    def close(self):
+        try:
+            self._pconn.send(("stop", None)); self.proc.join(2)
+        except Exception:  # noqa: BLE001
+            pass
+
+
+# --- candidate generators (translators) ------------------------------------------
+@dataclass
+class Candidate:
+    """A way to realize a feature: the payloads to run + the resulting live-body names.
+    `label` is for diagnostics (which convention won). When `skip_failures` is set the
+    payloads are a resilient chain over `target` — each is start_from the last SUCCESS
+    and failures are skipped (per-edge fillet/chamfer on topology OCCT can't do at once);
+    `base_live` is the live set the chain result substitutes into."""
+    payloads: list[dict]
+    live_after: list[str]
+    label: str = ""
+    skip_failures: bool = False
+    target: str | None = None
+    base_live: list[str] | None = None
+
+
+def profile_variants(sketch_profiles: list[ir.Profile]) -> list[tuple[str, list[ir.Profile]]]:
+    """Region-selection variants for an extrude's 2D profile. The winning one is picked
+    by the oracle, so we don't need to KNOW whether a sketch is a disc, an annulus, or
+    a multi-region shape — we offer the sensible options and let the geometry decide."""
+    out: list[tuple[str, list[ir.Profile]]] = []
+    if not sketch_profiles:
+        return out
+    # 1) all regions together (concentric loops -> holes via even-odd): the annulus case
+    out.append(("all-regions", sketch_profiles))
+    # 2) each region alone (a plain single-region extrude, or picking one of many)
+    if len(sketch_profiles) > 1:
+        for i, p in enumerate(sketch_profiles):
+            out.append((f"region[{i}]", [p]))
+    return out
+
+
+def _dist_variants(depth: float | None):
+    """(label, distance, symmetric) trials for a known magnitude — the oracle picks the
+    real sign / symmetry, so no direction convention is hand-coded."""
+    if not depth:
+        return []
+    m = abs(depth)
+    return [(f"+{m}", m, False), (f"-{m}", -m, False), (f"±{m}", m, True)]
+
+
+def _ex(dist: float, sym: bool) -> dict:
+    return {"method": "extrude", "params": {"until": dist, "combine": False, "both": sym}}
+
+
+def _op_candidates(engine: Engine, tool_payloads: list[dict], tool: str, op: str,
+                   base_live: list[str], prefix: str) -> list[Candidate]:
+    """Given payloads that build a `tool` solid, enumerate how it joins the world:
+    new body / add-separate / merge-into-each / cut-or-intersect-each / cut-all. The
+    oracle selects which actually happened."""
+    if op == "new" or not base_live:
+        return [Candidate(tool_payloads, base_live + [tool], f"{prefix}|new")]
+    cands: list[Candidate] = []
+    if op == "add":                      # ADD may stay a separate body
+        cands.append(Candidate(tool_payloads, base_live + [tool], f"{prefix}|add-sep"))
+    meth = {"add": "union", "cut": "cut", "intersect": "intersect"}[op]
+    for ti, target in enumerate(base_live):    # ...or combine into an existing body
+        res = engine.name()
+        boolean = {"operations": [{"method": meth, "args": [{"_ref": tool}]}],
+                   "start_from": target, "store_as": res}
+        cands.append(Candidate(tool_payloads + [boolean],
+                               [res if x == target else x for x in base_live],
+                               f"{prefix}|{op}->{ti}"))
+    if op == "add" and len(base_live) > 1:
+        # an ADD that BRIDGES several bodies into one (the tool overlaps 2+ existing
+        # bodies): union the tool AND all bodies into a single merged solid. Without this
+        # the volume is right but the body COUNT is wrong (N bodies instead of 1).
+        res = engine.name()
+        ops = ([{"method": "union", "args": [{"_ref": tool}]}]
+               + [{"method": "union", "args": [{"_ref": b}]} for b in base_live[1:]])
+        cands.append(Candidate(tool_payloads
+                               + [{"operations": ops, "start_from": base_live[0], "store_as": res}],
+                               [res], f"{prefix}|add-all"))
+    if op in ("cut", "intersect") and len(base_live) > 1:
+        # a REMOVE spanning several bodies (patterned holes): apply to EVERY body.
+        payloads, new_live = list(tool_payloads), []
+        for target in base_live:
+            res = engine.name()
+            payloads.append({"operations": [{"method": meth, "args": [{"_ref": tool}]}],
+                             "start_from": target, "store_as": res})
+            new_live.append(res)
+        cands.append(Candidate(payloads, new_live, f"{prefix}|{op}-all"))
+    return cands
+
+
+def extrude_candidates(engine: Engine, plane: ir.Plane, profiles: list[ir.Profile],
+                       depth: float | None, op: str, base_live: list[str]) -> list[Candidate]:
+    """Flat path: all loops drawn on one workplane (even-odd holes) x distance x op.
+    Fine for a disc, a single annulus, or disjoint regions; the per-region path handles
+    the cases even-odd can't (several nested rings)."""
+    init = _plane_init(plane)
+    cands: list[Candidate] = []
+    for pname, profs in profile_variants(profiles):
+        prof_ops = _profile_ops(profs)
+        for dname, dist, sym in _dist_variants(depth):
+            tool = engine.name()
+            make = {"operations": prof_ops + [_ex(dist, sym)], "init_params": init, "store_as": tool}
+            cands += _op_candidates(engine, [make], tool, op, base_live, f"{pname}|{dname}")
+    return cands
+
+
+def region_extrude_candidates(engine: Engine, plane: ir.Plane, regions: list, depth: float | None,
+                              op: str, base_live: list[str]) -> list[Candidate]:
+    """Per-region path: extrude EACH cap-face region as its own solid (even-odd within
+    the region -> its own holes), union them into one tool, then apply the op. Robust
+    for multi-region extrudes (e.g. concentric rings) that a flat even-odd corrupts.
+    `regions` is caps_to_regions output: list of regions, each a list of loops."""
+    if len(regions) < 2:
+        return []                        # single region is already covered by the flat path
+    init = _plane_init(plane)
+    cands: list[Candidate] = []
+    for dname, dist, sym in _dist_variants(depth):
+        payloads, solids = [], []
+        for loops in regions:
+            profs = [ir.Profile(loop) for loop in loops]
+            rs = engine.name()
+            payloads.append({"operations": _profile_ops(profs) + [_ex(dist, sym)],
+                             "init_params": init, "store_as": rs})
+            solids.append(rs)
+        tool = engine.name()
+        payloads.append({"operations": [{"method": "union", "args": [{"_ref": s}]} for s in solids[1:]],
+                         "start_from": solids[0], "store_as": tool})
+        cands += _op_candidates(engine, payloads, tool, op, base_live, f"regions[{len(regions)}]|{dname}")
+    return cands
+
+
+def true_region_candidates(engine: Engine, plane: ir.Plane, regions: list, depth: float | None,
+                           op: str, base_live: list[str]) -> list[Candidate]:
+    """Extrude each of Onshape's EXACT sketch regions as ONE atomic profile (even-odd over
+    that region's own loops -> its holes) x dist x op. This is the reliable profile source:
+    unlike our even-odd loop grouping it never mis-splits a complex sketch, so the specific
+    region an extrude uses is always present for the oracle to pick. `regions` is
+    caps_to_regions output (list of regions, each a list of loops)."""
+    init = _plane_init(plane)
+    cands: list[Candidate] = []
+    for ri, loops in enumerate(regions):
+        prof_ops = _profile_ops([ir.Profile(loop) for loop in loops])
+        for dname, dist, sym in _dist_variants(depth):
+            tool = engine.name()
+            make = {"operations": prof_ops + [_ex(dist, sym)], "init_params": init, "store_as": tool}
+            cands += _op_candidates(engine, [make], tool, op, base_live, f"R[{ri}]|{dname}")
+    return cands
+
+
+def _rev(angle: float, a0, a1) -> dict:
+    # combine=False: build the revolved solid in isolation, then _op_candidates joins it.
+    return {"method": "revolve", "args": [angle, list(a0), list(a1), False]}
+
+
+def _profiles_centroid(profiles: list[ir.Profile]) -> list[float]:
+    """A representative 2D point of a sketch profile set (circle centres / curve endpoints
+    averaged) — used only to seed candidate revolve axes near the profile."""
+    pts: list[list[float]] = []
+    for p in profiles:
+        for c in p.curves:
+            d = c.params
+            if c.kind == "circle":
+                pts.append(list(d["center"]))
+            else:
+                for k in ("start", "end", "mid"):
+                    if k in d:
+                        pts.append(list(d[k]))
+    if not pts:
+        return [0.0, 0.0]
+    return [sum(p[0] for p in pts) / len(pts), sum(p[1] for p in pts) / len(pts)]
+
+
+def revolve_candidates(engine: Engine, plane: ir.Plane, profiles: list[ir.Profile],
+                       angle: float, full: bool, axes: list[tuple],
+                       op: str, base_live: list[str]) -> list[Candidate]:
+    """Revolve a profile about an axis. Neither the region, the axis, nor (for a partial
+    revolve) the direction is hand-picked — candidates enumerate them and the oracle picks.
+    `axes` are (p0, p1) segments in the profile plane's LOCAL frame (revolve axes are
+    coplanar with the sketch, so cq's local-coord axis matches the sketch's 2D frame).
+    `full` = a 360deg (FULL) revolve, where direction is irrelevant."""
+    init = _plane_init(plane)
+    angles = [360.0] if full else [abs(angle), -abs(angle)]
+    cands: list[Candidate] = []
+    for pname, profs in profile_variants(profiles):
+        prof_ops = _profile_ops(profs)
+        for ai, (a0, a1) in enumerate(axes):
+            for adeg in angles:
+                tool = engine.name()
+                make = {"operations": prof_ops + [_rev(adeg, a0, a1)],
+                        "init_params": init, "store_as": tool}
+                cands += _op_candidates(engine, [make], tool, op, base_live,
+                                        f"{pname}|axis{ai}|{adeg:g}")
+    return cands
+
+
+def pattern_candidates(engine: Engine, count: int, angle: float, equal_space: bool,
+                       axes: list[tuple[list[float], list[float]]],
+                       base_live: list[str]) -> list[Candidate]:
+    """Circular pattern: rotate-copy a source body into `count` instances. Neither the
+    source body NOR the axis is hand-picked — every (live body, candidate axis) pair is
+    offered and the oracle selects the combination whose copies land where Onshape's do.
+    `axes` is a small set of (origin, direction) covering the common cases (principal
+    directions through the origin / the pattern's own centre)."""
+    k = max(int(count), 1)
+    step = (angle / count) if equal_space else angle
+    cands: list[Candidate] = []
+    for ai, (a0, ad) in enumerate(axes):
+        a1 = [a0[0] + ad[0], a0[1] + ad[1], a0[2] + ad[2]]
+        for si, src in enumerate(base_live):
+            payloads, new = [], []
+            for j in range(1, k):
+                copy = engine.name()
+                payloads.append({"operations": [{"method": "rotate", "args": [a0, a1, j * step]}],
+                                 "start_from": src, "store_as": copy})
+                new.append(copy)
+            if payloads:
+                cands.append(Candidate(payloads, base_live + new, f"pattern src{si} axis{ai} x{k}"))
+    return cands
+
+
+def mirror_candidates(engine: Engine, planes: list[tuple[list[float], list[float]]],
+                      base_live: list[str]) -> list[Candidate]:
+    """Mirror a source body across a candidate plane. Neither the source nor the mirror
+    plane is hand-picked — every (body, plane) pair is offered, in both `separate` (the
+    mirror image is a new body) and `merge` (unioned back into the source) forms, and the
+    oracle selects. `planes` is (normal, base_point) world-space planes (principal planes
+    through the origin and through the resulting bodies' centroid, which lies on the plane
+    of symmetry)."""
+    cands: list[Candidate] = []
+    for pi, (normal, base) in enumerate(planes):
+        for si, src in enumerate(base_live):
+            copy = engine.name()
+            make = {"operations": [{"method": "mirror", "args": [list(normal), list(base), False]}],
+                    "start_from": src, "store_as": copy}
+            cands.append(Candidate([make], base_live + [copy], f"mirror src{si} plane{pi} sep"))
+            res = engine.name()
+            merge = {"operations": [{"method": "union", "args": [{"_ref": copy}]}],
+                     "start_from": src, "store_as": res}
+            cands.append(Candidate([make, merge],
+                                   [res if x == src else x for x in base_live],
+                                   f"mirror src{si} plane{pi} merge"))
+    return cands
+
+
+def boolean_candidates(engine: Engine, op: str, base_live: list[str]) -> list[Candidate]:
+    """Boolean of multiple bodies. Union-all is the common case (washer merges 5->1);
+    for cut/intersect we offer base-vs-rest. The oracle confirms operand grouping."""
+    if len(base_live) < 2:
+        return []
+    meth = {"union": "union", "cut": "cut", "intersect": "intersect"}.get(op, "union")
+    res = engine.name()
+    ops = [{"method": meth, "args": [{"_ref": b}]} for b in base_live[1:]]
+    return [Candidate([{"operations": ops, "start_from": base_live[0], "store_as": res}],
+                      [res], f"{op}-all")]
+
+
+def _edge_point_dist(einfo: dict, p: list[float]) -> float:
+    return min((s[0] - p[0])**2 + (s[1] - p[1])**2 + (s[2] - p[2])**2
+               for s in einfo["samples"]) ** 0.5
+
+
+def _edge_selector(einfo: dict) -> dict:
+    """A selector that robustly isolates ONE edge. A concentric circle can't be picked by
+    NearestToPoint (all concentric circles share the axis centroid), so a circle is
+    isolated by SubtractSelector of two bbox BoxSelectors — radius in (r-0.1, r+eps] at
+    its own plane. Non-circular edges use NearestToPoint on a mid sample."""
+    if einfo["kind"] != "circle":
+        return {"_type": "NearestToPointSelector", "pnt": einfo["samples"][len(einfo["samples"]) // 2]}
+    bb, c = einfo["bbox"], einfo["center"]
+    o0, o1, i0, i1 = [], [], [], []
+    for a in range(3):
+        ext, cen = (bb[a + 3] - bb[a]) / 2, c[a]
+        if ext > 0.2:                       # a wide axis of the circle's plane
+            o0.append(cen - ext - 0.02); o1.append(cen + ext + 0.02)
+            i0.append(cen - (ext - 0.1)); i1.append(cen + (ext - 0.1))
+        else:                               # the plane-normal axis (flat)
+            o0.append(cen - 0.05); o1.append(cen + 0.05)
+            i0.append(cen - 0.05); i1.append(cen + 0.05)
+    return {"_type": "SubtractSelector",
+            "left": {"_type": "BoxSelector", "point0": o0, "point1": o1, "boundingbox": True},
+            "right": {"_type": "BoxSelector", "point0": i0, "point1": i1, "boundingbox": True}}
+
+
+def round_candidates(engine, kind: str, points: list[list[float]], amount: float,
+                     base_live: list[str]) -> list[Candidate]:
+    """fillet/chamfer, made robust two ways the oracle then confirms:
+    - edge selection: query the live bodies' real edges, map each fingerprint point to a
+      few nearest edges (TRUE distance, not centroid), and isolate each with _edge_selector
+      (handles concentric circles). Search the combinations.
+    - amount: offer the exact value AND a hair-perturbed one (x0.9999) — OCCT rejects a
+      chamfer/fillet that exactly consumes a feature (e.g. 1mm on a 1mm wall) where
+      Onshape's kernel does not; the tiny perturbation dodges the degeneracy in tolerance.
+    Candidates come in all-at-once and per-edge-skipping forms."""
+    import itertools
+    meth = "fillet" if kind == "fillet" else "chamfer"
+    edges_by_body = engine.edges(base_live)
+    amounts = [amount, amount * 0.9999]
+    cands: list[Candidate] = []
+    for ti, target in enumerate(base_live):
+        edges = edges_by_body.get(target, [])
+        if not edges:
+            continue
+        per_point = [sorted(range(len(edges)), key=lambda i: _edge_point_dist(edges[i], p))[:3]
+                     for p in points]
+        combos = list(itertools.product(*per_point))[:16]
+        for combo in combos:
+            chosen = list(dict.fromkeys(combo))          # dedup edge indices
+            sels = [_edge_selector(edges[i]) for i in chosen]
+            allsel = sels[0]
+            for s in sels[1:]:
+                allsel = {"_type": "SumSelector", "left": allsel, "right": s}
+            for amt in amounts:
+                res = engine.name()
+                cands.append(Candidate(
+                    [{"operations": [{"method": "edges", "args": [allsel]},
+                                     {"method": meth, "args": [amt]}],
+                      "start_from": target, "store_as": res}],
+                    [res if x == target else x for x in base_live],
+                    f"{kind}-all[{ti}]x{len(chosen)}@{amt:.4g}"))
+                payloads = []
+                for s in sels:
+                    nxt = engine.name()
+                    payloads.append({"operations": [{"method": "edges", "args": [s]},
+                                                    {"method": meth, "args": [amt]}], "store_as": nxt})
+                cands.append(Candidate(payloads, [], f"{kind}-seq[{ti}]x{len(chosen)}@{amt:.4g}",
+                                       skip_failures=True, target=target, base_live=list(base_live)))
+    return cands
+
+
+def pick(engine: Engine, cands: list[Candidate], target: State,
+         **tol) -> tuple[Candidate | None, bool]:
+    """Return (candidate, exact) — the candidate whose resulting live State matches the
+    oracle (exact=True), else the closest by total-volume error (exact=False), else
+    (None, False)."""
+    best, best_err = None, float("inf")
+    for c in cands:
+        st, _ = engine.try_candidate(c)
+        if st is None:
+            continue
+        if st.matches(target, **tol):
+            return c, True
+        err = abs(st.total_volume - target.total_volume)
+        if err < best_err:
+            best, best_err = c, err
+    return best, False
+
+
+# --- the full closed-loop driver -------------------------------------------------
+def reconstruct(api, ps, verbose: bool = True, dump: set | None = None,
+                stop_after: int | None = None):
+    """Reconstruct a whole Part Studio feature-by-feature, each verified against the
+    oracle. Returns (steps, report) where report[i] = (index, type, name, label, exact).
+    No feature's conventions are hand-decided: every feature offers candidates and the
+    oracle picks. A feature that no candidate matches is flagged (later: B-rep fallback).
+    `stop_after` halts after that feature index (dev: iterate a prefix offline cheaply)."""
+    from onshape.normalize import (_msg, _params, _enum, _sketch_profiles, caps_to_profiles,
+                                   caps_to_regions, _cap_distance, parse_length_mm,
+                                   _parse_angle_deg, _extrude_op, _BOOL_OP)
+    from onshape.extract import (resolve_extrude_caps, resolve_modifier_faces,
+                                  resolve_sketch_regions)
+    from onshape.oracle import body_states
+
+    feats = api.features(ps).get("features", [])
+    sk = {s["featureId"]: s for s in api.sketches(ps).get("sketches", [])}
+    sketch_ids = set(sk)
+    oracle = body_states(api, ps, len(feats))
+
+    extrudes = [(_msg(f)["featureId"], i + 1) for i, f in enumerate(feats)
+                if _msg(f).get("featureType") == "extrude" and not _msg(f).get("suppressed")]
+    caps = resolve_extrude_caps(api, ps, extrudes)
+    # Onshape's EXACT sketch regions (see resolve_sketch_regions): our even-odd extraction
+    # mis-splits complex sketches, so an extrude's true profile region may be missing.
+    sketches = [(_msg(f)["featureId"], i + 1) for i, f in enumerate(feats)
+                if _msg(f).get("featureType") == "newSketch" and not _msg(f).get("suppressed")]
+    sketch_regions = resolve_sketch_regions(api, ps, sketches)
+    mods = [(_msg(f)["featureId"], i + 1) for i, f in enumerate(feats)
+            if _msg(f).get("featureType") in ("fillet", "chamfer") and not _msg(f).get("suppressed")]
+    edge_pts = resolve_modifier_faces(api, ps, mods)
+
+    eng = WorkerEngine()
+    last_sketch = None
+    report: list[tuple] = []
+
+    for i, f in enumerate(feats):
+        if stop_after is not None and i > stop_after:
+            break
+        m = _msg(f)
+        ft, fid, nm = m.get("featureType"), m.get("featureId"), m.get("name") or ""
+        if m.get("suppressed"):
+            continue
+        tgt = oracle.get(i + 1)
+        cands: list[Candidate] = []
+
+        if ft == "newSketch":
+            last_sketch = fid
+            report.append((i, ft, nm, "sketch (no solid)", True))
+            if verbose:
+                print(f"  --  f{i:2d} {ft:15s} {nm[:20]:20s}")
+            continue
+        elif ft in ("cPlane", "cPoint", "mateConnector"):
+            # Datums create no solid body, so the oracle state is unchanged and the live
+            # set carries through untouched. Downstream sketches reference the world frame
+            # via their own absolute sketchMatrix (explicit_plane), so the datum itself
+            # never needs reconstructing. Pure no-op.
+            report.append((i, ft, nm, "datum (no solid)", True))
+            if verbose:
+                print(f"  --  f{i:2d} {ft:15s} {nm[:20]:20s}")
+            continue
+        elif ft == "extrude":
+            op, _why = _extrude_op(f, sketch_ids, last_sketch)
+            ref = op.profile_ref
+            fcaps = caps.get(fid) or []
+            # Candidate sketch planes. The linked sketch is unreliable when the extrude's
+            # profile is an opaque qCompressed query (falls back to last_sketch, which can
+            # be the WRONG plane -> wrong extrude direction). So also offer any sketch whose
+            # plane COINCIDES with one of this extrude's cap faces (its true plane, found
+            # geometrically). The oracle then picks the plane+direction that actually abuts.
+            cand_sids: list[str] = [ref] if ref in sk else []
+            if fcaps:
+                cn = fcaps[0].get("n", [0, 0, 1])
+                cap_offs = [sum(face["edges"][0][0][k] * cn[k] for k in range(3))
+                            for face in fcaps if face.get("edges")]
+                # The sketch plane coincides with a cap OR sits a full depth from one (only
+                # the FAR cap is 'created' when an ADD merges its near face into the body).
+                accept = set(cap_offs)
+                if op.distance:
+                    for co in list(cap_offs):
+                        accept.add(co + abs(op.distance)); accept.add(co - abs(op.distance))
+                for sid, s in sk.items():
+                    sm = s.get("sketchMatrix")
+                    if not sm or sid in cand_sids:
+                        continue
+                    n = [sm[2], sm[6], sm[10]]
+                    if abs(sum(n[k] * cn[k] for k in range(3))) < 0.99:
+                        continue
+                    o = [sm[3] * 1e3, sm[7] * 1e3, sm[11] * 1e3]
+                    off = sum(o[k] * cn[k] for k in range(3))
+                    if any(abs(off - a) < 0.05 for a in accept):
+                        cand_sids.append(sid)
+            for sid in (cand_sids or [ref]):
+                matrix = (sk.get(sid) or {}).get("sketchMatrix")
+                plane = explicit_plane(matrix) if matrix else ir.Plane(name="XY")
+                depth = op.distance
+                if depth is None and fcaps and matrix:
+                    d = _cap_distance(fcaps, matrix)
+                    depth = abs(d) if d else None
+                # Onshape's EXACT regions for this sketch (the reliable profile source).
+                true_regs = caps_to_regions(sketch_regions.get(sid) or [], matrix) if matrix else []
+                if true_regs:
+                    cands += true_region_candidates(eng, plane, true_regs, depth, op.op, eng.live)
+                    if len(true_regs) >= 2:
+                        cands += region_extrude_candidates(eng, plane, true_regs, depth, op.op, eng.live)
+                if sid in sk:
+                    profs = _sketch_profiles(sk[sid])
+                    if profs:
+                        cands += extrude_candidates(eng, plane, profs, depth, op.op, eng.live)
+                if fcaps and matrix:
+                    cands += extrude_candidates(eng, plane, caps_to_profiles(fcaps, matrix),
+                                                depth, op.op, eng.live)
+                    cands += region_extrude_candidates(eng, plane, caps_to_regions(fcaps, matrix),
+                                                       depth, op.op, eng.live)
+        elif ft == "revolve":
+            P = _params(f)
+            optype = _enum(P.get("operationType"))
+            op = {"NEW": "new", "ADD": "add", "REMOVE": "cut",
+                  "INTERSECT": "intersect"}.get(optype, "new")
+            full = _enum(P.get("revolveType")) == "FULL"
+            angle = _parse_angle_deg((P.get("angle") or {}).get("expression")) or 360.0
+            # Profile from the current sketch (its world matrix fixes the plane). The axis
+            # is an opaque query, so search candidate axes IN THE SKETCH-LOCAL frame: the
+            # plane's own X/Y through the origin and through the profile centroid (a revolve
+            # axis is coplanar with the sketch). The oracle selects the real axis.
+            sid = last_sketch
+            matrix = (sk.get(sid) or {}).get("sketchMatrix")
+            plane = explicit_plane(matrix) if matrix else ir.Plane(name="XY")
+            profs = _sketch_profiles(sk[sid]) if sid in sk else []
+            if profs:
+                cx, cy = _profiles_centroid(profs)
+                axes = [((0, 0, 0), (0, 1, 0)), ((0, 0, 0), (1, 0, 0)),
+                        ((cx, cy, 0), (cx, cy + 1, 0)), ((cx, cy, 0), (cx + 1, cy, 0))]
+                cands = revolve_candidates(eng, plane, profs, angle, full, axes, op, eng.live)
+        elif ft == "mirror":
+            # The mirror plane is an opaque reference; search the principal planes through
+            # the origin AND through the resulting bodies' centroid (which lies ON the plane
+            # of symmetry). The oracle selects the plane + source that reproduce the copy.
+            normals = [[1, 0, 0], [0, 1, 0], [0, 0, 1]]
+            planes = [(n, [0, 0, 0]) for n in normals]
+            if tgt and tgt.bodies:
+                cs = [b.centroid for b in tgt.bodies]
+                c = [sum(x[k] for x in cs) / len(cs) for k in range(3)]
+                planes += [(n, c) for n in normals]
+            cands = mirror_candidates(eng, planes, eng.live)
+        elif ft == "circularPattern":
+            P = _params(f)
+            count = parse_length_mm((P.get("instanceCount") or {}).get("expression"))
+            angle = _parse_angle_deg((P.get("angle") or {}).get("expression"))
+            eq = bool((P.get("equalSpace") or {}).get("value", True))
+            if count and angle is not None:
+                # Candidate axes: principal directions through the origin and through the
+                # pattern's own centre (mean of the resulting bodies' centroids lies ON a
+                # circular pattern's axis). The oracle selects the real one.
+                pts = [[0.0, 0.0, 0.0]]
+                if tgt and tgt.bodies:
+                    cs = [b.centroid for b in tgt.bodies]
+                    pts.append([sum(c[k] for c in cs) / len(cs) for k in range(3)])
+                axes = [(o, d) for o in pts
+                        for d in ([1, 0, 0], [0, 1, 0], [0, 0, 1])]
+                cands = pattern_candidates(eng, int(round(count)), angle, eq, axes, eng.live)
+        elif ft == "booleanBodies":
+            bop = _BOOL_OP.get(_enum(_params(f).get("operationType")), "union")
+            cands = boolean_candidates(eng, bop, eng.live)
+        elif ft in ("fillet", "chamfer"):
+            faces = edge_pts.get(fid) or []
+            points = [x["at"] for x in faces if isinstance(x, dict) and "at" in x]
+            P = _params(f)
+            if ft == "fillet":
+                amt = parse_length_mm((P.get("radius") or {}).get("expression"))
+                if amt is None:
+                    rs = [x.get("r") for x in faces if x.get("r")]
+                    amt = sum(rs) / len(rs) if rs else None
+            else:
+                amt = parse_length_mm((P.get("width") or P.get("length") or {}).get("expression"))
+            if points and amt:
+                cands = round_candidates(eng, ft, points, amt, eng.live)
+
+        if dump and i in dump and cands:
+            print(f"    [dump f{i}] oracle target: nB={len(tgt.bodies) if tgt else '?'} "
+                  f"totV={tgt.total_volume if tgt else '?'}")
+            for c in cands:
+                st, _ = eng.try_candidate(c)
+                if st is None:
+                    print(f"      {c.label:32s} -> FAIL/reject")
+                else:
+                    print(f"      {c.label:32s} -> nB={len(st.bodies)} totV={st.total_volume:.2f}"
+                          + ("  <-- MATCH" if (tgt and st.matches(tgt)) else ""))
+        win, exact = pick(eng, cands, tgt) if (cands and tgt is not None) else (None, False)
+        if win:
+            eng.commit(win)
+        label = win.label if win else "no candidate"
+        report.append((i, ft, nm, label, bool(win and exact)))
+        if verbose:
+            flag = "OK " if (win and exact) else ("~~ " if win else "XX ")
+            print(f"  {flag}f{i:2d} {ft:15s} {nm[:20]:20s} -> {label}"
+                  + ("" if exact else "   [NOT EXACT]"))
+    steps = list(eng.steps)
+    eng.close()
+    return steps, report
+
+
+# --- CLI -------------------------------------------------------------------------
+def _cli(argv: list[str]) -> int:
+    """python -m onshape.recon <part-studio-url> [--out FILE.json] [--name NAME]
+
+    Reconstructs the model through the closed loop, verifies the emitted steps
+    end-to-end against Onshape's mass-properties, and writes the templates.steps."""
+    if not argv:
+        print(_cli.__doc__)
+        return 2
+    from onshape.client import Onshape, parse_url
+    url = argv[0]
+    out = argv[argv.index("--out") + 1] if "--out" in argv else None
+    name = argv[argv.index("--name") + 1] if "--name" in argv else None
+
+    api = Onshape()
+    ps = parse_url(url)
+    steps, report = reconstruct(api, ps)
+    matched = sum(1 for r in report if r[4])
+    print(f"\nfeatures matched: {matched}/{len(report)}   steps: {len(steps)}")
+
+    verified, deltas = None, None
+    if steps:
+        from onshape.verify import run_steps_guarded, fetch_ground_truth, compare, Geometry
+        try:
+            props = run_steps_guarded(steps, timeout=90)
+            res = compare(Geometry.from_mcp_props(props), fetch_ground_truth(ps, api))
+            verified, deltas = res.ok, res.deltas
+            print(f"end-to-end verified: {res.ok} | {res.reason}")
+        except Exception as e:  # noqa: BLE001
+            verified = False
+            print(f"end-to-end verify failed: {str(e)[:160]}")
+
+    if out:
+        record = {
+            "model": name, "url": url, "verified": verified, "verify": deltas,
+            "features_total": len(report), "features_matched": matched,
+            "n_steps": len(steps), "steps": steps,
+            "report": [{"index": i, "type": t, "name": n, "how": lbl, "exact": ex}
+                       for (i, t, n, lbl, ex) in report],
+        }
+        json.dump(record, open(out, "w"), indent=1)
+        print(f"wrote {out}")
+    return 0 if verified in (True, None) else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(_cli(sys.argv[1:]))

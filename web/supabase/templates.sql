@@ -46,6 +46,12 @@ alter table public.templates alter column review_status drop not null;
 alter table public.templates alter column review_status set default null;
 update public.templates set review_status = null where visibility = 'private';
 
+-- Hash of the exact text last embedded (`title. description`). Lets the re-embed
+-- script (supabase/reembed-templates.mjs) skip rows whose text is unchanged, so
+-- Gemini is only called after an actual edit. NULL on rows created before this
+-- column existed → re-embedded once, then stamped.
+alter table public.templates add column if not exists content_hash text;
+
 -- Approximate nearest-neighbour index for cosine similarity (recommended for RAG).
 create index if not exists templates_embedding_hnsw
   on public.templates using hnsw (embedding vector_cosine_ops);

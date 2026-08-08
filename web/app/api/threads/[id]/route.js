@@ -45,5 +45,14 @@ export async function DELETE(_req, { params }) {
   const supabase = await createClient();
   const { error } = await supabase.from("chats").delete().eq("id", id);
   if (error) return Response.json({ error: error.message }, { status: 500 });
+  // The chat's CAD snapshot lives in Storage at "<uid>/<chatId>". Storage has no FK
+  // to cascade on chat delete (unlike the legacy session_snapshots row), so remove
+  // it here or it's orphaned forever. Best-effort — a cleanup miss (incl. a chat
+  // that never had a snapshot) must never fail the delete.
+  const { data: claims } = await supabase.auth.getClaims();
+  const uid = claims?.claims?.sub;
+  if (uid) {
+    await supabase.storage.from("cad-snapshots").remove([`${uid}/${id}`]).catch(() => {});
+  }
   return Response.json({ ok: true });
 }

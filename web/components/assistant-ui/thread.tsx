@@ -47,6 +47,7 @@ import {
   SuggestionPrimitive,
   ThreadPrimitive,
   type ToolCallMessagePartComponent,
+  useAui,
   useAuiState,
 } from "@assistant-ui/react";
 import {
@@ -78,6 +79,7 @@ import {
   type PropsWithChildren,
 } from "react";
 import { useCreditStore } from "@/lib/credit-store";
+import { useSelectionStore } from "@/lib/selection-store";
 
 export type ThreadGroupPart = MessagePrimitive.GroupedParts.GroupPart;
 
@@ -362,10 +364,66 @@ const ComposerInput: FC = () => {
   );
 };
 
-const Composer: FC = () => {
+// Header for the reference block prefixed onto a prompt when the user has picked
+// geometry in the viewer. The system prompt teaches the AI to read this block.
+const SELECTION_BLOCK_HEADER = "Selected geometry (picked by user in 3d viewer):";
+
+// Numbered by position (not baked in) so removing a chip renumbers the rest.
+function buildSelectionBlock(features: { text: string }[]): string {
+  return [SELECTION_BLOCK_HEADER, ...features.map((f, i) => `${i + 1}. ${f.text}`)].join("\n");
+}
+
+// Prefix the outgoing prompt with the picked-feature reference block, then clear
+// the picks. Used by BOTH the form submit (Enter) and the Send button's onClick
+// (the button calls send() directly, bypassing the form) so it works on mobile
+// too. Runs before the actual send (composeEventHandlers), which then reads the
+// updated composer text.
+function useInjectSelection() {
+  const aui = useAui();
+  return () => {
+    const { features, clear } = useSelectionStore.getState();
+    if (features.length === 0) return;
+    const text = aui.composer().getState().text;
+    const block = buildSelectionBlock(features);
+    aui.composer().setText(text.trim() ? `${block}\n\n${text}` : block);
+    clear();
+  };
+}
+
+// Basic chip bar: the features the user picked in the viewer. Numbered by
+// position (matches the injected block). Each chip is removed only via its own
+// cross (never by keyboard) so editing the prompt text can't drop a reference.
+const SelectedFeaturesBar: FC = () => {
+  const features = useSelectionStore((s) => s.features);
+  const remove = useSelectionStore((s) => s.remove);
+  if (features.length === 0) return null;
   return (
-    <ComposerPrimitive.Root className="aui-composer-root relative flex w-full flex-col">
-      <ComposerPrimitive.AttachmentDropzone render={<div data-slot="aui_composer-shell" className="border-border/60 data-[dragging=true]:border-ring focus-within:border-border dark:border-muted-foreground/15 dark:focus-within:border-muted-foreground/30 flex w-full flex-col gap-2 rounded-(--composer-radius) border bg-(--composer-bg) p-(--composer-padding) shadow-[0_4px_16px_-8px_rgba(0,0,0,0.08),0_1px_2px_rgba(0,0,0,0.04)] transition-[border-color,box-shadow] focus-within:shadow-[0_6px_24px_-8px_rgba(0,0,0,0.12),0_1px_2px_rgba(0,0,0,0.05)] data-[dragging=true]:border-dashed data-[dragging=true]:bg-[color-mix(in_oklab,var(--color-accent)_50%,var(--color-background))] dark:shadow-none" />}><ComposerAttachments /><ComposerInput /><ComposerAction /></ComposerPrimitive.AttachmentDropzone>
+    <div className="flex flex-wrap items-center gap-1.5 px-1 pb-1">
+      {features.map((f, i) => (
+        <span
+          key={f.id}
+          className="bg-muted text-muted-foreground inline-flex items-center gap-1 rounded-full py-0.5 pl-2 pr-1 text-xs"
+        >
+          {f.label} #{i + 1}
+          <button
+            type="button"
+            onClick={() => remove(f.id)}
+            className="hover:text-foreground inline-flex cursor-pointer items-center rounded-full p-0.5"
+            aria-label={`Remove ${f.label} #${i + 1}`}
+          >
+            <XIcon className="size-3" />
+          </button>
+        </span>
+      ))}
+    </div>
+  );
+};
+
+const Composer: FC = () => {
+  const inject = useInjectSelection();
+  return (
+    <ComposerPrimitive.Root onSubmit={inject} className="aui-composer-root relative flex w-full flex-col">
+      <ComposerPrimitive.AttachmentDropzone render={<div data-slot="aui_composer-shell" className="border-border/60 data-[dragging=true]:border-ring focus-within:border-border dark:border-muted-foreground/15 dark:focus-within:border-muted-foreground/30 flex w-full flex-col gap-2 rounded-(--composer-radius) border bg-(--composer-bg) p-(--composer-padding) shadow-[0_4px_16px_-8px_rgba(0,0,0,0.08),0_1px_2px_rgba(0,0,0,0.04)] transition-[border-color,box-shadow] focus-within:shadow-[0_6px_24px_-8px_rgba(0,0,0,0.12),0_1px_2px_rgba(0,0,0,0.05)] data-[dragging=true]:border-dashed data-[dragging=true]:bg-[color-mix(in_oklab,var(--color-accent)_50%,var(--color-background))] dark:shadow-none" />}><ComposerAttachments /><SelectedFeaturesBar /><ComposerInput /><ComposerAction /></ComposerPrimitive.AttachmentDropzone>
     </ComposerPrimitive.Root>
   );
 };
@@ -600,6 +658,9 @@ const SaveTemplateButton: FC = () => {
 };
 
 const ComposerAction: FC = () => {
+  // The Send button calls send() directly (it doesn't submit the form), so attach
+  // the picked-feature injection here too — this is the path mobile taps.
+  const inject = useInjectSelection();
   return (
     <div className="aui-composer-action-wrapper relative flex items-center justify-between">
       <div className="flex items-center gap-1.5">
@@ -617,7 +678,7 @@ const ComposerAction: FC = () => {
           </AuiIf>
         </AuiIf>
         <AuiIf condition={(s) => !s.thread.isRunning}>
-          <ComposerPrimitive.Send render={<TooltipIconButton tooltip="Send message" side="bottom" type="button" variant="default" size="icon" className="aui-composer-send size-7 rounded-full" aria-label="Send message" />}><ArrowUpIcon className="aui-composer-send-icon size-4.5" /></ComposerPrimitive.Send>
+          <ComposerPrimitive.Send onClick={inject} render={<TooltipIconButton tooltip="Send message" side="bottom" type="button" variant="default" size="icon" className="aui-composer-send size-7 rounded-full" aria-label="Send message" />}><ArrowUpIcon className="aui-composer-send-icon size-4.5" /></ComposerPrimitive.Send>
         </AuiIf>
         <AuiIf condition={(s) => s.thread.isRunning}>
           <ComposerPrimitive.Cancel render={<Button type="button" variant="default" size="icon" className="aui-composer-cancel size-7 rounded-full" aria-label="Stop generating" />}><SquareIcon className="aui-composer-cancel-icon size-3.5 fill-current" /></ComposerPrimitive.Cancel>

@@ -32,6 +32,7 @@ const nextConfig = {
       { source: "/api/model", destination: `${backend}/model` },
       { source: "/api/version", destination: `${backend}/version` },
       { source: "/api/backend", destination: `${backend}/backend` },
+      { source: "/api/selection", destination: `${backend}/selection` },
       // Reverse-proxy PostHog through our origin so its requests are first-party
       // (survives ad-blockers). Matches the provider's api_host of "/ingest".
       { source: "/ingest/static/:path*", destination: "https://us-assets.i.posthog.com/static/:path*" },

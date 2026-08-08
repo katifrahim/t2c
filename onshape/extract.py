@@ -1,0 +1,181 @@
+"""FeatureScript resolution: turn a modifier feature's opaque edge references into
+concrete 3D points that emission can select with NearestToPointSelector.
+
+For each fillet/chamfer/etc. we ask Onshape's own engine which FACES that feature
+created and where their centroids are (mm). A fillet/chamfer face sits on the
+rounded/bevelled edge, so the nearest edge to that centroid in the reconstructed
+(pre-modifier) solid is the edge the feature acted on — the bridge that decouples us
+from both engines' opaque topological naming.
+"""
+from __future__ import annotations
+
+from onshape.client import Onshape, PartStudio, RateLimited
+
+# One representative point PER created face, plus radius, in millimetres. The point
+# is the midpoint of the face's LONGEST boundary edge -- a tangent line for a
+# straight-edge fillet/chamfer, a boundary circle for a circular one -- so it always
+# lies near the real edge and never on the axis (evApproximateCentroid gives the axis
+# center for surfaces of revolution, which mis-selects circular edges). `%s` is a
+# FeatureScript array literal of feature ids.
+_FS_CREATED = """function(context is Context, queries){
+  var res = {};
+  var ids = %s;
+  for (var fid in ids){
+    var faces = [];
+    for (var f in evaluateQuery(context, qCreatedBy(makeId(fid), EntityType.FACE))){
+      var s = evSurfaceDefinition(context, {"face": f});
+      var r = 0 * meter;
+      if (s is Cylinder) { r = s.radius; }
+      else if (s is Torus) { r = s.minorRadius; }
+      var best = undefined;
+      var bestLen = -1 * meter;
+      for (var e in evaluateQuery(context, qAdjacent(f, AdjacencyType.EDGE, EntityType.EDGE))){
+        var L = evLength(context, {"entities": e});
+        if (L > bestLen){
+          bestLen = L;
+          var tl = evEdgeTangentLines(context, {"edge": e, "parameters": [0.5]});
+          best = [tl[0].origin[0]/millimeter, tl[0].origin[1]/millimeter, tl[0].origin[2]/millimeter];
+        }
+      }
+      if (best != undefined){ faces = append(faces, { "at": best, "r": r/millimeter }); }
+    }
+    res[fid] = faces;
+  }
+  return res;
+}"""
+
+
+def _unwrap(v):
+    """Plain JSON out of a FeatureScript eval result (BTFSValue* wrappers)."""
+    if not isinstance(v, dict):
+        return v
+    t = v.get("btType", "")
+    if "ValueMap" in t and "Entry" not in t:
+        return {_unwrap(e["key"]): _unwrap(e["value"]) for e in v["value"]}
+    if "ValueArray" in t:
+        return [_unwrap(x) for x in v["value"]]
+    if "Value" in t:  # scalar wrappers (Number/String/WithUnits/...)
+        return v.get("value")
+    return v
+
+
+# Per-extrude created planar faces, with each boundary edge sampled at parameters
+# 0/0.5/1 (3 points classify any line/arc/circle). Evaluated at the extrude's own
+# rollback so its faces are clean and unfragmented by later features.
+_FS_CAPS = """function(context is Context, queries){
+  var out = [];
+  for (var f in evaluateQuery(context, qCreatedBy(makeId("%s"), EntityType.FACE))){
+    var s = evSurfaceDefinition(context, {"face": f});
+    if (!(s is Plane)) { continue; }
+    var edges = [];
+    for (var e in evaluateQuery(context, qAdjacent(f, AdjacencyType.EDGE, EntityType.EDGE))){
+      var tl = evEdgeTangentLines(context, {"edge": e, "parameters": [0, 0.5, 1]});
+      var pts = [];
+      for (var t in tl){ pts = append(pts, [t.origin[0]/millimeter, t.origin[1]/millimeter, t.origin[2]/millimeter]); }
+      edges = append(edges, pts);
+    }
+    out = append(out, {"n": [s.normal[0], s.normal[1], s.normal[2]], "edges": edges});
+  }
+  return out;
+}"""
+
+
+def resolve_sketch_regions(api: Onshape, ps: PartStudio, sketches: list[tuple]) -> dict:
+    """{sketchFeatureId: [{"n": [x,y,z], "edges": [[p0,pmid,p1] mm, ...]}, ...]} — the
+    EXACT closed regions of each sketch, straight from Onshape's kernel.
+
+    A sketch's regions (the faces it bounds) are what an extrude actually selects. Deriving
+    them ourselves from the raw curves (even-odd loop grouping) silently mis-splits complex
+    sketches — e.g. L4 Sketch 2 has 15 regions but our extraction found 9, dropping exactly
+    the small region a later cut needs. So we ask Onshape: at each sketch's own rollback
+    (index just after it, before any extrude consumes its faces) the region faces are
+    pristine; reuse the cap sampler (qCreatedBy -> planar faces -> boundary edges at 0/.5/1).
+    `sketches` is [(sketchFeatureId, rollback_index)]. Same shape as resolve_extrude_caps,
+    so caps_to_regions/caps_to_profiles consume it directly."""
+    return resolve_extrude_caps(api, ps, sketches)
+
+
+def resolve_extrude_caps(api: Onshape, ps: PartStudio, extrudes: list[tuple]) -> dict:
+    """{featureId: [{"n": [x,y,z], "edges": [[p0,pmid,p1] mm, ...]}, ...]}.
+
+    `extrudes` is a list of (featureId, rollback_index) — the index just AFTER the
+    extrude, so its created faces exist and aren't yet fragmented. Best-effort:
+    missing/failed entries are simply absent (the extrude then falls back)."""
+    out: dict = {}
+    for fid, rb in extrudes:
+        try:
+            res = api.call(f"{ps.path}/featurescript?rollbackBarIndex={rb}",
+                           {"script": _FS_CAPS % fid, "queries": {}})
+            faces = _unwrap(res.get("result")) or []
+            if faces:
+                out[fid] = faces
+        except RateLimited:
+            raise  # a global stop, not a per-feature miss -- don't emit a broken model
+        except Exception:  # noqa: BLE001
+            continue
+    return out
+
+
+# Centroids (mm) of every SOLID body present at a rollback state -- the raw signal
+# for tracking bodies across features (create/modify/pattern/union).
+_FS_SOLIDS = """function(context is Context, queries){
+  var out = [];
+  for (var b in evaluateQuery(context, qBodyType(qEverything(EntityType.BODY), BodyType.SOLID))){
+    var c = evApproximateCentroid(context, {"entities": b});
+    out = append(out, [c[0]/millimeter, c[1]/millimeter, c[2]/millimeter]);
+  }
+  return out;
+}"""
+
+
+def resolve_body_flow(api: Onshape, ps: PartStudio, max_rollback: int) -> dict:
+    """{rollbackBarIndex: [solid centroid, ...]} for indices 1..max_rollback.
+    body_flow[i] is the state after feature i-1 (i.e. before feature i)."""
+    flow: dict = {}
+    for rb in range(1, max_rollback + 1):
+        try:
+            res = api.call(f"{ps.path}/featurescript?rollbackBarIndex={rb}",
+                           {"script": _FS_SOLIDS, "queries": {}})
+            flow[rb] = _unwrap(res.get("result")) or []
+        except RateLimited:
+            raise  # a global stop, not a per-feature miss -- don't emit a broken model
+        except Exception:  # noqa: BLE001
+            flow[rb] = []
+    return flow
+
+
+def resolve_created_faces(api: Onshape, ps: PartStudio, feature_ids: list[str]) -> dict:
+    """{featureId: [{"at": [x,y,z] mm, "r": mm}, ...]} for the given features.
+
+    Returns {} on any FeatureScript failure — resolution is best-effort and a
+    missing entry simply means that feature can't be reconstructed (flagged later).
+    """
+    if not feature_ids:
+        return {}
+    ids = "[" + ", ".join('"%s"' % f for f in feature_ids) + "]"
+    try:
+        res = api.featurescript(ps, _FS_CREATED % ids)
+        return _unwrap(res.get("result", {})) or {}
+    except RateLimited:
+        raise  # a global stop, not a per-feature miss -- don't emit a broken model
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def resolve_modifier_faces(api: Onshape, ps: PartStudio, modifiers: list[tuple]) -> dict:
+    """Like resolve_created_faces but evaluates EACH modifier at its OWN rollback (the
+    index just after it), so its created faces are clean — not fragmented/moved by later
+    features (which corrupts the sampled edge points). `modifiers` is [(featureId, rb)]."""
+    out: dict = {}
+    for fid, rb in modifiers:
+        try:
+            res = api.call(f"{ps.path}/featurescript?rollbackBarIndex={rb}",
+                           {"script": _FS_CREATED % ('["%s"]' % fid), "queries": {}})
+            u = _unwrap(res.get("result", {})) or {}
+            if u.get(fid):
+                out[fid] = u[fid]
+        except RateLimited:
+            raise
+        except Exception:  # noqa: BLE001
+            continue
+    return out

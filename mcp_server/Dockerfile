@@ -4,9 +4,10 @@
 # MUST build with:  docker build --platform linux/amd64 ...  (emulated via QEMU).
 FROM python:3.13-slim
 
-# Native runtime libs OCCT/cadquery needs (the slim image lacks them).
+# Native runtime libs OCCT/cadquery needs (the slim image lacks them), plus git
+# so pip can install the cq_gears/cq_warehouse plugins from their pinned commits.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        libgl1 libglu1-mesa libxrender1 libxext6 libsm6 \
+        libgl1 libglu1-mesa libxrender1 libxext6 libsm6 git \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app

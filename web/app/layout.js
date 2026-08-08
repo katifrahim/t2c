@@ -48,7 +48,10 @@ export default function RootLayout({ children }) {
             // but captures nothing — no events, no replays — to protect the free-tier
             // quota. Flip on locally with NEXT_PUBLIC_ANALYTICS_DEV=true.
             opt_out_capturing_by_default: !ANALYTICS_ENABLED,
-            disable_session_recording: !ANALYTICS_ENABLED,
+            // Never auto-start replay: anonymous landing traffic would burn the
+            // free-tier quota fast. AnalyticsIdentity starts it (startReplay) only
+            // for signed-in users; sign-out stops it (resetIdentity).
+            disable_session_recording: true,
             autocapture: ANALYTICS_ENABLED,
           }}
           bootstrapFlags

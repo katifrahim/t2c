@@ -2,6 +2,7 @@
 import { useEffect, useRef, useState } from "react";
 import { LoaderIcon } from "lucide-react";
 import { useSessionStore } from "@/lib/session-store";
+import { useSelectionStore } from "@/lib/selection-store";
 import { useViewerThemeStore } from "@/lib/viewer-theme-store";
 import { ANALYTICS_ENABLED } from "@/lib/analytics-enabled";
 
@@ -147,7 +148,12 @@ const SPIN_SPEED = 0.008;
 const SPEED_UNIT = SPIN_SPEED / 20;
 function rotationTick(ref) {
   const v = ref.current.viewer;
-  const g = v?.rendered?.nestedGroup?.rootGroup;
+  // `rendered` is a getter that THROWS (not returns undefined) if the viewer was
+  // just disposed during a model swap — optional chaining doesn't guard that, and
+  // this per-frame loop would otherwise crash with "Viewer.render() must be called
+  // before this operation". Swallow it; the next frame runs once the new viewer is up.
+  let g = null;
+  try { g = v?.rendered?.nestedGroup?.rootGroup; } catch { /* viewer not ready */ }
   if (g) {
     if (v._studioManager?.isActive) {
       const { rot, spin, spinAccum, spinSpeed } = ref.current;
@@ -349,6 +355,43 @@ export default function Viewer() {
     try { ref.current.viewer?.setTheme(theme); } catch {}
   }, [theme]);
 
+  // three-cad-viewer binds its shortcuts globally — on `document` (Backspace/Esc
+  // change the picked selection; n/v/e/f/s switch the pick filter) and on `window`
+  // (trackball camera keys). None of them check focus, so typing a prompt drove
+  // the viewer (e.g. "s" flipped the pick filter, Backspace dropped a picked-
+  // feature chip). A capture-phase interceptor runs before every viewer listener
+  // and swallows those keys while a text field is focused. It only stops
+  // propagation — never preventDefault — so normal typing/deletion is untouched.
+  useEffect(() => {
+    // Escape is intentionally excluded — many inputs live inside dialogs that
+    // close on Escape, and we must not swallow that. (The reported culprits are
+    // n/v/e/f/s and Backspace.)
+    const VIEWER_KEYS = new Set(["Backspace", "Delete", "n", "v", "e", "f", "s"]);
+    // Pick-filter keys → topo mode. While a pick tool is active these must drive
+    // the filter ONLY; otherwise "s" would ALSO open the Studio (its global
+    // shortcut). We run the filter switch ourselves and stop the event so the
+    // colliding global shortcut can't fire. Global shortcuts stay intact when no
+    // pick tool is active.
+    const FILTER_TOPO = { n: "None", v: "Vertex", e: "Edge", f: "Face", s: "Solid" };
+    const isTextField = (el) =>
+      !!el && (el.isContentEditable || el.tagName === "INPUT" ||
+               el.tagName === "TEXTAREA" || el.tagName === "SELECT");
+    const onKeyDownCapture = (e) => {
+      if (isTextField(e.target)) {
+        if (VIEWER_KEYS.has(e.key)) e.stopImmediatePropagation();
+        return;
+      }
+      const viewer = ref.current.viewer;
+      const topo = FILTER_TOPO[e.key];
+      if (topo && viewer?.cadTools?.enabledTool) {
+        try { ref.current.display?.shapeFilterDropDownMenu?.setValue(topo); } catch {}
+        e.stopImmediatePropagation();
+      }
+    };
+    window.addEventListener("keydown", onKeyDownCapture, true); // capture: ahead of doc + window
+    return () => window.removeEventListener("keydown", onKeyDownCapture, true);
+  }, []);
+
   // On chat/session switch: keep the current scene on screen (no blanking) and
   // force the next poll to re-render this session's model — or its placeholder
   // (grid + tools + empty scene), so the viewer widget is NEVER torn down.
@@ -448,6 +491,14 @@ export default function Viewer() {
       if (!TCV || !container) return;
       ref.current.payload = payload; // remember for re-fitting on resize
       if (ref.current.viewer) { try { ref.current.viewer.dispose(); } catch {} }
+      // The Display owns the container's keyboard-shortcut listener and only
+      // detaches it in ITS dispose() — which we must call, or each model swap
+      // leaks a stale handler bound to the now-disposed viewer. Those stale
+      // handlers throw "Viewer.render() must be called…" on every shortcut
+      // (x/s/p/t/b/…) while the live viewer still handles the key.
+      if (ref.current.display) { try { ref.current.display.dispose(); } catch {} }
+      // A new model invalidates any features picked on the previous one.
+      try { useSelectionStore.getState().clear(); } catch {}
       container.innerHTML = "";
 
       const config = payload.config || {};
@@ -463,6 +514,7 @@ export default function Viewer() {
       if (window.innerWidth < 768) viewerOptions.control = "orbit";
 
       const display = new TCV.Display(container, displayOptions);
+      ref.current.display = display; // tracked so we can dispose it on the next swap
       const viewer = new TCV.Viewer(display, displayOptions, notify, null);
       // Mobile: keep the X/Y/Z orientation legend visible regardless of the Tools
       // panel state. The library ties the marker to the panel — showToolsPanel(flag)
@@ -490,6 +542,55 @@ export default function Viewer() {
       }
       ref.current.viewer = viewer;
       setHasModel(true);
+
+      // "Select" tool → prompt reference. The built-in notify only emits lossy
+      // trailing indices (for clipboard); wrap it so we also read the full picked
+      // paths, resolve them to geometric descriptions on the backend, and stash
+      // them for the chat composer to prefix onto the next prompt. Paths are built
+      // exactly like the measure tools (fromSolid → strip topology → solid id).
+      try {
+        const so = viewer.cadTools?.selectObject;
+        if (so && !so.__t2cWrapped) {
+          so.__t2cWrapped = true;
+          const orig = so.notify.bind(so);
+          so.notify = async () => {
+            orig();
+            const ids = (so.selectedShapes || []).map((s) => {
+              let n = s.obj.name;
+              if (s.fromSolid) {
+                n = n.replace(/\|faces.*$/, "").replace(/\|edges.*$/, "").replace(/\|vertices.*$/, "");
+              }
+              return n.replaceAll("|", "/");
+            });
+            const setFeatures = useSelectionStore.getState().setFeatures;
+            if (ids.length === 0) { setFeatures([]); return; }
+            try {
+              const resp = await fetch(`/api/selection?session=${sidRef.current}`, {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ shapeIds: ids }),
+              });
+              if (!resp.ok) return;
+              const data = await resp.json();
+              setFeatures(data?.features || []);
+            } catch { /* ignore */ }
+          };
+        }
+      } catch { /* ignore */ }
+
+      // Repurposed button: it now drives geometry selection for prompt references,
+      // not clipboard. Rename its tooltip (data-*-tooltip attrs) to match, then
+      // re-run updateTooltips so the button's keyboard-shortcut suffix (Shift+S →
+      // "› S") is re-appended onto the new base label like every other tool.
+      try {
+        container
+          .querySelectorAll('[data-base-tooltip="Copy shape IDs to clipboard"]')
+          .forEach((el) => {
+            el.setAttribute("data-tooltip", "Select geometry");
+            el.setAttribute("data-base-tooltip", "Select geometry");
+          });
+        display.updateTooltips();
+      } catch { /* ignore */ }
 
       // Mobile: start with the Tools panel collapsed to declutter the small screen.
       // (The wrapped showToolsPanel above keeps the X/Y/Z legend visible.) Render the
@@ -660,6 +761,7 @@ export default function Viewer() {
       if (ref.current.rotRaf) cancelAnimationFrame(ref.current.rotRaf); // stop the rotation loop
       ro.disconnect();
       if (ref.current.viewer) { try { ref.current.viewer.dispose(); } catch {} }
+      if (ref.current.display) { try { ref.current.display.dispose(); } catch {} }
     };
   }, []);
 

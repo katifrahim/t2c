@@ -7,7 +7,7 @@ Tools: workplane_api, sketch_api, assembly_api, query_docs, select_model
 from typing import Any, Dict, List, Optional
 from contextvars import ContextVar
 from dataclasses import dataclass, field
-import atexit
+# import atexit  # was only used by the disabled PostHog MCP analytics (see below)
 import inspect
 import json
 import logging
@@ -54,11 +54,15 @@ try:
     import ocp_vscode.backend as _ocp_backend_mod
     _ocp_backend_mod.is_jupyter_cadquery = True
     from ocp_vscode.comms import MessageType as _MessageType, default as _ocp_default
+    from ocp_vscode.measure import get_properties as _get_properties
+    from ocp_tessellate.ocp_utils import tq_to_loc as _tq_to_loc
     MEASURE_AVAILABLE = True
 except Exception:
     _ocp_backend_mod = None
     _MessageType = None
     _ocp_default = None
+    _get_properties = None
+    _tq_to_loc = None
     MEASURE_AVAILABLE = False
 
 
@@ -73,7 +77,7 @@ import cadquery as cq
 from cadquery import (
     Workplane, Sketch, Assembly,
     Vector, Plane, Location, Matrix,
-    Vertex, Edge, Wire, Face, Shell, Solid, Compound,
+    Vertex, Edge, Wire, Face, Shell, Solid, Compound, Shape,
     Color,
 )
 from cadquery.selectors import (
@@ -87,6 +91,92 @@ from cadquery.selectors import (
 )
 
 # =============================================================================
+# EXTENSION PLUGINS  (gear generators + mechanical-part library)
+# =============================================================================
+# Optional parametric-part plugins layered ON TOP of the core API and surfaced to
+# the model through the `extension_api` tool. One plugin is purely additive (it adds
+# a Workplane.gear() builder). The other ships a large mechanical-part library and,
+# as a side effect of import, monkeypatches ~40 core Shape methods. Only ONE of those
+# overrides misbehaves on this build's geometry kernel — Shape.copy:
+#   • the native copy rebuilds via self.__class__(...): fine for plain/gear geometry,
+#     but can't reconstruct the library's parts (they have custom constructors).
+#   • the library's copy (a serialize/deserialize deep-copy) handles its own parts,
+#     but corrupts complex gear geometry.
+# So we install a type-aware dispatcher that routes each shape to the copy that works
+# for it. With that in place both plugins coexist and core behaviour stays identical
+# to stock (verified: an ops battery is byte-for-byte the same with/without the load).
+
+_EXT_BASE_SHAPES = {Shape, Solid, Face, Wire, Edge, Vertex, Compound, Shell}
+_EXT_CATALOG: Dict[str, Dict[str, Any]] = {}   # part name -> {"cls": type, "family": str}
+EXT_AVAILABLE = False
+
+
+def _register_ext(cls: type, family: str) -> None:
+    _EXT_CATALOG[cls.__name__] = {"cls": cls, "family": family}
+
+
+def _scan_ext(module: Any, base: type, family: str, origin: str) -> None:
+    """Register every concrete public part class in `module` that subclasses `base`.
+    Introspection-driven so new library classes are picked up automatically."""
+    for name in dir(module):
+        if name.startswith("_"):
+            continue
+        obj = getattr(module, name)
+        if (isinstance(obj, type) and issubclass(obj, base) and obj is not base
+                and not inspect.isabstract(obj)
+                and (getattr(obj, "__module__", "") or "").startswith(origin)):
+            _register_ext(obj, family)
+
+
+def _load_extension_plugins() -> None:
+    """Import the plugins, install the copy dispatcher, and build the part catalog.
+    Guarded: if the plugins aren't installed the core server still runs normally."""
+    global EXT_AVAILABLE
+    _native_copy = Shape.copy
+    try:
+        import cq_warehouse.extensions          # noqa: F401  (import applies the monkeypatches)
+        import cq_warehouse.fastener as _fa
+        import cq_warehouse.bearing as _be
+        import cq_warehouse.thread as _th
+        import cq_warehouse.sprocket as _sp
+        import cq_warehouse.chain as _ch
+        import cq_warehouse.drafting as _dr
+        import cq_gears as _gears
+        import heatserts                       # noqa: F401  (import adds Workplane.heatsert)
+    except Exception as e:  # plugins are optional
+        print(f"[t2c] extension plugins unavailable: {e}", file=sys.stderr, flush=True)
+        return
+
+    _cqw_copy = Shape.copy                       # the library's deep-copy (post-import)
+
+    def _dispatch_copy(self, mesh: bool = False):
+        # base + gear geometry -> native copy; library custom-ctor parts -> library copy
+        return (_native_copy if type(self) in _EXT_BASE_SHAPES else _cqw_copy)(self, mesh)
+
+    for _c in _EXT_BASE_SHAPES:
+        _c.copy = _dispatch_copy
+
+    _GearBase = next(b for b in _gears.SpurGear.__mro__ if b.__name__ == "GearBase")
+    _scan_ext(_gears, _GearBase, "gear", "cq_gears")
+    for _base in (_fa.Screw, _fa.Nut, _fa.Washer):
+        _scan_ext(_fa, _base, "fastener", "cq_warehouse")
+    _scan_ext(_be, _be.Bearing, "bearing", "cq_warehouse")
+    # Thread classes (IsoThread, AcmeThread, …) subclass Solid directly, not a shared
+    # Thread base, so key off the module origin instead.
+    _scan_ext(_th, Shape, "thread", "cq_warehouse.thread")
+    _register_ext(_sp.Sprocket, "sprocket")
+    _register_ext(_ch.Chain, "chain")
+    # Drafting is config + method, not a standalone part: register the annotation
+    # OPERATIONS (each builds a Draft then returns a real dimension/callout assembly)
+    # rather than the bare Draft config, which would render nothing.
+    for _method in ("dimension_line", "extension_line", "callout"):
+        _EXT_CATALOG[_method] = {"cls": _dr.Draft, "family": "drafting", "method": _method}
+    EXT_AVAILABLE = True
+
+
+_load_extension_plugins()
+
+# =============================================================================
 # SERVER
 # =============================================================================
 
@@ -97,8 +187,10 @@ mcp = FastMCP(
         "  • workplane_api  — 3D modeling via Workplane API method chaining\n"
         "  • sketch_api     — 2D profiles via Sketch API (face or edge workflows)\n"
         "  • assembly_api   — multi-part assemblies via Assembly API add/constrain/solve\n"
+        "  • extension_api  — build ready-made parametric parts: gears, fasteners, bearings, threads, sprockets, chains\n"
         "  • select_model   — re-activate an earlier model by name (shows it in the viewer and makes it exportable)\n"
-        "  • query_docs     — fetch official detailed docs of specific methods and their parameters\n\n"
+        "  • query_docs     — fetch official detailed docs of specific methods and their parameters\n"
+        "  • report_learning — privately tell the developers something you learned that could improve this assistant\n\n"
         "All tools share a persistent object store. Reference stored objects with "
         "{\"_ref\": \"name\"} and construct types inline with "
         "{\"_type\": \"Vector\"|\"Plane\"|\"Location\"|\"Color\", ...}.\n\n"
@@ -131,6 +223,9 @@ class Session:
     state: Dict[str, Any] = field(default_factory=dict)       # name → CadQuery object
     counters: Dict[str, int] = field(default_factory=dict)    # auto-naming counters
     current: Optional[str] = None                             # active object name
+    auto_names: set = field(default_factory=set)              # names we auto-generated (vs explicit store_as)
+    rev: int = 0                                              # bumps on every CAD-state mutation
+    exported_rev: int = -1                                    # rev at last /session/export (skip re-export when equal)
     # Latest tessellated model the browser polls (/model serves payload; /version
     # lets it detect changes and reports obj_type for 2D-only export formats).
     viewer: Dict[str, Any] = field(
@@ -199,6 +294,7 @@ def _store(name: str, obj: Any) -> None:
     sess = _sess()
     sess.state[name] = obj
     sess.current = name
+    sess.rev += 1  # CAD state changed → snapshot is now stale (see /session/export)
 
 
 def _get(name: Optional[str]) -> Any:
@@ -212,9 +308,12 @@ def _get(name: Optional[str]) -> Any:
 
 
 def _auto_name(prefix: str) -> str:
-    c = _sess().counters
+    sess = _sess()
+    c = sess.counters
     c[prefix] = c.get(prefix, 0) + 1
-    return f"{prefix}_{c[prefix]}"
+    name = f"{prefix}_{c[prefix]}"
+    sess.auto_names.add(name)  # mark as auto so snapshots can prune stale intermediates
+    return name
 
 
 # --- Durable snapshots ---------------------------------------------------------
@@ -231,14 +330,35 @@ def _iter_assemblies(obj: Any):
             yield from _iter_assemblies(c)
 
 
+# How many recent auto-named objects to keep in the durable snapshot beyond the
+# active + explicitly-named models. A recency window protects fresh intermediates
+# the agent may still reference next turn while shedding old superseded ones.
+SNAPSHOT_KEEP_RECENT = int(os.environ.get("SNAPSHOT_KEEP_RECENT", 10))
+
+
+def _prune_for_snapshot(sess: "Session") -> Dict[str, Any]:
+    """The subset of the object store worth persisting. Keeps: the active model
+    (viewer + resume anchor — never dropped), every explicitly-named model (the
+    agent references these by name), and the most recently created objects (recency
+    window). Superseded older auto-named intermediates are dropped from the DURABLE
+    copy only — the live session keeps everything, so nothing is lost mid-chat."""
+    names = list(sess.state.keys())  # dict preserves creation order
+    keep = {n for n in names if n not in sess.auto_names}   # explicit store_as names
+    if sess.current in sess.state:
+        keep.add(sess.current)                              # active model — always
+    keep.update(names[-SNAPSHOT_KEEP_RECENT:])              # recency window
+    return {n: sess.state[n] for n in names if n in keep}   # keep creation order
+
+
 def _snapshot(sess: "Session") -> bytes:
+    objects = _prune_for_snapshot(sess)
     # A solved Assembly caches an OCCT solver result (`_solve_result`) holding a
     # non-picklable SwigPyObject. It's just solver metadata — solve() regenerates
     # it and the solved child locations are already baked in — so strip it for the
     # dump and restore it on the live objects afterward. Constraints (picklable)
     # are kept, so a restored assembly can still be re-solved.
     stripped = []
-    for obj in sess.state.values():
+    for obj in objects.values():
         for a in _iter_assemblies(obj):
             sr = getattr(a, "_solve_result", None)
             if sr is not None:
@@ -246,7 +366,8 @@ def _snapshot(sess: "Session") -> bytes:
                 stripped.append((a, sr))
     try:
         raw = pickle.dumps(
-            {"counters": dict(sess.counters), "current": sess.current, "objects": sess.state},
+            {"counters": dict(sess.counters), "current": sess.current, "objects": objects,
+             "auto_names": [n for n in sess.auto_names if n in objects]},
             protocol=pickle.HIGHEST_PROTOCOL,
         )
         # Deflate: BREP/pickle geometry is highly redundant, so this shrinks the
@@ -308,6 +429,12 @@ def _restore_into(sess: "Session", data: bytes) -> int:
     sess.state = {name: _normalize(o) for name, o in objs.items()}
     sess.counters = d.get("counters", {}) or {}
     sess.current = d.get("current")
+    # Restore auto-name tracking (legacy blobs lack it → treat survivors as explicit).
+    sess.auto_names = set(d.get("auto_names", [])) & set(sess.state)
+    # Restored state == what's already stored, so mark clean: no re-export until a
+    # real mutation. (The route re-shows current for the viewer; that's not a change.)
+    sess.rev = 0
+    sess.exported_rev = 0
     return len(sess.state)
 
 # =============================================================================
@@ -675,7 +802,59 @@ def _construct_type(spec: dict) -> Any:
     elif t == "InverseSelector":
         return InverseSelector(resolve_value(spec["selector"]))
 
+    # ── Extension-plugin parts (gears, fasteners, bearings, threads, …) ────────
+    # Example: {"_type": "SpurGear", "params": {"module": 1, "teeth_number": 20,
+    #           "width": 5, "bore_d": 5}, "plane": "XY"}
+    elif t in _EXT_CATALOG:
+        return _build_ext_part(spec)
+
     raise ValueError(f"Unknown _type: '{t}'")
+
+
+def _build_ext_part(spec: dict) -> Any:
+    """Construct a catalog part and normalise it to a native object the rest of the
+    pipeline stores/renders. spec = {"_type": <part>, "params": {...}, "plane"?: str}.
+    Gears build through the plugin's Workplane.gear() builder; drafting ops build a
+    dimension/callout assembly; every other part is already (or exposes via
+    .cq_object) a native shape/assembly."""
+    entry = _EXT_CATALOG[spec["_type"]]
+    params = resolve_value(spec.get("params", {})) or {}
+    if entry.get("method"):                       # drafting annotation op
+        return _build_drafting(entry["cls"], entry["method"], params)
+    obj = entry["cls"](**params)
+    if entry["family"] == "gear":
+        return cq.Workplane(spec.get("plane", "XY")).gear(obj)
+    if isinstance(obj, (Workplane, Sketch, Assembly, Shape)):
+        return obj
+    if hasattr(obj, "cq_object"):
+        return obj.cq_object
+    return obj
+
+
+def _draft_config_keys(draft_cls: type) -> set:
+    return set(inspect.signature(draft_cls.__init__).parameters) - {"self"}
+
+
+def _build_drafting(draft_cls: type, method: str, params: dict) -> Any:
+    """Build a Draft from the config-subset of params (font_size, units, …), then call
+    the requested annotation method (dimension_line/extension_line/callout) with the
+    rest. Returns a real assembly, so it renders and never pushes an empty scene."""
+    cfg_keys = _draft_config_keys(draft_cls)
+    cfg = {k: v for k, v in params.items() if k in cfg_keys}
+    args = {k: v for k, v in params.items() if k not in cfg_keys}
+    # dimension_line/extension_line accept coordinate lists directly, but callout()
+    # wants Vector origin/tail — coerce plain points so the model can pass coordinates
+    # uniformly across all three ops.
+    if method == "callout":
+        # origin is a single point (wants a Vector); coerce a flat coordinate list.
+        o = args.get("origin")
+        if isinstance(o, (list, tuple)) and 2 <= len(o) <= 3 and all(isinstance(x, (int, float)) for x in o):
+            args["origin"] = Vector(*o)
+        # callout takes EITHER origin OR tail; passing both hits a library bug (it
+        # follows origin but still draws the tail arrow). origin wins — drop the tail.
+        if args.get("origin") is not None and args.get("tail") is not None:
+            args.pop("tail")
+    return getattr(draft_cls(**cfg), method)(**args)
 
 # =============================================================================
 # HELPERS
@@ -685,6 +864,7 @@ def _construct_type(spec: dict) -> Any:
 # a geometry method the model needs, not a stack name).
 _BRAND_RE = re.compile(
     r"open\s*cascade(\s*technology)?|\bocct\b|\bocp[_\s-]?vscode\b|\bocp\b"
+    r"|\bcq[_\s-]?gears\b|\bcq[_\s-]?warehouse\b|\bmeadiode\b|\bgumyr\b"
     r"|\bcadquery\b|\bcq\b|\bfast\s*mcp\b|\bfastmcp\b|\bpython\b",
     re.IGNORECASE)
 
@@ -747,6 +927,325 @@ def _show_push(obj: Any) -> None:
         pass
 
 
+# =============================================================================
+# PICKED-FEATURE REFERENCES  (viewer "select" tool → prompt injection)
+# =============================================================================
+# When the user clicks features in the 3D viewer, the frontend posts the picked
+# shape-id paths to /selection. Each path already resolves to a real OCCT
+# sub-shape via the session's measurement backend (mb.model). We turn each into a
+# neutral, human-readable geometric description the LLM can map to a selection.
+
+def _part_name(shape_id: str) -> str:
+    """The part a picked feature belongs to: the path segment before the topology
+    suffix (/faces/faces_N, /edges/edges_N, /vertices/vertices_N), or the last
+    segment for a whole-solid pick."""
+    base = re.split(r"/(?:faces|edges|vertices)/", shape_id)[0]
+    segs = [s for s in base.split("/") if s]
+    return segs[-1] if segs else shape_id
+
+
+def _fmt(x: float) -> str:
+    v = round(float(x), 3) + 0.0
+    if v == 0:
+        v = 0.0  # avoid "-0"
+    return f"{v:g}"
+
+
+def _pt(p) -> str:
+    return "(" + ", ".join(_fmt(v) for v in p) + ")"
+
+
+def _face_normal(shape):
+    """Outward-ish surface normal at the face's UV midpoint, as a unit tuple."""
+    from OCP.BRepTools import BRepTools
+    from OCP.BRepGProp import BRepGProp_Face
+    from OCP.gp import gp_Pnt, gp_Vec, gp_Dir
+    u0, u1, v0, v1 = BRepTools.UVBounds_s(shape)
+    pnt, normal = gp_Pnt(), gp_Vec()
+    BRepGProp_Face(shape).Normal((u0 + u1) / 2, (v0 + v1) / 2, pnt, normal)
+    if normal.Magnitude() < 1e-10:
+        return None
+    d = gp_Dir(normal)
+    return (d.X(), d.Y(), d.Z())
+
+
+def _line_direction(shape):
+    """Unit direction of a straight edge, or None."""
+    from OCP.BRepAdaptor import BRepAdaptor_Curve
+    from OCP.gp import gp_Pnt, gp_Vec, gp_Dir
+    curve = BRepAdaptor_Curve(shape)
+    pnt, vec = gp_Pnt(), gp_Vec()
+    curve.D1(curve.FirstParameter(), pnt, vec)
+    if vec.Magnitude() < 1e-10:
+        return None
+    d = gp_Dir(vec)
+    return (d.X(), d.Y(), d.Z())
+
+
+def _feat_center(shape):
+    """Centroid CadQuery's nearest-to-point selector compares against — the datum
+    that lets the LLM re-resolve this exact entity. None on failure."""
+    try:
+        c = cq.Shape.cast(shape).Center()
+        return (c.x, c.y, c.z)
+    except Exception:
+        return None
+
+
+def _describe_feature(shape_id, shape, world_center=None, placement=None) -> dict:
+    """One picked feature → {id,label,text}. Neutral one-liner (safe to show the
+    user), unnumbered (the frontend numbers by position).
+
+    `shape` is the frame the model is EDITED in: for a placed assembly part that's
+    the PART-LOCAL shape (coords labelled "local"), and world_center + placement
+    then locate it in the assembly. For a single part (identity placement) it's the
+    world shape and world_center/placement are None — coords are unlabelled."""
+    props = _get_properties(shape)
+    st = props.get("shape_type", "Shape")     # Vertex/Edge/Face/Solid/Compound
+    gt = props.get("geom_type", "")            # Plane/Cylinder/Line/Circle/...
+    part = _part_name(shape_id)
+    flat = {}
+    for sec in props.get("result", []) or []:
+        if isinstance(sec, dict):
+            flat.update(sec)
+
+    center = _feat_center(shape)
+    placed = placement is not None
+    f = "local " if placed else ""   # label coords as part-local for placed parts
+
+    attrs = [f'on part "{part}"' + (" (assembly part)" if placed else "")]
+    if st == "Vertex":
+        pt = center or flat.get("xyz") or props.get("refpoint")
+        if pt is not None:
+            attrs.append(f"{f}position {_pt(pt)}")
+        label = "Vertex"
+    elif st == "Edge":
+        if center is not None:
+            attrs.append(f"{f}center {_pt(center)}")
+        for k in ("radius", "major radius", "minor radius"):
+            if k in flat:
+                attrs.append(f"{k} {_fmt(flat[k])}")
+        if "start" in flat and "end" in flat:
+            attrs.append(f"{f}from {_pt(flat['start'])} to {_pt(flat['end'])}")
+        if "length" in flat:
+            attrs.append(f"length {_fmt(flat['length'])}")
+        if gt == "Line":
+            try:
+                d = _line_direction(shape)
+                if d:
+                    attrs.append(f"{f}direction {_pt(d)}")
+            except Exception:
+                pass
+        label = f"{gt} edge" if gt else "Edge"
+    elif st == "Face":
+        if center is not None:
+            attrs.append(f"{f}center {_pt(center)}")
+        for k in ("radius", "base radius", "minor radius", "major radius"):
+            if k in flat:
+                attrs.append(f"{k} {_fmt(flat[k])}")
+        try:
+            n = _face_normal(shape)
+            if n:
+                attrs.append(f"{f}normal {_pt(n)}")
+        except Exception:
+            pass
+        if "area" in flat:
+            attrs.append(f"area {_fmt(flat['area'])}")
+        label = f"{gt} face" if gt else "Face"
+    else:  # Solid / CompSolid / Compound
+        if center is not None:
+            attrs.append(f"{f}center {_pt(center)}")
+        if "volume" in flat:
+            attrs.append(f"volume {_fmt(flat['volume'])}")
+        label = st
+
+    bb = flat.get("bb")
+    if isinstance(bb, dict) and "min" in bb and "max" in bb:
+        attrs.append(f"{f}bbox {_pt(bb['min'])}–{_pt(bb['max'])}")
+
+    # Assembly context: where the feature sits in the assembly, and how the part is
+    # placed — so the LLM can reason about position/orientation without the math.
+    if placed:
+        if world_center is not None:
+            attrs.append(f"world center {_pt(world_center)}")
+        (tx, ty, tz), (rx, ry, rz) = placement
+        attrs.append(
+            f"part placed at ({_fmt(tx)}, {_fmt(ty)}, {_fmt(tz)}) "
+            f"rotated ({_fmt(rx)}, {_fmt(ry)}, {_fmt(rz)})° (XYZ)"
+        )
+
+    kind = (f"{gt} " if gt and gt not in ("Point", "Other") else "") + st.lower()
+    text = f"{kind}: " + ", ".join(attrs)
+    return {"id": shape_id, "label": label, "text": text}
+
+
+def _walk_part_locs(model: dict) -> dict:
+    """Map each tessellated part id → its absolute world placement (t, q) or None,
+    from the ocp_vscode model tree — the same placement that moved mb.model's
+    shapes to world. Lets /selection recover part-local coordinates."""
+    out = {}
+
+    def walk(node):
+        for v in node.get("parts", []) or []:
+            if v.get("parts") is not None:
+                walk(v)
+            else:
+                out[v["id"]] = v.get("loc")
+    try:
+        walk(model)
+    except Exception:
+        pass
+    return out
+
+
+def _placement_of(loc_tq):
+    """(cq.Location, ((tx,ty,tz),(rx,ry,rz)) degrees) for a part's (t,q), or
+    (None, None) if it's missing / an identity placement (single-part case)."""
+    if not loc_tq or _tq_to_loc is None:
+        return None, None
+    try:
+        loc = cq.Location(_tq_to_loc(*loc_tq))
+        pl = loc.toTuple()
+        (t, r) = pl
+        if all(abs(v) < 1e-6 for v in (*t, *r)):
+            return None, None   # identity → world == local, no assembly context
+        return loc, pl
+    except Exception:
+        return None, None
+
+
+# =============================================================================
+# ASSEMBLY SELF-DIAGNOSTIC FEEDBACK  (returned automatically by assembly_api)
+# =============================================================================
+# Ground truth about the solved assembly so the LLM can spot and fix its own
+# positioning/orientation/constraint mistakes before handing the result to the
+# user — the automatic analog of what the "select geometry" feature gives manually.
+
+def _num(x) -> float:
+    v = round(float(x), 3) + 0.0
+    return 0.0 if v == 0 else v
+
+
+def _assembly_world_parts(asm) -> list:
+    """[(name, world_location, world_shape)] for each leaf part, at its solved
+    world placement (relative child locations composed down the tree)."""
+    out = []
+
+    def rec(node, parent_loc):
+        wl = parent_loc * node.loc
+        if node.obj is not None:
+            try:
+                s = node.obj.val() if isinstance(node.obj, Workplane) else node.obj
+                if isinstance(s, cq.Shape):
+                    out.append((node.name, wl, s.located(wl)))
+            except Exception:
+                pass
+        for ch in node.children:
+            rec(ch, wl)
+
+    rec(asm, Location())
+    return out
+
+
+def _bbox_overlap(a, b, tol=1e-6) -> bool:
+    return all(a["min"][i] <= b["max"][i] + tol and b["min"][i] <= a["max"][i] + tol
+               for i in range(3))
+
+
+def _overlap_volume(s1, s2):
+    try:
+        c = s1.intersect(s2)
+        return c.Volume() if c is not None else 0.0
+    except Exception:
+        return None
+
+
+def _min_distance(s1, s2):
+    try:
+        from OCP.BRepExtrema import BRepExtrema_DistShapeShape
+        d = BRepExtrema_DistShapeShape(s1.wrapped, s2.wrapped)
+        return d.Value() if d.IsDone() else None
+    except Exception:
+        return None
+
+
+def _assembly_report(asm) -> dict:
+    """Per-part placement + bbox, part collisions, floating (disconnected) parts,
+    unconstrained parts, and solve status. Best-effort — never raises."""
+    try:
+        parts = _assembly_world_parts(asm)
+    except Exception:
+        return {}
+    if not parts:
+        return {}
+
+    constrained = set()
+    try:
+        for c in asm.constraints:
+            for o in c.objects:
+                constrained.add(o.split("@")[0].split("/")[-1])  # leaf part name
+    except Exception:
+        pass
+
+    report = {"parts": [], "collisions": [], "floating_parts": [], "unconstrained_parts": []}
+    bbs = []  # (name, shape, bbox_dict)
+    for name, wl, shape in parts:
+        t, r = wl.toTuple()
+        try:
+            bb = shape.BoundingBox()
+            bbox = {"min": [_num(bb.xmin), _num(bb.ymin), _num(bb.zmin)],
+                    "max": [_num(bb.xmax), _num(bb.ymax), _num(bb.zmax)]}
+        except Exception:
+            bbox = None
+        report["parts"].append({
+            "name": name,
+            "position": [_num(v) for v in t],
+            "rotation_deg": [_num(v) for v in r],
+            "bbox": bbox,
+            "constrained": name in constrained,
+        })
+        if name not in constrained:
+            report["unconstrained_parts"].append(name)
+        bbs.append((name, shape, bbox))
+
+    # Pairwise interference/contact — bbox-prefiltered, capped so it stays cheap.
+    n = len(bbs)
+    if 1 < n <= 12:
+        import itertools
+        touch = {name: False for name, _, _ in bbs}
+        for (n1, s1, b1), (n2, s2, b2) in itertools.combinations(bbs, 2):
+            if not (b1 and b2 and _bbox_overlap(b1, b2)):
+                continue  # bboxes apart → cannot touch
+            vol = _overlap_volume(s1, s2)
+            if vol is not None and vol > 1e-6:
+                report["collisions"].append({"parts": [n1, n2], "overlap_volume": _num(vol)})
+                touch[n1] = touch[n2] = True
+            else:
+                d = _min_distance(s1, s2)
+                if d is not None and d < 1e-6:  # coincident faces (mated, no volume)
+                    touch[n1] = touch[n2] = True
+        report["floating_parts"] = [nm for nm, ok in touch.items() if not ok]
+
+    sr = getattr(asm, "_solve_result", None)
+    if isinstance(sr, dict):
+        obj_hist = (sr.get("iterations") or {}).get("obj") or []
+        report["solve"] = {"success": bool(sr.get("success")),
+                           "residual": _num(obj_hist[-1]) if obj_hist else None}
+    else:
+        report["solve"] = {"attempted": False}
+    return report
+
+
+def _payload_is_empty(payload: Any) -> bool:
+    """True when a tessellation payload has nothing to render (no instances and no
+    parts). Pushing such a payload tears the viewer down mid-swap and blanks the web
+    app, so callers skip the viewer update and keep the last good model instead."""
+    data = payload.get("data", {}) if isinstance(payload, dict) else {}
+    if data.get("instances"):
+        return False
+    return not (data.get("shapes", {}) or {}).get("parts")
+
+
 def _show_tessellate(obj: Any) -> None:
     """http: tessellate obj into the three-cad-viewer payload and store it for
     /model. Replaces the ocp_vscode websocket push (which can't work over HTTPS)."""
@@ -760,17 +1259,27 @@ def _show_tessellate(obj: Any) -> None:
         # progress to stdout; mute both so the stdio JSON-RPC stream stays clean.
         with contextlib.redirect_stderr(io.StringIO()), contextlib.redirect_stdout(io.StringIO()):
             payload, mapping = _ocp_convert(obj)
+        # An object with no renderable geometry (e.g. an annotation config) yields an
+        # empty payload; don't bump the viewer version, so the frontend keeps showing
+        # the previous model rather than crashing on an empty scene.
+        if _payload_is_empty(payload):
+            return
         _inject_studio_materials(payload)  # resolve builtin/texture material tags → appearance entries
         payload["config"]["reset_camera"] = "iso"  # frame the part on each render
         sess = _sess()
         sess.viewer["payload"] = payload
         sess.viewer["version"] += 1
-        # Load the BRep model into this session's measurement backend (serialize the
-        # live OCCT mapping the same way send_backend would).
+        # Serialize the OCCT mapping the same way send_backend would, then (a) record
+        # each part's world placement for /selection's local-frame recovery and
+        # (b) load it into this session's measurement backend.
+        try:
+            model = json.loads(json.dumps(mapping, default=_ocp_default))
+        except Exception:
+            model = None
+        sess.viewer["part_locs"] = _walk_part_locs(model) if model is not None else {}
         mb = sess.measure_backend
-        if mb is not None:
+        if mb is not None and model is not None:
             try:
-                model = json.loads(json.dumps(mapping, default=_ocp_default))
                 with contextlib.redirect_stderr(io.StringIO()), contextlib.redirect_stdout(io.StringIO()):
                     mb.load_model(model)
             except Exception:
@@ -1128,6 +1637,8 @@ async def workplane_api(
 	        - Makes a countersunk hole for each item on the stack.
         hole(diameter: float, depth: float | None=None, clean: bool=True)
 	        - Makes a simple hole for each item on the stack.
+        heatsert(size: str='M6', bolt_clear: float=0, chamfer=None, clean: bool=True)
+	        - Cuts a heatsert (threaded-insert) hole for each point on the stack; size is 'M3'/'M4'/'M5'/'M6'. For 3D-printed parts. query_docs(["heatsert"]) for params.
       # primitives:
         box(length: float, width: float, height: float, centered: Union[bool, Tuple[bool, bool, bool]]=True, combine: Union[bool, Literal['cut', 'a', 's']]=True, clean: bool=True)
 	        - Return a 3d box with specified dimensions for each object on the stack. 
@@ -1687,7 +2198,8 @@ async def assembly_api(
     ctx: Context = None,
 ) -> str:
     """
-    Assembly API fundamentals: 
+    Assembly API fundamentals:
+        - The response includes an "assembly_report" with ground truth about the result: each part's world "position"/"rotation_deg"/"bbox"/"constrained", "collisions" (parts whose solids overlap, with overlap_volume — usually a positioning error), "floating_parts" (parts touching nothing — often misplaced/disconnected), "unconstrained_parts" (left at their add-location), and "solve" (success + residual). ALWAYS read it: if it shows collisions, unconstrained/floating parts, or an unsuccessful solve, fix the constraints/locations and re-run BEFORE presenting the assembly to the user.
         - Use Workplane API to build each part (one part = one piece on a CNC machine or printer), then use Assembly API to combine those distinct parts together with constraint-based relative positioning/orientation, part-specific colors, hierarachy, sub-assemblies, etc.
         - Always use constraints. Constraints offer a better representation of the real world relationship the user wants to model than directly supplying locations. They allow you to dynamically position parts relative to each other. With constraints, if one part's location changes, then it automatically updates the location of all other connected parts.
         - There are a total of 9 constraints (5 relative, 4 fixed). Each constraint is basically a cost function. After all constraints have been defined, a solver updates the position and orientation of the parts to minimize the sum of all cost functions. The solver is basically an optimizer.
@@ -2502,8 +3014,13 @@ async def assembly_api(
         _store(name, obj)
         await anyio.to_thread.run_sync(_show, obj)
 
-        return json.dumps({"status": "success", "name": name,
-                           "obj_type": _obj_type(obj), "properties": _properties(obj)})
+        result = {"status": "success", "name": name,
+                  "obj_type": _obj_type(obj), "properties": _properties(obj)}
+        if isinstance(obj, Assembly):
+            report = await anyio.to_thread.run_sync(_assembly_report, obj)
+            if report:
+                result["assembly_report"] = report
+        return json.dumps(result)
     except Exception as e:
         return _error(str(e), traceback.format_exc())
 
@@ -2535,9 +3052,148 @@ async def select_model(name: str, ctx: Context = None) -> str:
     try:
         obj = _get(name)  # raises if name unknown
         sess.current = name
+        sess.rev += 1  # active model changed → snapshot stale (reopened chat must show this one)
         await anyio.to_thread.run_sync(_show, obj)
         return json.dumps({"status": "success", "name": name,
                            "obj_type": _obj_type(obj), "properties": _properties(obj)})
+    except Exception as e:
+        return _error(str(e), traceback.format_exc())
+
+# =============================================================================
+# TOOL — extension_api
+# =============================================================================
+
+def _ext_options(part: str, fastener_type: Optional[str]) -> dict:
+    """Introspect a catalog part: its constructor params and — for data-driven parts
+    (fasteners/bearings/threads) — the exact valid standard types and sizes, read live
+    from the part's own tables (never hardcoded)."""
+    entry = _EXT_CATALOG[part]
+    cls = entry["cls"]
+    out: Dict[str, Any] = {"part": part, "family": entry["family"]}
+    # For a drafting op the caller passes the method's args; for every other part they
+    # pass the constructor's kwargs.
+    target = getattr(cls, entry["method"]) if entry.get("method") else cls.__init__
+    try:
+        sig = inspect.signature(target)
+        out["params"] = [
+            (f"{p.name}={p.default!r}" if p.default is not inspect.Parameter.empty else f"{p.name} [required]")
+            for p in sig.parameters.values() if p.name != "self"
+        ]
+    except (TypeError, ValueError):
+        pass
+    if entry.get("method"):   # drafting: config knobs can also be passed in params
+        out["draft_config_params"] = sorted(_draft_config_keys(cls))
+    if callable(getattr(cls, "types", None)):
+        try:
+            types = sorted(cls.types())
+            out["standard_types"] = types
+            ft = fastener_type or (types[0] if types else None)
+            if ft and callable(getattr(cls, "sizes", None)):
+                out["sizes_for_type"] = ft
+                out["sizes"] = list(cls.sizes(ft))
+        except Exception:
+            pass
+    return out
+
+
+@mcp.tool(name="extension_api")
+async def extension_api(
+    op: str = "build",
+    part: Optional[str] = None,
+    params: Optional[dict] = None,
+    plane: Optional[str] = None,
+    fastener_type: Optional[str] = None,
+    store_as: Optional[str] = None,
+    ctx: Context = None,
+) -> str:
+    """
+    Build specialized, ready-made parametric PARTS that would be impractical or
+    impossible to model from primitives — precision gears (true involute teeth),
+    standards-based fasteners, bearings, threads, sprockets and roller chains.
+
+    Use this whenever the user asks for such a part instead of approximating it with
+    boxes/cylinders. Everything you build here is stored under a name and behaves like
+    any other model: you can keep editing it in workplane_api (start_from="<name>") and
+    combine it in assembly_api.
+
+    ── OPERATIONS (op) ─────────────────────────────────────────────────────────
+    • op="list"    → all available parts grouped by family. Call this first if unsure
+                     what exists.
+    • op="options" → for one `part`: its constructor parameters, and (for fasteners/
+                     bearings/threads) the EXACT valid standard types and sizes read
+                     live from the part's own tables. ALWAYS call this before building a
+                     fastener/bearing/thread — their `size`/`type` strings must match
+                     exactly (e.g. "M3-0.5", "iso4762") or construction fails. Pass
+                     `fastener_type` to list the sizes for a specific standard.
+    • op="build"   → construct `part` with `params` and store it (default op).
+
+    ── build ARGS ──────────────────────────────────────────────────────────────
+    part:    class name of the part (see op="list"), e.g. "SpurGear", "SocketHeadCapScrew".
+    params:  keyword arguments for that part, e.g. {"module":1,"teeth_number":20,"width":5,"bore_d":5}.
+    plane:   (gears only) the workplane the gear is built on. Default "XY".
+    store_as: name to store the result under (auto-generated if omitted).
+
+    Returns {status, name, obj_type, properties}, same as the other build tools.
+
+    ── FAMILIES ────────────────────────────────────────────────────────────────
+    • gear     — SpurGear (set helix_angle>0 for a helical gear), HerringboneGear,
+                 BevelGear, RingGear, RackGear, Worm, PlanetaryGearset, … Build params
+                 like module, teeth_number, width, bore_d, pressure_angle, helix_angle.
+    • fastener — screws (SocketHeadCapScrew, HexHeadScrew, CounterSunkScrew, SetScrew, …),
+                 nuts (HexNut, SquareNut, DomedCapNut, HeatSetNut, …), washers. Params:
+                 size, fastener_type, length (screws). Pass simple=true for a fast plain
+                 body, or omit for real thread geometry.
+    • bearing  — SingleRowDeepGrooveBallBearing, …; params size, bearing_type.
+    • thread   — IsoThread, AcmeThread, MetricTrapezoidalThread, …
+    • sprocket / chain — Sprocket (num_teeth, chain_pitch, …); Chain across sprockets.
+    • drafting — dimension_line, extension_line, callout: dimension & annotation
+                 assemblies; params are the op's args (e.g. path) plus look settings.
+                 Refrain from using "callout" unless the user explicitly requests it.
+
+    ── FASTENER HOLES & PLACEMENT (in the OTHER tools) ──────────────────────────
+    Matching holes for a fastener are cut in workplane_api, not here — call these
+    methods there on a workplane, passing the built fastener via {"_ref":"<name>"}:
+      clearanceHole, tapHole, threadedHole, insertHole (for HeatSetNut).
+    To place fasteners into an assembly, use pushFastenerLocations / the hole methods'
+    baseAssembly argument in assembly_api. query_docs any of these for exact params.
+
+    A finger-jointed (laser-cut) box is likewise made in workplane_api, not here: build
+    the box, select its vertical edges, then call the makeFingerJoints method
+    (materialThickness, targetFingerWidth) on that workplane.
+
+
+    To learn a part's exact parameters, call query_docs(methods=["<PartName>"]).
+    """
+    _bind(_sid_from_ctx(ctx))
+    try:
+        if not EXT_AVAILABLE:
+            return _error("Specialized parts are currently unavailable.")
+
+        if op == "list":
+            fams: Dict[str, List[str]] = {}
+            for name, entry in sorted(_EXT_CATALOG.items()):
+                fams.setdefault(entry["family"], []).append(name)
+            return json.dumps({"status": "success", "parts_by_family": fams})
+
+        if op == "options":
+            if not part or part not in _EXT_CATALOG:
+                return _error(f"Unknown part '{part}'. Use op='list' to see available parts.")
+            return json.dumps({"status": "success", **_ext_options(part, fastener_type)})
+
+        if op == "build":
+            if not part or part not in _EXT_CATALOG:
+                return _error(f"Unknown part '{part}'. Use op='list' to see available parts.")
+            spec = {"_type": part, "params": params or {}}
+            if plane:
+                spec["plane"] = plane
+            obj = await anyio.to_thread.run_sync(_build_ext_part, spec)
+            name = store_as or _auto_name(_EXT_CATALOG[part]["family"])
+            _store(name, obj)
+            await anyio.to_thread.run_sync(_show, obj)
+            return json.dumps({"status": "success", "name": name,
+                               "obj_type": _obj_type(obj), "properties": _properties(obj)})
+
+        return _error(f"Unknown op '{op}'. Use 'build', 'list', or 'options'.")
     except Exception as e:
         return _error(str(e), traceback.format_exc())
 
@@ -2557,6 +3213,8 @@ def _resolve_cls(name: str):
         obj = getattr(module, name, None)
         if isinstance(obj, type):
             return obj
+    if name in _EXT_CATALOG:            # extension_api part classes (docs on __init__)
+        return _EXT_CATALOG[name]["cls"]
     raise ValueError(f"Unknown class: '{name}'")
 
 
@@ -2651,31 +3309,137 @@ async def query_docs(methods: List[str], cls: Optional[str] = None) -> str:
                  AndSelector, SumSelector, SubtractSelector, InverseSelector, 
                  StringSyntaxSelector (default)
              Omit to search Workplane, Sketch, and Assembly.
+             For an extension_api part or op, just pass its name as a method — e.g.
+             methods=["SpurGear"] or ["dimension_line"] — no cls needed; you get its
+             parameter docs directly.
 
     Returns plain-text docs per entry: signature, summary, params, full docstring.
     """
     # "Edge", "Wire", "Face", "Shell", "Solid", "Compound", "Shape" - add this once there is a direct_api tool
-    
-    if cls:
-        try:
-            classes = [(cls, _resolve_cls(cls))]
-        except ValueError as e:
-            return str(e)
-    else:
-        classes = [(k.__name__, k) for k in _DOC_DEFAULTS]
+
     results = []
-    for display_name, klass in classes:
-        for mname in methods:
+
+    # extension_api parts/ops self-document: a part documents its constructor and a
+    # drafting op documents its method, whether the name is given as `cls` or a method.
+    for name in {n for n in ([cls] if cls else []) + methods if n in _EXT_CATALOG}:
+        entry = _EXT_CATALOG[name]
+        tname = entry.get("method", "__init__")
+        target = getattr(entry["cls"], tname, None)
+        if callable(target):
             try:
-                m = getattr(klass, mname, None)
-                if not callable(m):
+                results.append(_doc_render(name, tname, target, inspect.signature(target)))
+            except (TypeError, ValueError):
+                pass
+
+    # Everything else is looked up on the requested class (or the defaults).
+    remaining = [m for m in methods if m not in _EXT_CATALOG and m not in ("__init__", cls)]
+    if remaining:
+        if cls:
+            try:
+                klass = _EXT_CATALOG[cls]["cls"] if cls in _EXT_CATALOG else _resolve_cls(cls)
+            except ValueError as e:
+                return "\n".join(results) if results else str(e)
+            classes = [(cls, klass)]
+        else:
+            classes = [(k.__name__, k) for k in _DOC_DEFAULTS]
+        for display_name, klass in classes:
+            for mname in remaining:
+                try:
+                    m = getattr(klass, mname, None)
+                    if not callable(m):
+                        continue
+                    sig = inspect.signature(m)
+                except Exception:
                     continue
-                sig = inspect.signature(m)
-            except Exception:
-                continue
-            results.append(_doc_render(display_name, mname, m, sig))
+                results.append(_doc_render(display_name, mname, m, sig))
 
     return "\n".join(results) if results else f"No docs found for: {', '.join(methods)}"
+
+
+# =============================================================================
+# TOOL 7 — report_learning  (agent → developer self-improvement channel)
+# =============================================================================
+# Stateless by design: this tool only validates + acks. The web backend reads the
+# call's arguments straight off the turn's steps and logs the structured learning to
+# Langfuse (a dedicated "agent-learnings" dataset item + a categorical trace score +
+# trace tags), where the trace id and Langfuse client already live. Keeping the CAD
+# server free of any Langfuse dependency is intentional — reporting must never touch
+# core modeling behavior.
+
+_LEARNING_TYPES = {
+    "missing_capability",  # a capability the agent needed but no tool offers
+    "tool_doc_error",      # a tool's doc/schema is wrong, misleading, or incomplete
+    "tool_bug",            # a tool errors or misbehaves unexpectedly
+    "context_gap",         # knowledge the agent wished it had up front (add to context)
+    "stale_context",       # something in the agent's context is wrong/misleading (remove it)
+    "technique",           # a reusable trick/recipe discovered by trial-and-error (save it)
+    "painpoint",           # recurring friction, a repeated mistake, or user frustration
+}
+_LEARNING_SEVERITIES = {"low", "medium", "high"}
+
+
+@mcp.tool(name="report_learning")
+async def report_learning(
+    type: str,
+    title: str,
+    detail: str,
+    suggestion: Optional[str] = None,
+    severity: str = "medium",
+    tool: Optional[str] = None,
+    evidence: Optional[str] = None,
+    ctx: Context = None,
+) -> str:
+    """
+    Tell the DEVELOPERS something you learned that would make this assistant better.
+    This is a private feedback channel to the people who build your tools — it is NOT
+    shown to the user and is NOT a reply to the user. Use it to turn the things you
+    discover mid-task (through real trial-and-error) into concrete, actionable signal
+    the developers can act on: gaps to fill, docs to fix, bugs to squash, context to
+    add or remove, and hard-won techniques worth keeping.
+
+    ── WHEN TO CALL (be proactive, but never spam) ──────────────────────────────
+    Call this the moment you genuinely learn something worth a developer's attention:
+    a real, specific, reusable insight — not a routine build step, and not a guess.
+    A good learning is one a developer could act on without watching this session.
+    You may call it several times in a turn if you learned several distinct things.
+    Reporting happens in the background — file it and keep helping the user; it must
+    never delay or replace your answer to them.
+
+    ── type (pick the ONE that fits best) ───────────────────────────────────────
+    • missing_capability — the user needed something no tool can do. Report ONCE for a
+                           truly unsupported request, then plainly tell the user you
+                           can't do it. Never as an excuse before really trying.
+    • tool_doc_error     — a tool's description/params were wrong, misleading, or missing
+                           something you only found out by trying. Name the tool + what's off.
+    • tool_bug           — a tool errored or produced a wrong/surprising result when used
+                           correctly. Include how to reproduce it in `evidence`.
+    • context_gap        — a fact/convention that, had you known it up front, would have
+                           saved trial-and-error. Suggest what to add to your context.
+    • stale_context      — something in your instructions/tool docs is wrong or outdated
+                           and misled you. Say what to remove or correct.
+    • technique          — a reusable recipe/workaround you discovered that reliably works
+                           (e.g. a specific op sequence for a tricky shape). Worth saving.
+    • painpoint          — a recurring friction or a mistake you keep making, or something
+                           that clearly frustrated the user. Flags what hurts most.
+
+    ── fields ───────────────────────────────────────────────────────────────────
+    title:      one short line — the headline a developer scans (required).
+    detail:     what happened and WHY it matters (required). Be concrete and specific.
+    suggestion: the fix you'd propose — the new tool, the corrected doc, the recipe, etc.
+    severity:   "low" | "medium" | "high" — how much it hurts / how much it'd help.
+    tool:       the tool this concerns, if any (e.g. "workplane_api").
+    evidence:   a concrete example — the exact params that failed, an error message, a repro.
+
+    Returns {"status": "logged", ...}. This is internal telemetry: never mention this
+    tool, its existence, or its contents to the user.
+    """
+    if type not in _LEARNING_TYPES:
+        return _error(f"Unknown type '{type}'. Use one of: {sorted(_LEARNING_TYPES)}")
+    if severity not in _LEARNING_SEVERITIES:
+        severity = "medium"
+    # The web backend does the actual Langfuse write from the turn's steps; here we
+    # only confirm the report was well-formed so the model can move on.
+    return json.dumps({"status": "logged", "type": type, "title": title})
 
 
 # =============================================================================
@@ -2724,11 +3488,16 @@ async def _session_export(request):
     sess = _get_session(request.query_params.get("session"))
     if not sess.state:
         return JSONResponse({"error": "empty"}, status_code=404)
+    # Nothing changed since the last export (e.g. a Q&A / doc-only turn) → tell the
+    # web layer to skip the re-upload. Avoids re-writing an identical blob every turn.
+    if sess.rev == sess.exported_rev:
+        return Response(status_code=304)
     try:
         data = _snapshot(sess)
     except Exception as e:
         _log_err(str(e), traceback.format_exc())
         return JSONResponse({"error": "snapshot failed"}, status_code=500)
+    sess.exported_rev = sess.rev
     return Response(data, media_type="application/octet-stream")
 
 
@@ -2849,6 +3618,43 @@ async def _backend(request):
     return JSONResponse(resp or {})
 
 
+@mcp.custom_route("/selection", methods=["POST"])
+async def _selection(request):
+    """Viewer 'select' tool: the frontend posts the picked shape-id paths
+    ({"shapeIds": [...]}); we resolve each to its OCCT sub-shape and return a
+    neutral geometric description the prompt is prefixed with. ?session=<id>."""
+    from starlette.responses import JSONResponse
+    sess = _get_session(request.query_params.get("session"))
+    mb = sess.measure_backend
+    if mb is None or not getattr(mb, "model", None) or _get_properties is None:
+        return JSONResponse({"features": []})
+    try:
+        ids = (await request.json()).get("shapeIds", []) or []
+    except Exception:
+        ids = []
+    part_locs = sess.viewer.get("part_locs") or {}
+    features = []
+    for sid in ids:
+        world_shape = mb.model.get(sid)
+        if world_shape is None:
+            continue
+        try:
+            # For a placed assembly part, edit-frame coords must be part-LOCAL:
+            # recover them by un-applying the part's world placement. Single parts
+            # (identity placement) stay world-framed with no assembly context.
+            part_id = re.split(r"/(?:faces|edges|vertices)/", sid)[0]
+            loc, placement = _placement_of(part_locs.get(part_id))
+            if loc is not None:
+                shape = cq.Shape.cast(world_shape).moved(loc.inverse).wrapped
+                world_center = _feat_center(world_shape)
+            else:
+                shape, world_center = world_shape, None
+            features.append(_describe_feature(sid, shape, world_center, placement))
+        except Exception as e:
+            _log_err(str(e), traceback.format_exc())
+    return JSONResponse({"features": features})
+
+
 # =============================================================================
 # ENTRY POINT
 # =============================================================================
@@ -2896,51 +3702,38 @@ def _run_http():
 
 
 # =============================================================================
-# POSTHOG MCP ANALYTICS  (production only)
+# POSTHOG MCP ANALYTICS  — DISABLED
 # =============================================================================
-# Auto-captures how the AI agent uses the CAD tools — every tool call (name,
-# parameters, response, duration, errors) plus the agent's intent — so we can see
-# which operations it reaches for, what fails, and where it's slow. instrument()
-# hooks FastMCP's dispatch, so all five tools are covered with no per-tool code.
-# Enabled only when POSTHOG_KEY is set (the prod backend), so local/CI runs
-# stay silent and don't spend the free-tier quota. Any failure degrades to a
-# no-op — analytics must never break the CAD server.
+# Replaced by the Langfuse-native self-improvement system: the `report_learning`
+# tool above (agent → developer), whose calls the web backend logs to Langfuse.
+# The old PostHog `instrument()` hook injected a virtual `get_more_tools` tool
+# ($mcp_missing_capability) and a per-call intent field ($mcp_intent); both are
+# superseded. Kept commented for reference rather than deleted.
 #
-# Test locally (http transport) — install the dep once, then run with the key set:
-#   ./mcp_server/.venv/bin/pip install -e ./mcp_server
-#   MCP_TRANSPORT=http MCP_TOKEN=<mcp-token> PORT=8080 \
-#   POSTHOG_KEY=<phc_project_key> POSTHOG_HOST=https://us.i.posthog.com \
-#   mcp_server/.venv/bin/python mcp_server/src/t2c_mcp.py
-def _setup_mcp_analytics():
-    key = os.environ.get("POSTHOG_KEY")
-    if not key:
-        return
-    try:
-        from posthog import Posthog
-        from posthog.mcp import instrument, MCPAnalyticsOptions, MCPAnalyticsContextOptions
-        client = Posthog(key, host=os.environ.get("POSTHOG_HOST", "https://us.i.posthog.com"))
-        # report_missing registers a virtual `get_more_tools` tool the agent calls
-        # when a request needs a capability we don't offer → $mcp_missing_capability
-        # events stamped with the agent's description of the gap (the R&D wishlist).
-        # context keeps per-call intent ($mcp_intent), but its description makes clear
-        # this injected field is internal-only so the model doesn't mistake it for its
-        # user reply and go silent (paired with the OUTPUT RULE in the web system prompt).
-        instrument(mcp, client, options=MCPAnalyticsOptions(
-            report_missing=True,
-            context=MCPAnalyticsContextOptions(
-                description=(
-                    "Internal analytics only — never shown to the user and NOT a substitute for your reply. " 
-                    "In one short phrase, why are you calling this tool?"
-                )
-            ),
-        ))
-        atexit.register(client.shutdown)  # flush queued events on process exit
-    except Exception as e:
-        logging.getLogger(__name__).warning("MCP analytics disabled: %s", e)
+# def _setup_mcp_analytics():
+#     key = os.environ.get("POSTHOG_KEY")
+#     if not key:
+#         return
+#     try:
+#         from posthog import Posthog
+#         from posthog.mcp import instrument, MCPAnalyticsOptions, MCPAnalyticsContextOptions
+#         client = Posthog(key, host=os.environ.get("POSTHOG_HOST", "https://us.i.posthog.com"))
+#         instrument(mcp, client, options=MCPAnalyticsOptions(
+#             report_missing=True,
+#             context=MCPAnalyticsContextOptions(
+#                 description=(
+#                     "Internal analytics only — never shown to the user and NOT a substitute for your reply. "
+#                     "In one short phrase, why are you calling this tool?"
+#                 )
+#             ),
+#         ))
+#         atexit.register(client.shutdown)  # flush queued events on process exit
+#     except Exception as e:
+#         logging.getLogger(__name__).warning("MCP analytics disabled: %s", e)
 
 
 if __name__ == "__main__":
-    _setup_mcp_analytics()
+    # _setup_mcp_analytics()  # PostHog MCP analytics disabled (see above)
     if os.environ.get("MCP_TRANSPORT", "stdio") == "http":
         _VIEWER_MODE = "http"
         # Each session seeds its own placeholder lazily (see _get_session), so the
