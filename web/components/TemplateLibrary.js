@@ -51,7 +51,7 @@ function Switch({ checked, disabled, onChange }) {
         />
       </TooltipTrigger>
       <TooltipContent side="bottom" sideOffset={8}>
-        {checked ? "On — the AI can use this template" : "Off — excluded from your AI retrieval"}
+        {checked ? "AI can use this" : "AI can't use this"}
       </TooltipContent>
     </Tooltip>
   );
@@ -92,7 +92,7 @@ function VisibilityBadge({ visibility }) {
         <Icon size={14} />
       </TooltipTrigger>
       <TooltipContent side="bottom" sideOffset={8}>
-        {isPublic ? "Public — shared with everyone" : "Private — only you can use it"}
+        {isPublic ? "Public" : "Private"}
       </TooltipContent>
     </Tooltip>
   );
@@ -159,7 +159,7 @@ function TemplateRow({ t, active, onPreview, onToggle, onEdited, onDelete }) {
           </div>
           <div style={{ fontSize: 12, color: "#8a8f98", overflow: "hidden", textOverflow: "ellipsis", display: "-webkit-box", WebkitLineClamp: 2, WebkitBoxOrient: "vertical" }}>{t.description}</div>
         </TooltipTrigger>
-        <TooltipContent side="bottom" sideOffset={8}>Show this template&apos;s 3D model</TooltipContent>
+        <TooltipContent side="bottom" sideOffset={8}>Show 3D model</TooltipContent>
       </Tooltip>
       {active && (
         <span style={{ color: "#6b7280", display: "inline-flex", flexShrink: 0 }} aria-hidden><EyeIcon size={14} /></span>
@@ -167,7 +167,7 @@ function TemplateRow({ t, active, onPreview, onToggle, onEdited, onDelete }) {
       {canManage && (
         <>
           <IconAction tooltip="Edit title & description" onClick={startEdit}><PencilIcon size={15} /></IconAction>
-          <IconAction tooltip="Delete template" danger onClick={() => onDelete(t)}><Trash2Icon size={15} /></IconAction>
+          <IconAction tooltip="Delete" danger onClick={() => onDelete(t)}><Trash2Icon size={15} /></IconAction>
         </>
       )}
       <Switch checked={t.enabled} onChange={(v) => onToggle(t.id, v)} />
