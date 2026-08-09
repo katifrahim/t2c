@@ -424,23 +424,21 @@ function ChatInner() {
   const [panel, setPanel] = useState(null);
   const clearPreview = useSessionStore((s) => s.clearPreview);
 
-  // Leaving the library snaps the viewer back to the live chat model (drops any
-  // template preview). Centralised here so every close path is covered.
-  const setPanelSafe = (next) => {
-    setPanel((prev) => {
-      const value = typeof next === "function" ? next(prev) : next;
-      if (prev === "library" && value !== "library") clearPreview();
-      return value;
-    });
-  };
-  const toggle = (name) => setPanelSafe((p) => (p === name ? null : name));
+  const toggle = (name) => setPanel((p) => (p === name ? null : name));
+
+  // Whenever the library isn't open, drop any template preview so the viewer shows the
+  // live chat model. Done in an effect (not inside a setState updater) so we never
+  // update the Viewer store while ChatInner is rendering.
+  useEffect(() => {
+    if (panel !== "library") clearPreview();
+  }, [panel, clearPreview]);
 
   // Close whatever panel is open whenever the active thread changes (selecting a past
   // chat or starting a new one), so the conversation comes to the front.
   const activeId = useAuiState((s) => s.threadListItem.id);
   const mounted = useRef(false);
   useEffect(() => {
-    if (mounted.current) setPanelSafe(null);
+    if (mounted.current) setPanel(null);
     else mounted.current = true;
   }, [activeId]);
 
