@@ -328,7 +328,10 @@ export default function Viewer() {
     spinAccum: { x: 0, y: 0, z: 0 }, spinSpeed: SPIN_SPEED, rotRaf: 0,
   });
   const sessionId = useSessionStore((s) => s.sessionId);
-  const sidRef = useRef(sessionId);
+  const previewSessionId = useSessionStore((s) => s.previewSessionId);
+  // The Viewer shows a template preview when one is active, else the live chat model.
+  const effectiveSid = previewSessionId ?? sessionId;
+  const sidRef = useRef(effectiveSid);
   // Blank white until the backend/MCP server delivers the first model; show a
   // loader in the viewer area until then.
   const [hasModel, setHasModel] = useState(false);
@@ -396,9 +399,9 @@ export default function Viewer() {
   // force the next poll to re-render this session's model — or its placeholder
   // (grid + tools + empty scene), so the viewer widget is NEVER torn down.
   useEffect(() => {
-    sidRef.current = sessionId;
+    sidRef.current = effectiveSid;
     ref.current.lastVersion = -1;
-  }, [sessionId]);
+  }, [effectiveSid]);
 
   // Load the viewer stylesheet only when the viewer mounts (it's scoped under
   // .tcv-scope, so it never leaks into the rest of the app).

@@ -14,4 +14,11 @@ export const useSessionStore = create((set) => ({
   // Start a brand-new chat (fresh backend session; row is created lazily on the
   // first saved message).
   newSession: () => set({ sessionId: newChatId() }),
+
+  // When set, the Viewer polls this backend session instead of sessionId — used by
+  // the Template Library to preview a template's stored 3D model without disturbing
+  // the live chat. Cleared to snap back to the active chat's model.
+  previewSessionId: null,
+  setPreview: (id) => set({ previewSessionId: id }),
+  clearPreview: () => set({ previewSessionId: null }),
 }));
