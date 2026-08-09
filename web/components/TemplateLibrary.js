@@ -108,6 +108,7 @@ function TemplateRow({ t, active, onPreview, onToggle, onEdited, onDelete }) {
   const [title, setTitle] = useState(t.title);
   const [description, setDescription] = useState(t.description);
   const [saving, setSaving] = useState(false);
+  const [hovered, setHovered] = useState(false);
 
   const canManage = t.is_owner && t.visibility === "private";
 
@@ -143,26 +144,40 @@ function TemplateRow({ t, active, onPreview, onToggle, onEdited, onDelete }) {
     <div
       onClick={() => onPreview(t)}
       style={{ display: "flex", alignItems: "center", gap: 8, padding: "8px 10px", borderBottom: "1px solid #f2f2f2", cursor: "pointer", background: active ? "#f1f1f1" : "transparent" }}
-      onMouseEnter={(e) => { if (!active) e.currentTarget.style.background = "#f7f7f7"; }}
-      onMouseLeave={(e) => { if (!active) e.currentTarget.style.background = "transparent"; }}
+      onMouseEnter={(e) => { setHovered(true); if (!active) e.currentTarget.style.background = "#f7f7f7"; }}
+      onMouseLeave={(e) => { setHovered(false); if (!active) e.currentTarget.style.background = "transparent"; }}
     >
       <VisibilityBadge visibility={t.visibility} />
-      {/* Scope the row's "show 3D model" tooltip to the title/description area only, so
-          hovering an action (toggle/edit/delete/badge) shows just that control's tooltip. */}
-      <Tooltip>
-        <TooltipTrigger render={<div style={{ flex: 1, minWidth: 0 }} />}>
-          <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
-            <span style={{ fontSize: 13, fontWeight: 600, color: "#1f2937", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{t.title}</span>
-            {active && !t.has_model && (
-              <span style={{ fontSize: 10, color: "#9ca3af", flexShrink: 0 }}>no preview yet</span>
-            )}
-          </div>
-          <div style={{ fontSize: 12, color: "#8a8f98", overflow: "hidden", textOverflow: "ellipsis", display: "-webkit-box", WebkitLineClamp: 2, WebkitBoxOrient: "vertical" }}>{t.description}</div>
-        </TooltipTrigger>
-        <TooltipContent side="bottom" sideOffset={8}>Show 3D model</TooltipContent>
-      </Tooltip>
-      {active && (
-        <span style={{ color: "#6b7280", display: "inline-flex", flexShrink: 0 }} aria-hidden><EyeIcon size={14} /></span>
+      <div style={{ flex: 1, minWidth: 0 }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+          <span style={{ fontSize: 13, fontWeight: 600, color: "#1f2937", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{t.title}</span>
+          {active && !t.has_model && (
+            <span style={{ fontSize: 10, color: "#9ca3af", flexShrink: 0 }}>no preview yet</span>
+          )}
+        </div>
+        <div style={{ fontSize: 12, color: "#8a8f98", overflow: "hidden", textOverflow: "ellipsis", display: "-webkit-box", WebkitLineClamp: 2, WebkitBoxOrient: "vertical" }}>{t.description}</div>
+      </div>
+      {/* Eye reveals on row hover (or stays put when this is the active model). It's
+          dark when active — the cue for which template the viewer is showing — and
+          darkens on its own hover, matching the pencil/trash icons. */}
+      {(hovered || active) && (
+        <Tooltip>
+          <TooltipTrigger
+            render={
+              <button
+                type="button"
+                aria-label="Show 3D model"
+                onClick={(e) => { e.stopPropagation(); onPreview(t); }}
+                style={{ border: "none", background: "none", cursor: "pointer", color: active ? "#111" : "#bbb", padding: 4, borderRadius: 6, display: "inline-flex", flexShrink: 0 }}
+                onMouseEnter={(e) => { e.currentTarget.style.color = "#111"; }}
+                onMouseLeave={(e) => { e.currentTarget.style.color = active ? "#111" : "#bbb"; }}
+              />
+            }
+          >
+            <EyeIcon size={15} />
+          </TooltipTrigger>
+          <TooltipContent side="bottom" sideOffset={8}>Show 3D model</TooltipContent>
+        </Tooltip>
       )}
       {canManage && (
         <>
