@@ -83,7 +83,23 @@ async function draftMetadata({ transcript, openrouter }) {
   }
 }
 
-// Rebuild the model once in a fresh scratch session; return steps + usage.
+// Export the freshly-built scratch session as a snapshot blob (base64), so we can
+// store it as the template's 3D preview model. Same format as a chat snapshot —
+// pickled geometry, NOT the steps. Best-effort: returns null on any failure.
+async function exportModel(backendUrl, token, scratch) {
+  try {
+    const resp = await fetch(`${backendUrl}/session/export?session=${encodeURIComponent(scratch)}`, {
+      headers: token ? { Authorization: `Bearer ${token}` } : {},
+    });
+    if (resp.status !== 200) return null; // 404 = empty session
+    return Buffer.from(await resp.arrayBuffer()).toString("base64");
+  } catch (e) {
+    console.error("capture-template model export failed:", e);
+    return null;
+  }
+}
+
+// Rebuild the model once in a fresh scratch session; return steps + usage + model.
 async function runRebuild({ backendUrl, token, scratch, transcript, openrouter }) {
   const mcpClient = await createMCPClient({
     transport: {
@@ -111,7 +127,9 @@ async function runRebuild({ backendUrl, token, scratch, transcript, openrouter }
       tools: await mcpClient.tools(),
       stopWhen: stepCountIs(50),
     });
-    return { steps, totalUsage };
+    // Snapshot the built model before the finally clears the scratch session.
+    const model = await exportModel(backendUrl, token, scratch);
+    return { steps, totalUsage, model };
   } finally {
     try { await mcpClient.close(); } catch { /* already closed */ }
     // Free the scratch session's objects on the backend.
@@ -149,14 +167,15 @@ export async function POST(_req, { params }) {
   // A capture is a full agent turn, so meter every attempt's real cost.
   let template = [];
   let verified = null;
+  let model = null; // base64 snapshot of the accepted attempt's built model
   let cost = 0;
   let inputTokens = 0;
   let outputTokens = 0;
   for (let attempt = 0; attempt < 2; attempt++) {
     const scratch = `__TEMPLATE__${id}__${Date.now()}`;
-    let steps, totalUsage;
+    let steps, totalUsage, attemptModel;
     try {
-      ({ steps, totalUsage } = await runRebuild({ backendUrl, token, scratch, transcript, openrouter }));
+      ({ steps, totalUsage, model: attemptModel } = await runRebuild({ backendUrl, token, scratch, transcript, openrouter }));
     } catch (e) {
       console.error("capture-template rebuild failed:", e);
       return Response.json({ error: "rebuild failed" }, { status: 502 });
@@ -166,6 +185,7 @@ export async function POST(_req, { params }) {
     outputTokens += totalUsage?.outputTokens ?? 0;
     template = templateFromSteps(steps);
     verified = signaturesMatch(finalSignatureFromSteps(steps), liveSig);
+    model = attemptModel; // keep the latest (= accepted, since we break on accept)
     if (verified !== false) break; // matched, or nothing to compare against
   }
 
@@ -200,6 +220,7 @@ export async function POST(_req, { params }) {
   return Response.json({
     template,
     verified,
+    model, // base64 3D preview snapshot (may be null), stored on save
     count: template.length,
     credits,
     title: meta.title,

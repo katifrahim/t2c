@@ -460,6 +460,7 @@ const SaveTemplateButton: FC = () => {
   >("idle");
   const [steps, setSteps] = useState<unknown[]>([]);
   const [verified, setVerified] = useState<boolean | null>(null);
+  const [model, setModel] = useState<string | null>(null);
   const [title, setTitle] = useState("");
   const [description, setDescription] = useState("");
   const [visibility, setVisibility] = useState<"private" | "public">("private");
@@ -483,6 +484,7 @@ const SaveTemplateButton: FC = () => {
       }
       setSteps(data.template);
       setVerified(data.verified ?? null);
+      setModel(data.model ?? null);
       setTitle(data.title ?? "");
       setDescription(data.description ?? "");
       setVisibility("private");
@@ -501,7 +503,7 @@ const SaveTemplateButton: FC = () => {
       const res = await fetch("/api/templates", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ title: title.trim(), description: description.trim(), steps, verified, visibility }),
+        body: JSON.stringify({ title: title.trim(), description: description.trim(), steps, verified, visibility, model }),
       });
       if (!res.ok) {
         console.warn("store template failed:", res.status);
