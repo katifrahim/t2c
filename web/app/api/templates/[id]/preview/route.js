@@ -44,7 +44,10 @@ export async function POST(_req, { params }) {
       },
     );
     const r = await resp.json().catch(() => ({}));
-    return Response.json({ available: r.status === "ok", sessionId: session });
+    // "ok" = just imported; "already-loaded" = a previous preview left the model in
+    // this session (the backend won't clobber it). Both mean the model is on screen.
+    const available = r.status === "ok" || r.status === "already-loaded";
+    return Response.json({ available, sessionId: session });
   } catch (e) {
     return Response.json({ available: false, error: String(e) }, { status: 502 });
   }

@@ -2,7 +2,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import {
   LockIcon, GlobeIcon, PencilIcon, Trash2Icon, EyeIcon,
-  Loader2Icon, CheckIcon, XIcon,
+  Loader2Icon, CheckIcon,
 } from "lucide-react";
 import {
   Tooltip, TooltipTrigger, TooltipContent,
