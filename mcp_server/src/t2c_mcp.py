@@ -3390,37 +3390,39 @@ async def report_learning(
     ctx: Context = None,
 ) -> str:
     """
-    Tell the DEVELOPERS something you learned that would make this assistant better.
+    Tell the DEVELOPERS something you learned that would help them make you better.
     This is a private feedback channel to the people who build your tools — it is NOT
     shown to the user and is NOT a reply to the user. Use it to turn the things you
     discover mid-task (through real trial-and-error) into concrete, actionable signal
     the developers can act on: gaps to fill, docs to fix, bugs to squash, context to
     add or remove, and hard-won techniques worth keeping.
 
-    ── WHEN TO CALL (be proactive, but never spam) ──────────────────────────────
-    Call this the moment you genuinely learn something worth a developer's attention:
-    a real, specific, reusable insight — not a routine build step, and not a guess.
-    A good learning is one a developer could act on without watching this session.
-    You may call it several times in a turn if you learned several distinct things.
-    Reporting happens in the background — file it and keep helping the user; it must
-    never delay or replace your answer to them.
+    ── WHEN TO CALL (self-trigger — you do not need to be asked) ─────────────────
+    Certain things you OBSERVE while working ARE your cue to file a report, on your
+    own, mid-task — the user will not ask you to. Each row below is a concrete event
+    to watch for and the type to file when it happens:
 
-    ── type (pick the ONE that fits best) ───────────────────────────────────────
-    • missing_capability — the user needed something no tool can do. Report ONCE for a
-                           truly unsupported request, then plainly tell the user you
-                           can't do it. Never as an excuse before really trying.
-    • tool_doc_error     — a tool's description/params were wrong, misleading, or missing
-                           something you only found out by trying. Name the tool + what's off.
-    • tool_bug           — a tool errored or produced a wrong/surprising result when used
-                           correctly. Include how to reproduce it in `evidence`.
-    • context_gap        — a fact/convention that, had you known it up front, would have
-                           saved trial-and-error. Suggest what to add to your context.
-    • stale_context      — something in your instructions/tool docs is wrong or outdated
+    • tool_bug           — a tool errored, rejected valid input, or gave a wrong/
+                           surprising result when you used it correctly. File it; put a
+                           repro (the exact params, the error) in `evidence`.
+    • tool_doc_error     — you had to retry or adjust a call because a tool's description
+                           or params didn't match reality. Name the tool + what's off.
+    • technique          — you only got a tricky result to work after trial-and-error and
+                           found a reliable recipe (e.g. a specific op sequence). Save it.
+    • context_gap        — a fact/convention would have saved you trial-and-error had you
+                           known it up front. Suggest what to add to your context.
+    • stale_context      — something in your instructions/tool docs was wrong or outdated
                            and misled you. Say what to remove or correct.
-    • technique          — a reusable recipe/workaround you discovered that reliably works
-                           (e.g. a specific op sequence for a tricky shape). Worth saving.
-    • painpoint          — a recurring friction or a mistake you keep making, or something
-                           that clearly frustrated the user. Flags what hurts most.
+    • painpoint          — the user corrected you, repeated a request, or was visibly
+                           frustrated, or you keep making the same mistake. Flag it.
+    • missing_capability — the user asked for something no tool can do, and you confirmed
+                           it by genuinely trying first. File ONCE, then plainly tell the
+                           user you can't do it. Not before really trying with your tools.
+
+    Reporting is background: file it and keep helping the user — it never delays or
+    replaces your reply. File several in a turn if several distinct things happened.
+    Skip routine successes and guesses — file only real, reusable signal a developer
+    could act on without watching this session.
 
     ── fields ───────────────────────────────────────────────────────────────────
     title:      one short line — the headline a developer scans (required).
