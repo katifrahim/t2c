@@ -9,7 +9,7 @@ import {
   useThreadListItem,
   useThreadListItemRuntime,
 } from "@assistant-ui/react";
-import { MenuIcon, PlusIcon, DownloadIcon, LogOutIcon, Trash2Icon, PencilIcon, GripVerticalIcon, MoonIcon, SunIcon } from "lucide-react";
+import { MenuIcon, PlusIcon, DownloadIcon, LogOutIcon, Trash2Icon, PencilIcon, GripVerticalIcon, MoonIcon, SunIcon, LibraryIcon } from "lucide-react";
 import {
   DndContext,
   PointerSensor,
@@ -43,6 +43,7 @@ import {
   AlertDialogAction,
 } from "@/components/ui/alert-dialog";
 import { Thread } from "@/components/assistant-ui/thread";
+import TemplateLibrary from "@/components/TemplateLibrary";
 import ChatProvider from "@/components/ChatProvider";
 import { MODELS } from "@/lib/models";
 import { useModelStore } from "@/lib/model-store";
@@ -118,7 +119,7 @@ function TopBarButton({ tooltip, onClick, active, danger, children }) {
   );
 }
 
-function TopBar({ onToggleHistory, historyOpen }) {
+function TopBar({ onToggleHistory, historyOpen, onToggleLibrary, libraryOpen }) {
   const model = useModelStore((s) => s.model);
   const setModel = useModelStore((s) => s.setModel);
   const sessionId = useSessionStore((s) => s.sessionId);
@@ -171,6 +172,10 @@ function TopBar({ onToggleHistory, historyOpen }) {
     <div style={{ display: "flex", alignItems: "center", gap: 8, padding: "8px 12px", borderBottom: "1px solid #eee", background: "#fff" }}>
       <TopBarButton tooltip="Chat history" onClick={onToggleHistory} active={historyOpen}>
         <MenuIcon size={16} />
+      </TopBarButton>
+
+      <TopBarButton tooltip="Template library" onClick={onToggleLibrary} active={libraryOpen}>
+        <LibraryIcon size={16} />
       </TopBarButton>
 
       <Tooltip>
@@ -415,14 +420,27 @@ function ThreadListPanel() {
 }
 
 function ChatInner() {
-  const [showHistory, setShowHistory] = useState(false);
+  // Only one panel overlays the chat at a time: 'history', 'library', or null.
+  const [panel, setPanel] = useState(null);
+  const clearPreview = useSessionStore((s) => s.clearPreview);
 
-  // Close the history panel whenever the active thread changes (selecting a past
+  // Leaving the library snaps the viewer back to the live chat model (drops any
+  // template preview). Centralised here so every close path is covered.
+  const setPanelSafe = (next) => {
+    setPanel((prev) => {
+      const value = typeof next === "function" ? next(prev) : next;
+      if (prev === "library" && value !== "library") clearPreview();
+      return value;
+    });
+  };
+  const toggle = (name) => setPanelSafe((p) => (p === name ? null : name));
+
+  // Close whatever panel is open whenever the active thread changes (selecting a past
   // chat or starting a new one), so the conversation comes to the front.
   const activeId = useAuiState((s) => s.threadListItem.id);
   const mounted = useRef(false);
   useEffect(() => {
-    if (mounted.current) setShowHistory(false);
+    if (mounted.current) setPanelSafe(null);
     else mounted.current = true;
   }, [activeId]);
 
@@ -432,13 +450,20 @@ function ChatInner() {
     const r = requestAnimationFrame(fire);
     const t = setTimeout(fire, 250);
     return () => { cancelAnimationFrame(r); clearTimeout(t); };
-  }, [showHistory]);
+  }, [panel]);
 
   return (
     <div style={{ display: "flex", flexDirection: "column", height: "100%", background: "#fff" }}>
-      <TopBar historyOpen={showHistory} onToggleHistory={() => setShowHistory((v) => !v)} />
+      <TopBar
+        historyOpen={panel === "history"}
+        onToggleHistory={() => toggle("history")}
+        libraryOpen={panel === "library"}
+        onToggleLibrary={() => toggle("library")}
+      />
       <div style={{ flex: 1, minHeight: 0, display: "flex", flexDirection: "column" }}>
-        {showHistory ? <ThreadListPanel /> : <div style={{ height: "100%" }}><Thread /></div>}
+        {panel === "history" ? <ThreadListPanel />
+          : panel === "library" ? <TemplateLibrary />
+          : <div style={{ height: "100%" }}><Thread /></div>}
       </div>
     </div>
   );
