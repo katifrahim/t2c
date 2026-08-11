@@ -27,7 +27,10 @@ import cadquery as cq
 from OCP.STEPCAFControl import STEPCAFControl_Reader
 from OCP.TDocStd import TDocStd_Document
 from OCP.XCAFApp import XCAFApp_Application
-from OCP.XCAFDoc import XCAFDoc_DocumentTool, XCAFDoc_ColorType
+from OCP.XCAFDoc import (
+    XCAFDoc_DocumentTool, XCAFDoc_ColorType,
+    XCAFDoc_Dimension, XCAFDoc_GeomTolerance, XCAFDoc_Datum,
+)
 from OCP.TCollection import TCollection_ExtendedString
 from OCP.TDF import TDF_LabelSequence, TDF_Label
 from OCP.TDataStd import TDataStd_Name
@@ -131,12 +134,13 @@ def _read_header(path: str) -> dict:
         if sch:
             s = sch.group(1)
             head["schema"] = s
-            ap = re.search(r"10303[,\s]+(\d{3})", s) or re.search(r"AP(\d{3})", s)
-            if ap:
-                head["application_protocol"] = "AP" + ap.group(1)[-3:]
-            elif "AUTOMOTIVE_DESIGN" in s:
+            # Prefer the schema *name*, not the "10303 NNN" MIM part-number (AP242's MIM is
+            # 10303-442, so that number must not be read as the AP).
+            if "MANAGED_MODEL_BASED_3D_ENGINEERING" in s or "AP242" in s:
+                head["application_protocol"] = "AP242"
+            elif "AUTOMOTIVE_DESIGN" in s or "AP214" in s:
                 head["application_protocol"] = "AP214"
-            elif "CONFIG_CONTROL_DESIGN" in s:
+            elif "CONFIG_CONTROL_DESIGN" in s or "AP203" in s:
                 head["application_protocol"] = "AP203"
         name = re.search(r"FILE_NAME\('([^']*)'", txt)
         if name and name.group(1):
@@ -166,22 +170,116 @@ def _label_color(color_tool, lab: TDF_Label):
     return None
 
 
+def _placement(t, r) -> dict | None:
+    """Translation + XYZ-euler degrees, or None for an identity placement."""
+    if all(abs(v) < 1e-6 for v in (*t, *r)):
+        return None
+    return {"translation": [_r(v) for v in t], "rotation_deg_xyz": [_r(v) for v in r]}
+
+
 def _loc_to_placement(loc) -> dict | None:
-    """A component's TopLoc_Location -> translation + XYZ-euler degrees (LLM-friendly)."""
+    """A placement from any location (TopLoc_Location or cq.Location). cq.Location.toTuple()
+    already yields ((tx,ty,tz),(rx,ry,rz)) with rotation in degrees."""
     try:
-        trsf = loc.Transformation()
-        t = trsf.TranslationPart()
-        q = trsf.GetRotation()
-        import math
-        a, b, c = q.GetEulerAngles(q.EulerSequence_Extrinsic_XYZ) \
-            if hasattr(q, "EulerSequence_Extrinsic_XYZ") else (0.0, 0.0, 0.0)
-        deg = [round(math.degrees(v), 3) + 0.0 for v in (a, b, c)]
-        tr = [_r(t.X()), _r(t.Y()), _r(t.Z())]
-        if all(abs(v) < 1e-6 for v in (*tr, *deg)):
-            return None  # identity — no placement to report
-        return {"translation": tr, "rotation_deg_xyz": deg}
+        t, r = cq.Location(loc).toTuple()
+        return _placement(t, r)
     except Exception:
         return None
+
+
+def _hstr(h):
+    """A handle to a TCollection HAsciiString -> str, or None."""
+    try:
+        return h.ToCString() if h is not None else None
+    except Exception:
+        try:
+            return h.String().ToCString()
+        except Exception:
+            return None
+
+
+def _enum_tail(v) -> str:
+    """'XCAFDimTolObjects_DimensionType_LinearDistance' -> 'LinearDistance'."""
+    return str(v).rsplit("_", 1)[-1]
+
+
+def _read_pmi(doc) -> dict:
+    """Semantic PMI / GD&T — dimensions, geometric tolerances, datums — via the XCAF
+    DimTol tool. Best-effort: AP242 carries this (it is the 2D-drawing data), but many
+    files have none, so every step is guarded and an empty result is normal."""
+    out = {"dimensions": [], "tolerances": [], "datums": []}
+    try:
+        tool = XCAFDoc_DocumentTool.DimTolTool_s(doc.Main())
+    except Exception:
+        return {}
+
+    def each(get_labels, attr_cls):
+        labels = TDF_LabelSequence()
+        try:
+            get_labels(labels)
+        except Exception:
+            return
+        for i in range(1, labels.Length() + 1):
+            lab = labels.Value(i)
+            attr = attr_cls()
+            if lab.FindAttribute(attr_cls.GetID_s(), attr):
+                try:
+                    o = attr.GetObject()
+                except Exception:
+                    o = None
+                if o is not None:
+                    yield o
+
+    for o in each(tool.GetDimensionLabels, XCAFDoc_Dimension):
+        d = {}
+        try:
+            d["type"] = _enum_tail(o.GetType())
+        except Exception:
+            pass
+        try:
+            arr = o.GetValues()
+            if arr is not None:
+                d["values"] = [_r(arr.Value(j)) for j in range(arr.Lower(), arr.Upper() + 1)]
+        except Exception:
+            pass
+        try:
+            nm = _hstr(o.GetSemanticName())
+            if nm:
+                d["name"] = nm
+        except Exception:
+            pass
+        try:
+            lo, up = o.GetLowerTolValue(), o.GetUpperTolValue()
+            if lo or up:
+                d["tolerance"] = [_r(lo), _r(up)]
+        except Exception:
+            pass
+        if d:
+            out["dimensions"].append(d)
+
+    for o in each(tool.GetGeomToleranceLabels, XCAFDoc_GeomTolerance):
+        t = {}
+        try:
+            t["type"] = _enum_tail(o.GetType())
+        except Exception:
+            pass
+        try:
+            t["value"] = _r(o.GetValue())
+        except Exception:
+            pass
+        if t:
+            out["tolerances"].append(t)
+
+    for o in each(tool.GetDatumLabels, XCAFDoc_Datum):
+        nm = None
+        try:
+            nm = _hstr(o.GetName())
+        except Exception:
+            pass
+        if nm:
+            out["datums"].append(nm)
+
+    return {k: v for k, v in out.items() if v}
 
 
 def read_step(path: str):
@@ -236,7 +334,7 @@ def read_step(path: str):
     for i in range(1, free.Length() + 1):
         walk(free.Value(i), None)
 
-    meta = {"header": _read_header(path), "parts": parts}
+    meta = {"header": _read_header(path), "parts": parts, "pmi": _read_pmi(doc)}
 
     # Build the editable CadQuery object. Single part -> Workplane; else Assembly.
     if len(parts) == 1 and parts[0]["placement"] is None:
@@ -465,19 +563,41 @@ def _solids(shape):
     return out
 
 
+def _parts_from_object(obj) -> list:
+    """Parts (name/color/placement/shape) from a live CadQuery object when no STEP metadata
+    is supplied — so describe_shape also works on AI-built models, including assemblies."""
+    if isinstance(obj, cq.Assembly):
+        parts = []
+
+        def rec(node, parent_loc):
+            loc = parent_loc * node.loc
+            if node.obj is not None:
+                shp = node.obj.val() if hasattr(node.obj, "val") else node.obj
+                if isinstance(shp, cq.Shape):
+                    t, r = loc.toTuple()
+                    col = list(node.color.toTuple()[:3]) if node.color else None
+                    parts.append({"name": node.name, "color": col,
+                                  "placement": _placement(t, r),
+                                  "shape": shp.located(loc).wrapped})
+            for ch in node.children:
+                rec(ch, loc)
+
+        rec(obj, cq.Location())
+        return parts
+    shape = obj.wrapped if hasattr(obj, "wrapped") else (
+        obj.val().wrapped if hasattr(obj, "val") else obj)
+    return [{"name": None, "color": None, "placement": None, "shape": shape}]
+
+
 def describe_shape(obj, meta: dict | None = None, budget: int = FACE_BUDGET) -> dict:
     """Structured, tiered description of a CAD object (imported STEP or AI-built).
 
     obj:  a cadquery Workplane / Shape / Assembly, or a raw TopoDS shape.
-    meta: the dict from read_step (header + parts). Optional; when absent the object's
-          own solids are described anonymously.
+    meta: the dict from read_step (header + parts). Optional; when absent the parts are
+          derived from the object itself.
     """
     # Resolve the parts to describe: prefer STEP metadata (names/colors/placement).
-    parts = (meta or {}).get("parts")
-    if not parts:
-        shape = obj.wrapped if hasattr(obj, "wrapped") else (
-            obj.val().wrapped if hasattr(obj, "val") else obj)
-        parts = [{"name": None, "color": None, "placement": None, "shape": shape}]
+    parts = (meta or {}).get("parts") or _parts_from_object(obj)
 
     all_solids = []
     part_reports = []
@@ -528,11 +648,17 @@ def describe_shape(obj, meta: dict | None = None, budget: int = FACE_BUDGET) -> 
     if meta and meta.get("header"):
         summary["source"] = meta["header"]
     summary["units"] = "mm"  # OCCT normalises STEP lengths to millimetres on read
+    pmi = (meta or {}).get("pmi")
+    if pmi:
+        summary["pmi_counts"] = {k: len(v) for k, v in pmi.items()}
 
-    return {
+    result = {
         "note": ("Geometry (boundary representation) read from the CAD file. It is the exact "
                  "shape and all dimensions, not the build recipe — infer sketches/extrudes/"
                  "fillets from this if you need to rebuild it."),
         "summary": summary,
         "parts": part_reports,
     }
+    if pmi:  # semantic PMI / GD&T straight off the drawing (AP242)
+        result["pmi"] = pmi
+    return result

@@ -7,7 +7,7 @@ holes, fillets, and — for assemblies — part names, colors, and placement. Te
 import cadquery as cq
 import pytest
 
-from src.step_import import read_step, describe_shape
+from src.step_import import read_step, describe_shape, _read_header
 
 
 def _write(wp_or_asm, path):
@@ -127,3 +127,22 @@ def test_import_route_edits_and_inspects(tmp_path):
 def test_import_route_rejects_empty_body():
     resp = asyncio.run(_import(_FakeReq(b"")))
     assert resp.status_code == 400
+
+
+# --- PMI / header ------------------------------------------------------------
+def test_pmi_absent_is_graceful(tmp_path):
+    # A plain part carries no PMI; the reader must return empty without error.
+    p = _write(cq.Workplane("XY").box(10, 10, 10), tmp_path / "np.step")
+    obj, meta = read_step(p)
+    assert meta["pmi"] == {}
+    assert "pmi" not in describe_shape(obj, meta)
+
+
+def test_ap242_schema_detected(tmp_path):
+    # AP242's MIM part-number is 10303-442; it must not be misread as the AP.
+    f = tmp_path / "h.stp"
+    f.write_text(
+        "ISO-10303-21;\nHEADER;\nFILE_NAME('x','',(''),(''),'','','');\n"
+        "FILE_SCHEMA(('AP242_MANAGED_MODEL_BASED_3D_ENGINEERING_MIM_LF "
+        "{ 1 0 10303 442 1 1 4 }'));\nENDSEC;\n")
+    assert _read_header(str(f))["application_protocol"] == "AP242"
