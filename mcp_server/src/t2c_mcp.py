@@ -3072,8 +3072,12 @@ async def select_model(name: str, ctx: Context = None) -> str:
         return _error(str(e), traceback.format_exc())
 
 
+_DETAIL_BUDGET = {"summary": 0, "standard": 200, "full": 100000}
+
+
 @mcp.tool(name="inspect_model")
-async def inspect_model(name: Optional[str] = None, ctx: Context = None) -> str:
+async def inspect_model(name: Optional[str] = None, detail: str = "standard",
+                        ctx: Context = None) -> str:
     """
     Read the geometry of a stored model as structured data — a far richer, exact substitute
     for a 2D drawing.
@@ -3084,17 +3088,25 @@ async def inspect_model(name: Optional[str] = None, ctx: Context = None) -> str:
     sketch→extrude→fillet history, so infer any recipe you need from this geometry.
 
     Use this to understand a model you did NOT build — e.g. a STEP file the user uploaded —
-    BEFORE editing it. To edit it afterwards, chain operations with
-    workplane_api(start_from="<name>").
+    BEFORE editing it. To EDIT a specific face/edge, read its center coordinate here and pass
+    it to a coordinate selector (e.g. faces(cq.selectors.NearestToPointSelector((x,y,z)))) in
+    workplane_api(start_from="<name>") — that reliably targets one feature on a dumb solid.
 
-    name: stored model name; omit for the active model.
+    name:   stored model name; omit for the active model.
+    detail: how much geometry to return.
+            - "summary"  — bbox, primitives, hole/fillet counts, part list only (smallest).
+            - "standard" — also the full face/edge list for solids up to ~200 faces (default).
+            - "full"     — always emit every face and edge (use for large/complex parts when
+                           you need to reference a specific feature; larger output).
     """
     _bind(_sid_from_ctx(ctx))
+    budget = _DETAIL_BUDGET.get(detail, _DETAIL_BUDGET["standard"])
     try:
         obj = _get(name)
-        description = await anyio.to_thread.run_sync(describe_shape, obj)
+        description = await anyio.to_thread.run_sync(describe_shape, obj, None, budget)
         return json.dumps({"status": "success", "name": name or _sess().current,
-                           "obj_type": _obj_type(obj), "description": description})
+                           "obj_type": _obj_type(obj), "detail": detail,
+                           "description": description})
     except Exception as e:
         return _error(str(e), traceback.format_exc())
 
