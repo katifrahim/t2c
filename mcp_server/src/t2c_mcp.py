@@ -90,6 +90,12 @@ from cadquery.selectors import (
     StringSyntaxSelector,
 )
 
+# STEP file reader → structured description (works as a script and as the src package).
+try:
+    from src.step_import import read_step, describe_shape
+except ImportError:
+    from step_import import read_step, describe_shape
+
 # =============================================================================
 # EXTENSION PLUGINS  (gear generators + mechanical-part library)
 # =============================================================================
@@ -3059,6 +3065,33 @@ async def select_model(name: str, ctx: Context = None) -> str:
     except Exception as e:
         return _error(str(e), traceback.format_exc())
 
+
+@mcp.tool(name="inspect_model")
+async def inspect_model(name: Optional[str] = None, ctx: Context = None) -> str:
+    """
+    Read the geometry of a stored model as structured data — a far richer, exact substitute
+    for a 2D drawing.
+
+    Returns the SHAPE (boundary representation), not the build recipe: the exact dimensions,
+    surface/curve types, holes, fillets, bounding box, and — for assemblies — each part's
+    name, color, and placement. A STEP file (like most CAD exchange files) never stores the
+    sketch→extrude→fillet history, so infer any recipe you need from this geometry.
+
+    Use this to understand a model you did NOT build — e.g. a STEP file the user uploaded —
+    BEFORE editing it. To edit it afterwards, chain operations with
+    workplane_api(start_from="<name>").
+
+    name: stored model name; omit for the active model.
+    """
+    _bind(_sid_from_ctx(ctx))
+    try:
+        obj = _get(name)
+        description = await anyio.to_thread.run_sync(describe_shape, obj)
+        return json.dumps({"status": "success", "name": name or _sess().current,
+                           "obj_type": _obj_type(obj), "description": description})
+    except Exception as e:
+        return _error(str(e), traceback.format_exc())
+
 # =============================================================================
 # TOOL — extension_api
 # =============================================================================
@@ -3583,6 +3616,41 @@ async def _export(request):
         _log_err(str(e), traceback.format_exc())
         return JSONResponse({"error": _scrub(f"export failed: {e}")}, status_code=500)
     return FileResponse(path, filename=f"model.{ext}")
+
+
+@mcp.custom_route("/import", methods=["POST"])
+async def _import(request):
+    """Import an uploaded STEP file (AP203/214/242) as the ACTIVE model and return a
+    structured geometric description the LLM reads in place of a 2D drawing. The user can
+    then ask to edit it (workplane_api start_from=<name>). Token-gated. Raw STEP bytes in the
+    request body; ?session=<id>&name=<model-name>."""
+    from starlette.responses import JSONResponse
+    if not _authorized(request):
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+    _bind(request.query_params.get("session"))
+    body = await request.body()
+    if not body:
+        return JSONResponse({"error": "empty file"}, status_code=400)
+    import tempfile
+    path = os.path.join(tempfile.gettempdir(), "import.step")
+    with open(path, "wb") as fh:
+        fh.write(body)
+    try:
+        obj, meta = await anyio.to_thread.run_sync(read_step, path)
+    except Exception as e:
+        _log_err(str(e), traceback.format_exc())
+        return JSONResponse({"error": _scrub(f"could not read STEP file: {e}")},
+                            status_code=400)
+    name = request.query_params.get("name") or _auto_name("import")
+    _store(name, obj)
+    try:
+        description = await anyio.to_thread.run_sync(describe_shape, obj, meta)
+    except Exception as e:
+        _log_err(str(e), traceback.format_exc())
+        description = {"error": "description unavailable"}
+    await anyio.to_thread.run_sync(_show, obj)  # render it + load the measurement backend
+    return JSONResponse({"status": "ok", "name": name,
+                         "obj_type": _obj_type(obj), "description": description})
 
 
 @mcp.custom_route("/model", methods=["GET"])

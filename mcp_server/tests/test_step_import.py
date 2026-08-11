@@ -86,3 +86,44 @@ def test_face_budget_omits_detail(tmp_path):
     s = d["parts"][0]["solids"][0]
     assert "faces" not in s and "detail_omitted" in s
     assert s["primitive"] == "box"                    # summary still present
+
+
+# --- MCP integration: /import route + inspect_model tool ---------------------
+import asyncio
+import json
+
+from src.t2c_mcp import _import, inspect_model, workplane_api, _bind
+
+
+class _FakeReq:
+    """Minimal Starlette-request stand-in for the /import handler."""
+    def __init__(self, body: bytes):
+        self.headers = {}
+        self.query_params = {}          # no session -> local session (also used by the tools)
+        self._body = body
+
+    async def body(self):
+        return self._body
+
+
+def test_import_route_edits_and_inspects(tmp_path):
+    p = _write(cq.Workplane("XY").box(30, 20, 10), tmp_path / "up.step")
+    resp = asyncio.run(_import(_FakeReq(open(p, "rb").read())))
+    data = json.loads(resp.body)
+    assert data["status"] == "ok" and data["obj_type"] == "Workplane"
+    assert data["description"]["parts"][0]["solids"][0]["primitive"] == "box"
+
+    # Edit the imported model in place, then inspect the result.
+    name = data["name"]
+    r = json.loads(asyncio.run(workplane_api(
+        operations=[{"method": "edges", "args": ["|Z"]},
+                    {"method": "fillet", "args": [2]}],
+        start_from=name, store_as="edited")))
+    assert r["status"] == "success"
+    ins = json.loads(asyncio.run(inspect_model(name="edited")))
+    assert ins["description"]["summary"]["round_or_fillet_count"] == 1
+
+
+def test_import_route_rejects_empty_body():
+    resp = asyncio.run(_import(_FakeReq(b"")))
+    assert resp.status_code == 400
