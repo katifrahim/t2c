@@ -154,6 +154,23 @@ def test_pmi_absent_is_graceful(tmp_path):
     assert "pmi" not in describe_shape(obj, meta)
 
 
+import os
+
+FIXTURES = os.path.join(os.path.dirname(__file__), "fixtures")
+
+
+def test_real_world_onshape_ap242():
+    # A genuine third-party AP242 file (exported from Onshape, written by ST-Developer, not
+    # OCCT) — proves the parser handles real CAD, not just CadQuery-generated geometry.
+    obj, meta = read_step(os.path.join(FIXTURES, "onshape_ap242.step"))
+    d = describe_shape(obj, meta)
+    assert meta["header"]["application_protocol"] == "AP242"
+    s = d["parts"][0]["solids"][0]
+    assert "Cylinder" in s["face_types"] and "Plane" in s["face_types"]
+    assert d["summary"]["hole_count"] >= 1          # has through holes
+    assert meta["pmi"] == {}                          # this model carries no semantic PMI
+
+
 def test_ap242_schema_detected(tmp_path):
     # AP242's MIM part-number is 10303-442; it must not be misread as the AP.
     f = tmp_path / "h.stp"
