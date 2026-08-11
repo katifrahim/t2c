@@ -92,9 +92,15 @@ from cadquery.selectors import (
 
 # STEP file reader → structured description (works as a script and as the src package).
 try:
-    from src.step_import import read_step, describe_shape
+    from src.step_import import (
+        read_step, describe_shape, to_ap242, ensure_ap242_schema,
+        SUPPORTED_IMPORT_EXTS, looks_like_step,
+    )
 except ImportError:
-    from step_import import read_step, describe_shape
+    from step_import import (
+        read_step, describe_shape, to_ap242, ensure_ap242_schema,
+        SUPPORTED_IMPORT_EXTS, looks_like_step,
+    )
 
 # =============================================================================
 # EXTENSION PLUGINS  (gear generators + mechanical-part library)
@@ -3599,6 +3605,8 @@ async def _export(request):
         )
     import tempfile
     path = os.path.join(tempfile.gettempdir(), f"model.{ext}")
+    if export_type == "STEP":
+        ensure_ap242_schema()  # write STEP as AP242 (richest schema); falls back to default if unsupported
     try:
         if isinstance(obj, Assembly):
             if export_type == "STEP":
@@ -3618,12 +3626,26 @@ async def _export(request):
     return FileResponse(path, filename=f"model.{ext}")
 
 
+def _convert_and_read(body: bytes):
+    """Persist the upload, normalise it to AP242 (keep the original if that fails), then read
+    it. Returns (obj, meta, converted_bool). Runs in a worker thread (blocking OCCT work)."""
+    import tempfile
+    d = tempfile.gettempdir()
+    orig = os.path.join(d, "import_orig.step")
+    with open(orig, "wb") as fh:
+        fh.write(body)
+    ap242 = os.path.join(d, "import_ap242.step")
+    converted = to_ap242(orig, ap242)          # first thing: convert AP203/214/… → AP242
+    obj, meta = read_step(ap242 if converted else orig)
+    return obj, meta, converted
+
+
 @mcp.custom_route("/import", methods=["POST"])
 async def _import(request):
-    """Import an uploaded STEP file (AP203/214/242) as the ACTIVE model and return a
-    structured geometric description the LLM reads in place of a 2D drawing. The user can
-    then ask to edit it (workplane_api start_from=<name>). Token-gated. Raw STEP bytes in the
-    request body; ?session=<id>&name=<model-name>."""
+    """Import an uploaded STEP file as the ACTIVE model and return a structured geometric
+    description the LLM reads in place of a 2D drawing. Any AP203/AP214 file is first converted
+    to AP242. The user can then edit it (workplane_api start_from=<name>). Token-gated. Raw
+    STEP bytes in the request body; ?session=<id>&name=<model-name>&filename=<original-name>."""
     from starlette.responses import JSONResponse
     if not _authorized(request):
         return JSONResponse({"error": "unauthorized"}, status_code=401)
@@ -3631,12 +3653,16 @@ async def _import(request):
     body = await request.body()
     if not body:
         return JSONResponse({"error": "empty file"}, status_code=400)
-    import tempfile
-    path = os.path.join(tempfile.gettempdir(), "import.step")
-    with open(path, "wb") as fh:
-        fh.write(body)
+    # Reject unsupported formats up front (extension + content sniff) with a clear message.
+    fname = (request.query_params.get("filename") or "").lower()
+    ext_ok = fname.endswith(SUPPORTED_IMPORT_EXTS) if fname else True
+    if not ext_ok or not looks_like_step(body):
+        return JSONResponse(
+            {"error": "unsupported file format. Only STEP files (.step / .stp) can be "
+                      "imported.", "supported": list(SUPPORTED_IMPORT_EXTS)},
+            status_code=415)
     try:
-        obj, meta = await anyio.to_thread.run_sync(read_step, path)
+        obj, meta, converted = await anyio.to_thread.run_sync(_convert_and_read, body)
     except Exception as e:
         _log_err(str(e), traceback.format_exc())
         return JSONResponse({"error": _scrub(f"could not read STEP file: {e}")},
@@ -3649,8 +3675,8 @@ async def _import(request):
         _log_err(str(e), traceback.format_exc())
         description = {"error": "description unavailable"}
     await anyio.to_thread.run_sync(_show, obj)  # render it + load the measurement backend
-    return JSONResponse({"status": "ok", "name": name,
-                         "obj_type": _obj_type(obj), "description": description})
+    return JSONResponse({"status": "ok", "name": name, "obj_type": _obj_type(obj),
+                         "converted_to_ap242": converted, "description": description})
 
 
 @mcp.custom_route("/model", methods=["GET"])

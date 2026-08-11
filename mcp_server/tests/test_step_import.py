@@ -92,14 +92,14 @@ def test_face_budget_omits_detail(tmp_path):
 import asyncio
 import json
 
-from src.t2c_mcp import _import, inspect_model, workplane_api, _bind
+from src.t2c_mcp import _import, _export, inspect_model, workplane_api, _bind
 
 
 class _FakeReq:
-    """Minimal Starlette-request stand-in for the /import handler."""
-    def __init__(self, body: bytes):
+    """Minimal Starlette-request stand-in for the /import and /export handlers."""
+    def __init__(self, body: bytes = b"", query: dict | None = None):
         self.headers = {}
-        self.query_params = {}          # no session -> local session (also used by the tools)
+        self.query_params = query or {}   # no session -> local session (also used by the tools)
         self._body = body
 
     async def body(self):
@@ -111,6 +111,7 @@ def test_import_route_edits_and_inspects(tmp_path):
     resp = asyncio.run(_import(_FakeReq(open(p, "rb").read())))
     data = json.loads(resp.body)
     assert data["status"] == "ok" and data["obj_type"] == "Workplane"
+    assert data["converted_to_ap242"] is True    # AP214 upload normalised to AP242
     assert data["description"]["parts"][0]["solids"][0]["primitive"] == "box"
 
     # Edit the imported model in place, then inspect the result.
@@ -127,6 +128,21 @@ def test_import_route_edits_and_inspects(tmp_path):
 def test_import_route_rejects_empty_body():
     resp = asyncio.run(_import(_FakeReq(b"")))
     assert resp.status_code == 400
+
+
+def test_import_route_rejects_unsupported_format():
+    # A non-STEP payload (no ISO-10303-21 marker) must be refused with 415.
+    resp = asyncio.run(_import(_FakeReq(b"%PDF-1.7 not a step file")))
+    assert resp.status_code == 415
+    assert ".step" in json.loads(resp.body)["supported"][0]
+
+
+def test_export_step_is_ap242(tmp_path):
+    _bind("exp")
+    asyncio.run(workplane_api(operations=[{"method": "box", "args": [10, 10, 10]}],
+                              store_as="m"))
+    resp = asyncio.run(_export(_FakeReq(query={"fmt": "step"})))
+    assert "AP242_MANAGED" in open(resp.path).read()   # exported as AP242
 
 
 # --- PMI / header ------------------------------------------------------------

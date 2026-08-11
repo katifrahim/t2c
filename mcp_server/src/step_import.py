@@ -19,12 +19,15 @@ The description is deliberately tiered so large parts stay inside an LLM context
 
 from __future__ import annotations
 
+import os
 import re
 from collections import Counter, defaultdict
 
 import cadquery as cq
 
-from OCP.STEPCAFControl import STEPCAFControl_Reader
+from OCP.STEPCAFControl import STEPCAFControl_Reader, STEPCAFControl_Writer
+from OCP.STEPControl import STEPControl_Writer, STEPControl_StepModelType
+from OCP.Interface import Interface_Static
 from OCP.TDocStd import TDocStd_Document
 from OCP.XCAFApp import XCAFApp_Application
 from OCP.XCAFDoc import (
@@ -60,6 +63,17 @@ _CURVE = {getattr(GeomAbs_CurveType, f"GeomAbs_{n}"): n for n in (
 # Default: emit the full face/edge graph only when the solid has at most this many faces.
 # Bigger solids fall back to summary + detected features so the description stays legible.
 FACE_BUDGET = 200
+
+# The only import format the parser + viewer + AI edit-loop support today: STEP. STEP is the
+# neutral B-rep exchange format every CAD system writes; the reader normalises it to AP242.
+SUPPORTED_IMPORT_EXTS = (".step", ".stp")
+
+
+def looks_like_step(data: bytes) -> bool:
+    """A STEP file starts with the ISO-10303-21 marker. Sniff the content so a mislabelled or
+    wrong-format upload is rejected regardless of its extension."""
+    head = data[:512].lstrip()
+    return head.startswith(b"ISO-10303-21")
 
 
 # =============================================================================
@@ -130,7 +144,8 @@ def _read_header(path: str) -> dict:
         with open(path, "r", errors="ignore") as fh:
             txt = fh.read(4000)
         txt = txt.split("ENDSEC", 1)[0]
-        sch = re.search(r"FILE_SCHEMA\(\('([^']+)'", txt)
+        # FILE_SCHEMA may wrap across lines (AP242 does), so allow whitespace and span newlines.
+        sch = re.search(r"FILE_SCHEMA\s*\(\s*\(\s*'([^']+)'", txt, re.DOTALL)
         if sch:
             s = sch.group(1)
             head["schema"] = s
@@ -152,6 +167,39 @@ def _read_header(path: str) -> dict:
     except Exception:
         pass
     return head
+
+
+def ensure_ap242_schema() -> None:
+    """Latch the STEP writer to AP242 for the current process.
+
+    OCCT's `write.step.schema` static ignores a value set while it is still uninitialised, and
+    a fresh writer forces the AP214 default. Constructing one writer first initialises the
+    static; then SetIVal(5)=AP242DIS sticks for every writer that follows (including
+    CadQuery's own exporters). Cheap and idempotent — safe to call before each export."""
+    STEPControl_Writer()
+    Interface_Static.SetIVal_s("write.step.schema", 5)  # 5 = AP242DIS
+
+
+def to_ap242(src: str, dst: str) -> bool:
+    """Convert a STEP file to AP242, preserving assembly / names / colors / PMI via XCAF.
+    Returns True on success; on any failure the caller keeps the original file."""
+    try:
+        doc = TDocStd_Document(TCollection_ExtendedString("BinXCAF"))
+        XCAFApp_Application.GetApplication_s().InitDocument(doc)
+        reader = STEPCAFControl_Reader()
+        reader.SetColorMode(True)
+        reader.SetNameMode(True)
+        reader.SetLayerMode(True)
+        if not reader.ReadFile(src):
+            return False
+        reader.Transfer(doc)
+        ensure_ap242_schema()
+        writer = STEPCAFControl_Writer()
+        writer.Transfer(doc, STEPControl_StepModelType.STEPControl_AsIs)
+        writer.Write(dst)
+        return os.path.exists(dst) and os.path.getsize(dst) > 0
+    except Exception:
+        return False
 
 
 def _label_name(lab: TDF_Label):
