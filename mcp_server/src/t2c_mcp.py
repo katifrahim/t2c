@@ -3571,6 +3571,42 @@ async def _session_import(request):
     return JSONResponse({"status": "ok", "objects": n})
 
 
+@mcp.custom_route("/session/adopt", methods=["POST"])
+async def _session_adopt(request):
+    """Move a new chat's live CAD state from its temporary local session id to the persistent
+    chat id. A brand-new chat has no chat id yet, so a model imported/built before the first
+    message is stored under the local id; when the first message creates the chat row the
+    backend session id switches to the chat id, orphaning that model. This re-homes it. No-op
+    when there is nothing to move or the target already holds work (never clobbers). Token-
+    gated. ?from=<localId>&to=<chatId>."""
+    from starlette.responses import JSONResponse
+    if not _authorized(request):
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+    frm = request.query_params.get("from")
+    to = request.query_params.get("to")
+    if not frm or not to or frm == to:
+        return JSONResponse({"status": "noop"})
+    src = _get_session(frm)
+    if not src.state:
+        return JSONResponse({"status": "noop"})          # nothing built/imported locally
+    dst = _bind(to)                                       # binds contextvar for _show below
+    if dst.state:
+        return JSONResponse({"status": "target-occupied"})  # keep existing work intact
+    dst.state.update(src.state)
+    dst.counters.update(src.counters)
+    dst.auto_names.update(src.auto_names)
+    dst.current = src.current
+    dst.rev += 1
+    src.state.clear()                                     # release the throwaway local session
+    src.current = None
+    try:
+        if dst.current and dst.current in dst.state:
+            _show(dst.state[dst.current])                # re-tessellate so the viewer shows it
+    except Exception as e:
+        _log_err(str(e), traceback.format_exc())
+    return JSONResponse({"status": "ok", "objects": len(dst.state)})
+
+
 @mcp.custom_route("/export", methods=["GET"])
 async def _export(request):
     """Export the current stored object so the web backend can serve it as a

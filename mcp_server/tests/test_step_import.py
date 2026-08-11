@@ -92,7 +92,10 @@ def test_face_budget_omits_detail(tmp_path):
 import asyncio
 import json
 
-from src.t2c_mcp import _import, _export, inspect_model, workplane_api, _bind
+from src.t2c_mcp import (
+    _import, _export, _session_adopt, _get_session,
+    inspect_model, workplane_api, _bind,
+)
 
 
 class _FakeReq:
@@ -135,6 +138,27 @@ def test_import_route_rejects_unsupported_format():
     resp = asyncio.run(_import(_FakeReq(b"%PDF-1.7 not a step file")))
     assert resp.status_code == 415
     assert ".step" in json.loads(resp.body)["supported"][0]
+
+
+def test_import_then_adopt_moves_model_to_chat_id(tmp_path):
+    # Import into a temporary local session (a brand-new, unsaved chat)…
+    p = _write(cq.Workplane("XY").box(12, 8, 4), tmp_path / "a.step")
+    resp = asyncio.run(_import(_FakeReq(open(p, "rb").read(),
+                                        query={"session": "__LOCALID_x", "name": "m"})))
+    assert json.loads(resp.body)["status"] == "ok"
+    assert "m" in _get_session("__LOCALID_x").state
+
+    # …first message promotes the chat: the model must move to the persistent chat id,
+    # so the AI (whose tools run under the chat id) can still see and edit it.
+    ad = asyncio.run(_session_adopt(_FakeReq(query={"from": "__LOCALID_x", "to": "chat_1"})))
+    assert json.loads(ad.body)["status"] == "ok"
+    assert "m" in _get_session("chat_1").state
+    assert not _get_session("__LOCALID_x").state          # local session released
+    assert _get_session("chat_1").current == "m"
+
+    # Idempotent: re-adopting an emptied local session is a no-op.
+    ad2 = asyncio.run(_session_adopt(_FakeReq(query={"from": "__LOCALID_x", "to": "chat_1"})))
+    assert json.loads(ad2.body)["status"] == "noop"
 
 
 def test_export_step_is_ap242(tmp_path):

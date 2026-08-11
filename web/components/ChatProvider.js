@@ -85,12 +85,24 @@ function SessionSync() {
   const setSessionId = useSessionStore((s) => s.setSessionId);
   const restored = useRef(new Set());
   useEffect(() => {
+    // The id the backend has been using so far (what an import/build before the first
+    // message wrote to) — capture it BEFORE we switch to the new chat id.
+    const prev = useSessionStore.getState().sessionId;
     setSessionId(remoteId ?? localId);
-    // Opening a chat with a persistent id → restore its saved CAD objects into the
-    // backend session (once per id). The backend no-ops if they're already loaded.
     if (remoteId && !restored.current.has(remoteId)) {
       restored.current.add(remoteId);
-      fetch(`/api/session/load?session=${remoteId}`, { method: "POST" }).catch(() => {});
+      // First message just promoted this chat: move any CAD state built/imported under the
+      // local id onto the persistent chat id (so an imported model isn't orphaned), THEN
+      // restore any saved snapshot (reopened chats). The backend no-ops when nothing applies.
+      const adopt =
+        prev && prev !== remoteId
+          ? fetch(`/api/session/adopt?from=${encodeURIComponent(prev)}&to=${encodeURIComponent(remoteId)}`, {
+              method: "POST",
+            }).catch(() => {})
+          : Promise.resolve();
+      adopt.finally(() =>
+        fetch(`/api/session/load?session=${remoteId}`, { method: "POST" }).catch(() => {}),
+      );
     }
   }, [remoteId, localId, setSessionId]);
   return null;
