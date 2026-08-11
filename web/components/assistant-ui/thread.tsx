@@ -80,6 +80,7 @@ import {
 } from "react";
 import { useCreditStore } from "@/lib/credit-store";
 import { useSelectionStore } from "@/lib/selection-store";
+import { useImportStore } from "@/lib/import-store";
 
 export type ThreadGroupPart = MessagePrimitive.GroupedParts.GroupPart;
 
@@ -390,6 +391,57 @@ function useInjectSelection() {
   };
 }
 
+const IMPORT_BLOCK_HEADER = "Imported CAD model (use this structured geometry instead of a 2D drawing):";
+
+// Describe the just-imported model for the AI: where it lives (stored name), how to edit it,
+// and its exact geometry as JSON. This replaces a 2D drawing — far more detail, machine-legible.
+function buildImportBlock(p: {
+  name: string; filename: string; converted: boolean; description: unknown;
+}): string {
+  const meta =
+    `File "${p.filename}" was imported as the active model "${p.name}"` +
+    (p.converted ? " (normalised to STEP AP242). " : ". ") +
+    `Edit it with workplane_api(start_from="${p.name}"), or re-read it with inspect_model("${p.name}"). ` +
+    "The JSON below is the exact shape and all dimensions (boundary representation), not the build recipe.";
+  return [IMPORT_BLOCK_HEADER, meta, JSON.stringify(p.description)].join("\n");
+}
+
+// Prefix the next prompt with the imported model's description, then clear it (mirrors
+// useInjectSelection). The AI can still call inspect_model later for the full geometry.
+function useInjectImport() {
+  const aui = useAui();
+  return () => {
+    const { pending, clear } = useImportStore.getState();
+    if (!pending) return;
+    const text = aui.composer().getState().text;
+    const block = buildImportBlock(pending);
+    aui.composer().setText(text.trim() ? `${block}\n\n${text}` : block);
+    clear();
+  };
+}
+
+// Chip showing the model queued for the next prompt. Cleared via its own cross.
+const ImportedModelBar: FC = () => {
+  const pending = useImportStore((s) => s.pending);
+  const clear = useImportStore((s) => s.clear);
+  if (!pending) return null;
+  return (
+    <div className="flex flex-wrap items-center gap-1.5 px-1 pb-1">
+      <span className="bg-muted text-muted-foreground inline-flex items-center gap-1 rounded-full py-0.5 pl-2 pr-1 text-xs">
+        Imported: {pending.filename}
+        <button
+          type="button"
+          onClick={clear}
+          className="hover:text-foreground inline-flex cursor-pointer items-center rounded-full p-0.5"
+          aria-label="Remove imported model"
+        >
+          <XIcon className="size-3" />
+        </button>
+      </span>
+    </div>
+  );
+};
+
 // Basic chip bar: the features the user picked in the viewer. Numbered by
 // position (matches the injected block). Each chip is removed only via its own
 // cross (never by keyboard) so editing the prompt text can't drop a reference.
@@ -420,10 +472,12 @@ const SelectedFeaturesBar: FC = () => {
 };
 
 const Composer: FC = () => {
-  const inject = useInjectSelection();
+  const injectSelection = useInjectSelection();
+  const injectImport = useInjectImport();
+  const inject = () => { injectImport(); injectSelection(); };
   return (
     <ComposerPrimitive.Root onSubmit={inject} className="aui-composer-root relative flex w-full flex-col">
-      <ComposerPrimitive.AttachmentDropzone render={<div data-slot="aui_composer-shell" className="border-border/60 data-[dragging=true]:border-ring focus-within:border-border dark:border-muted-foreground/15 dark:focus-within:border-muted-foreground/30 flex w-full flex-col gap-2 rounded-(--composer-radius) border bg-(--composer-bg) p-(--composer-padding) shadow-[0_4px_16px_-8px_rgba(0,0,0,0.08),0_1px_2px_rgba(0,0,0,0.04)] transition-[border-color,box-shadow] focus-within:shadow-[0_6px_24px_-8px_rgba(0,0,0,0.12),0_1px_2px_rgba(0,0,0,0.05)] data-[dragging=true]:border-dashed data-[dragging=true]:bg-[color-mix(in_oklab,var(--color-accent)_50%,var(--color-background))] dark:shadow-none" />}><ComposerAttachments /><SelectedFeaturesBar /><ComposerInput /><ComposerAction /></ComposerPrimitive.AttachmentDropzone>
+      <ComposerPrimitive.AttachmentDropzone render={<div data-slot="aui_composer-shell" className="border-border/60 data-[dragging=true]:border-ring focus-within:border-border dark:border-muted-foreground/15 dark:focus-within:border-muted-foreground/30 flex w-full flex-col gap-2 rounded-(--composer-radius) border bg-(--composer-bg) p-(--composer-padding) shadow-[0_4px_16px_-8px_rgba(0,0,0,0.08),0_1px_2px_rgba(0,0,0,0.04)] transition-[border-color,box-shadow] focus-within:shadow-[0_6px_24px_-8px_rgba(0,0,0,0.12),0_1px_2px_rgba(0,0,0,0.05)] data-[dragging=true]:border-dashed data-[dragging=true]:bg-[color-mix(in_oklab,var(--color-accent)_50%,var(--color-background))] dark:shadow-none" />}><ComposerAttachments /><ImportedModelBar /><SelectedFeaturesBar /><ComposerInput /><ComposerAction /></ComposerPrimitive.AttachmentDropzone>
     </ComposerPrimitive.Root>
   );
 };
@@ -661,8 +715,10 @@ const SaveTemplateButton: FC = () => {
 
 const ComposerAction: FC = () => {
   // The Send button calls send() directly (it doesn't submit the form), so attach
-  // the picked-feature injection here too — this is the path mobile taps.
-  const inject = useInjectSelection();
+  // the picked-feature + imported-model injection here too — this is the path mobile taps.
+  const injectSelection = useInjectSelection();
+  const injectImport = useInjectImport();
+  const inject = () => { injectImport(); injectSelection(); };
   return (
     <div className="aui-composer-action-wrapper relative flex items-center justify-between">
       <div className="flex items-center gap-1.5">
