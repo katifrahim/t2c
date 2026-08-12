@@ -90,17 +90,20 @@ from cadquery.selectors import (
     StringSyntaxSelector,
 )
 
-# STEP file reader → structured description (works as a script and as the src package).
+# STEP file reader → structured description, and direct-edit ops (work as a script and as the
+# src package).
 try:
     from src.step_import import (
         read_step, describe_shape, to_ap242, ensure_ap242_schema,
         SUPPORTED_IMPORT_EXTS, looks_like_step,
     )
+    from src.direct_edit import apply_edits
 except ImportError:
     from step_import import (
         read_step, describe_shape, to_ap242, ensure_ap242_schema,
         SUPPORTED_IMPORT_EXTS, looks_like_step,
     )
+    from direct_edit import apply_edits
 
 # =============================================================================
 # EXTENSION PLUGINS  (gear generators + mechanical-part library)
@@ -3107,6 +3110,52 @@ async def inspect_model(name: Optional[str] = None, detail: str = "standard",
         return json.dumps({"status": "success", "name": name or _sess().current,
                            "obj_type": _obj_type(obj), "detail": detail,
                            "description": description})
+    except Exception as e:
+        return _error(str(e), traceback.format_exc())
+
+
+@mcp.tool(name="edit_model")
+async def edit_model(operations: List[dict], name: Optional[str] = None,
+                     store_as: Optional[str] = None, ctx: Context = None) -> str:
+    """
+    Directly edit a "dumb" solid — an imported STEP model, or any model with no build history —
+    in a parametric way, WITHOUT constructive-solid-geometry hacks. Use this instead of
+    building a separate shape and subtracting it.
+
+    First call inspect_model to get the geometry. Each face and edge has a point on it
+    ("point_on_face") and holes/fillets have an "axis_point"/center. You select a feature by
+    passing a point that lies ON it (a "near" point); the tool resolves it to the exact face or
+    edge. Prefer the point_on_face value for a face, and a point on the wall for a hole.
+
+    operations: a list applied in order. Each item is {"op": <name>, ...}:
+      • {"op":"resize_hole", "edge":{"near":[x,y,z]}, "diameter": D}
+          Change a hole's diameter (removes the old hole, heals, re-cuts at the new size).
+      • {"op":"remove_feature", "faces":[{"near":[x,y,z]}, ...]}
+          Delete features (holes, bosses, fillets, chamfers) and heal the gap.
+      • {"op":"push_pull_face", "face":{"near":[x,y,z]}, "distance": d}
+          Move a planar face along its normal: +d adds material, -d removes it.
+      • {"op":"offset_face", "face":{"near":[x,y,z]}, "distance": d}   (alias of push_pull_face)
+      • {"op":"shell", "faces":[{"near":[x,y,z]}], "thickness": t}
+          Hollow the solid, opening it at the given face(s).
+      • {"op":"draft_face", "face":{"near":[x,y,z]}, "angle_deg": a}
+          Taper a face by an angle (for moulded parts).
+
+    Returns a report with "valid" (is the result a sound solid?) and the volume before/after.
+    ALWAYS check "valid": if false, the edit did not apply cleanly — adjust and retry.
+
+    name:     stored model to edit; omit for the active model.
+    store_as: name to save the result under; omit to overwrite the edited model.
+    """
+    _bind(_sid_from_ctx(ctx))
+    try:
+        src_name = name or _sess().current
+        obj = _get(name)
+        result, report = await anyio.to_thread.run_sync(apply_edits, obj, operations)
+        out_name = store_as or src_name or _auto_name("edit")
+        _store(out_name, result)
+        await anyio.to_thread.run_sync(_show, result)
+        return json.dumps({"status": "success", "name": out_name,
+                           "obj_type": _obj_type(result), "report": report})
     except Exception as e:
         return _error(str(e), traceback.format_exc())
 
