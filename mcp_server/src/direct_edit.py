@@ -27,11 +27,12 @@ from OCP.BRepOffsetAPI import BRepOffsetAPI_MakeThickSolid, BRepOffsetAPI_DraftA
 from OCP.BRepPrimAPI import BRepPrimAPI_MakeCylinder
 from OCP.BRepBuilderAPI import BRepBuilderAPI_MakeVertex
 from OCP.BRepExtrema import BRepExtrema_DistShapeShape
+from OCP.BRepFilletAPI import BRepFilletAPI_MakeFillet
 from OCP.ShapeUpgrade import ShapeUpgrade_UnifySameDomain
-from OCP.TopExp import TopExp_Explorer
+from OCP.TopExp import TopExp_Explorer, TopExp
 from OCP.TopAbs import TopAbs_ShapeEnum
 from OCP.TopoDS import TopoDS
-from OCP.TopTools import TopTools_ListOfShape
+from OCP.TopTools import TopTools_ListOfShape, TopTools_IndexedMapOfShape
 from OCP.GProp import GProp_GProps
 from OCP.BRepGProp import BRepGProp
 from OCP.Bnd import Bnd_Box
@@ -201,6 +202,48 @@ def _bbox_range(shapes, axis_pt, axis_dir):
     return lo, hi
 
 
+def _face_edges(face):
+    m = TopTools_IndexedMapOfShape()
+    TopExp.MapShapes_s(face, TopAbs_ShapeEnum.TopAbs_EDGE, m)
+    return [TopoDS.Edge_s(m.FindKey(i)) for i in range(1, m.Extent() + 1)]
+
+
+def _shared_edges(fa, fb):
+    eb = _face_edges(fb)
+    return [e for e in _face_edges(fa) if any(e.IsSame(x) for x in eb)]
+
+
+def _adjacent_faces(shape, face):
+    """Faces that share an edge with `face`."""
+    te = _face_edges(face)
+    out = []
+    exp = TopExp_Explorer(shape, TopAbs_ShapeEnum.TopAbs_FACE)
+    while exp.More():
+        f = TopoDS.Face_s(exp.Current())
+        if not f.IsSame(face) and any(any(e.IsSame(x) for x in te) for e in _face_edges(f)):
+            out.append(f)
+        exp.Next()
+    return out
+
+
+def _adjacent_rounds(shape, face):
+    """Fillet/round faces (small cylinder/torus blends) touching `face`, each with its radius
+    and a point on the flat neighbour it blends to — so we can suppress them, move the face,
+    then re-blend the same edges (what a direct modeller does)."""
+    rounds = []
+    for f in _adjacent_faces(shape, face):
+        s = BRepAdaptor_Surface(f)
+        t = _SURF.get(s.GetType())
+        if t not in ("Cylinder", "Torus"):
+            continue
+        radius = s.Cylinder().Radius() if t == "Cylinder" else s.Torus().MinorRadius()
+        neigh = [g for g in _adjacent_faces(shape, f)
+                 if not g.IsSame(face) and _SURF.get(BRepAdaptor_Surface(g).GetType()) == "Plane"]
+        if neigh:
+            rounds.append({"face": f, "radius": round(radius, 6), "neighbor_pt": _center(neigh[0])})
+    return rounds
+
+
 def _heal(shape):
     """Merge co-planar/co-cylindrical faces split by an edit, so the result reads as one clean
     face (what a direct modeller shows after a move)."""
@@ -270,22 +313,58 @@ def resize_hole(shape, ref, diameter, scope="one"):
     return _solid_of(_heal(result)), note
 
 
-def push_pull_face(shape, ref, distance):
-    """Move a planar face along its normal by `distance` (add material when positive, remove
-    when negative) — the core direct-modelling gesture, via BRepFeat_MakePrism."""
-    face = resolve_face(shape, ref)
-    _p, n = _face_normal_mid(face)
-    if n is None:
-        raise ValueError("face has no well-defined normal")
+def _prism(shape, face, normal, distance):
     fuse = distance >= 0
-    d = gp_Dir(n.X(), n.Y(), n.Z())
-    if not fuse:
-        d = gp_Dir(-n.X(), -n.Y(), -n.Z())
+    d = gp_Dir(*normal) if fuse else gp_Dir(*[-x for x in normal])
     mk = BRepFeat_MakePrism(shape, face, face, d, 1 if fuse else 0, True)
     mk.Perform(abs(distance))
     if not mk.IsDone():
         raise ValueError("push/pull failed")
     return _solid_of(_heal(mk.Shape()))
+
+
+def push_pull_face(shape, ref, distance):
+    """Move a planar face along its normal by `distance` (add material when positive, remove
+    when negative) — the core direct-modelling gesture, via BRepFeat_MakePrism.
+
+    Fillets/rounds on the face's edges are dependent blends: if left alone they stay behind and
+    leave a torn edge. So we SUPPRESS them (defeature to sharp), move the face, then REPLAY the
+    same blends on the moved edges — the standard direct-modelling behaviour."""
+    face = resolve_face(shape, ref)
+    _p, n = _face_normal_mid(face)
+    if n is None:
+        raise ValueError("face has no well-defined normal")
+    normal = (n.X(), n.Y(), n.Z())
+    tc = _center(face)
+    rounds = _adjacent_rounds(shape, face)
+
+    if not rounds:
+        return _prism(shape, face, normal, distance)
+
+    # suppress the blends → sharp solid, then re-find the (unmoved) target face by its center
+    faces = TopTools_ListOfShape()
+    for b in rounds:
+        faces.Append(b["face"])
+    df = BRepAlgoAPI_Defeaturing()
+    df.SetShape(shape)
+    df.AddFacesToRemove(faces)
+    df.Build()
+    sharp = _solid_of(df.Shape())
+    moved = _prism(sharp, resolve_face(sharp, {"near": tc}), normal, distance)
+
+    # replay: re-blend the edges between the moved target face and each recorded neighbour
+    moved_tc = tuple(tc[i] + distance * normal[i] for i in range(3))
+    tgt = resolve_face(moved, {"near": moved_tc})
+    mf = BRepFilletAPI_MakeFillet(moved)
+    added = 0
+    for b in rounds:
+        neigh = resolve_face(moved, {"near": b["neighbor_pt"]})
+        for e in _shared_edges(tgt, neigh):
+            mf.Add(b["radius"], e)
+            added += 1
+    if added == 0:
+        return moved                       # nothing to re-blend (edges vanished) — keep the move
+    return _solid_of(mf.Shape())
 
 
 def shell_solid(shape, refs, thickness):

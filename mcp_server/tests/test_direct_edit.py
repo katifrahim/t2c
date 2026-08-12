@@ -55,6 +55,18 @@ def test_push_pull_face_adds_material():
     assert report["volume_after"] > report["volume_before"]   # top face moved out
 
 
+def test_push_pull_carries_edge_fillets():
+    # Rim-filleted box: pushing the top face up must carry the 4 rim fillets with it (suppress
+    # + replay), not leave them behind with torn edges.
+    box = cq.Workplane("XY").box(20, 20, 10).edges(">Z").fillet(2)
+    before = describe_shape(box)["parts"][0]["solids"][0]["face_types"]
+    r, report = apply_edits(box, [{"op": "push_pull_face", "face": {"near": [0, 0, 5]}, "distance": 5}])
+    after = describe_shape(r)["parts"][0]["solids"][0]["face_types"]
+    assert report["valid"]
+    assert after == before                      # same clean topology, just taller (no torn edges)
+    assert after.get("Cylinder") == 4           # the 4 fillets survived
+
+
 def test_shell_hollows_solid():
     box = cq.Workplane("XY").box(20, 20, 10)
     result, report = apply_edits(box, [{"op": "shell", "faces": [{"near": [0, 0, 5]}], "thickness": 2}])
