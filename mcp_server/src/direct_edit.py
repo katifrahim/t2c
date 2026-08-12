@@ -230,13 +230,13 @@ def remove_feature(shape, refs):
     return _solid_of(df.Shape())
 
 
-def resize_hole(shape, ref, diameter, scope="matching"):
-    """Change a hole's diameter, and — by default — every other hole of the same diameter with
-    it (a bolt pattern is one design decision, so the AI does not track the set by hand).
+def resize_hole(shape, ref, diameter, scope="one"):
+    """Change a hole's diameter. By default only the selected hole changes (scope="one").
+    Pass scope="matching" to also change every other hole of the same diameter (a bolt
+    pattern) in one call.
 
     Each hole is removed + healed, then re-cut on its own axis over its own depth at the new
-    size. scope="matching" edits the whole equal-diameter set; scope="one" edits only the
-    selected hole. Returns (new_shape, note)."""
+    size. Returns (new_shape, note)."""
     _sel, (sel_pt, sel_dir, r0) = _hole_faces(shape, ref)
     groups = _hole_groups(shape)
     if scope == "one":
@@ -317,7 +317,7 @@ def draft_face(shape, ref, angle_deg, neutral_point=None, pull=(0, 0, 1)):
 _OPS = {
     "remove_feature": lambda s, o: remove_feature(s, o["faces"]),
     "resize_hole":    lambda s, o: resize_hole(s, o.get("edge") or o.get("face"), o["diameter"],
-                                               o.get("scope", "matching")),
+                                               o.get("scope", "one")),
     "push_pull_face": lambda s, o: push_pull_face(s, o["face"], o["distance"]),
     "offset_face":    lambda s, o: push_pull_face(s, o["face"], o["distance"]),
     "shell":          lambda s, o: shell_solid(s, o["faces"], o["thickness"]),

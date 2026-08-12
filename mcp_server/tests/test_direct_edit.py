@@ -86,7 +86,7 @@ def test_resize_hole_propagates_across_bolt_pattern():
     wall = next(f for f in describe_shape(plate)["parts"][0]["solids"][0]["faces"]
                 if f["type"] == "Cylinder")
     r, report = apply_edits(plate, [{"op": "resize_hole", "edge": {"near": wall["point_on_face"]},
-                                     "diameter": 10}])
+                                     "diameter": 10, "scope": "matching"}])
     assert report["valid"]
     holes = describe_shape(r)["parts"][0]["solids"][0]["features"]["holes"]
     assert all(h["diameter"] == 10.0 for h in holes)      # all four followed
