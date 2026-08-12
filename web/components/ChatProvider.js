@@ -13,6 +13,7 @@ import { useSupabaseThreadListAdapter } from "@/lib/thread-list-adapter";
 import { useModelStore } from "@/lib/model-store";
 import { useCreditStore } from "@/lib/credit-store";
 import { useSessionStore } from "@/lib/session-store";
+import { useImportStore } from "@/lib/import-store";
 import { useThreadOrderStore } from "@/lib/thread-order-store";
 
 // Keep a stable transport reference while its config (model) changes underneath,
@@ -84,7 +85,14 @@ function SessionSync() {
   const localId = useAuiState((s) => s.threadListItem.id);
   const setSessionId = useSessionStore((s) => s.setSessionId);
   const restored = useRef(new Set());
+  const lastLocalId = useRef(localId);
   useEffect(() => {
+    // Switching to a different chat: drop any queued import chip — it belonged to the old chat,
+    // not this one (localId is stable within a chat; it only changes on a real switch).
+    if (localId !== lastLocalId.current) {
+      lastLocalId.current = localId;
+      useImportStore.getState().clear();
+    }
     // The id the backend has been using so far (what an import/build before the first
     // message wrote to) — capture it BEFORE we switch to the new chat id.
     const prev = useSessionStore.getState().sessionId;

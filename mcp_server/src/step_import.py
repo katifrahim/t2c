@@ -68,6 +68,12 @@ FACE_BUDGET = 200
 # neutral B-rep exchange format every CAD system writes; the reader normalises it to AP242.
 SUPPORTED_IMPORT_EXTS = (".step", ".stp")
 
+# Above this many parts, describe each part compactly (bbox + volume + face count only, no
+# per-face detail or feature detection) so a big assembly stays fast and fits an LLM context.
+PART_BUDGET = 40
+# And list at most this many parts (the largest) so the description can't balloon the prompt.
+PART_LIST_CAP = 80
+
 
 def looks_like_step(data: bytes) -> bool:
     """A STEP file starts with the ISO-10303-21 marker. Sniff the content so a mislabelled or
@@ -389,10 +395,16 @@ def read_step(path: str):
         obj = cq.Workplane(obj=cq.Shape.cast(parts[0]["shape"]))
     else:
         asm = cq.Assembly()
-        for idx, p in enumerate(parts):
+        used = set()                       # STEP files may repeat part names; cq.Assembly needs
+        for idx, p in enumerate(parts):    # unique names, so de-duplicate with a numeric suffix.
             nm = p["name"] or f"part_{idx + 1}"
+            unique, k = nm, 2
+            while unique in used:
+                unique = f"{nm}_{k}"
+                k += 1
+            used.add(unique)
             col = cq.Color(*p["color"]) if p["color"] else None
-            asm.add(cq.Shape.cast(p["shape"]), name=nm, color=col)
+            asm.add(cq.Shape.cast(p["shape"]), name=unique, color=col)
         obj = asm
     return obj, meta
 
@@ -611,6 +623,23 @@ def _solids(shape):
     return out
 
 
+def _face_count(shape) -> int:
+    exp = TopExp_Explorer(shape, TopAbs_ShapeEnum.TopAbs_FACE)
+    n = 0
+    while exp.More():
+        n += 1
+        exp.Next()
+    return n
+
+
+def _solid_summary(solid, sid: str) -> dict:
+    """Cheap per-solid summary (bbox + face count only, no volume/GProp) for parts in a large
+    assembly — GProp volume is ~18 ms/solid and would dominate a 1000-part import."""
+    bb = _bbox(solid)
+    center = [_r((bb["min"][i] + bb["max"][i]) / 2) for i in range(3)]
+    return {"id": sid, "bbox": bb, "center": center, "face_count": _face_count(solid)}
+
+
 def _parts_from_object(obj) -> list:
     """Parts (name/color/placement/shape) from a live CadQuery object when no STEP metadata
     is supplied — so describe_shape also works on AI-built models, including assemblies."""
@@ -646,6 +675,7 @@ def describe_shape(obj, meta: dict | None = None, budget: int = FACE_BUDGET) -> 
     """
     # Resolve the parts to describe: prefer STEP metadata (names/colors/placement).
     parts = (meta or {}).get("parts") or _parts_from_object(obj)
+    compact = len(parts) > PART_BUDGET     # big assembly → per-part summary only
 
     all_solids = []
     part_reports = []
@@ -656,7 +686,7 @@ def describe_shape(obj, meta: dict | None = None, budget: int = FACE_BUDGET) -> 
         for si, sol in enumerate(solids):
             sid = f"P{pi}" if len(parts) > 1 else "S"
             sid = f"{sid}/{si}" if len(solids) > 1 else sid
-            sreps.append(_solid_report(sol, sid, budget))
+            sreps.append(_solid_summary(sol, sid) if compact else _solid_report(sol, sid, budget))
             all_solids.append(sol)
         pr = {"name": p["name"] or f"part_{pi + 1}", "bbox": _bbox(shape),
               "solids": sreps}
@@ -664,9 +694,10 @@ def describe_shape(obj, meta: dict | None = None, budget: int = FACE_BUDGET) -> 
             pr["color_rgb"] = p["color"]
         if p["placement"]:
             pr["placement"] = p["placement"]
-        vol, ctr = _volume(shape)
-        pr["volume"] = vol
-        pr["center"] = ctr
+        if not compact:                    # GProp volume is the per-part bottleneck; skip it big
+            vol, ctr = _volume(shape)
+            pr["volume"] = vol
+            pr["center"] = ctr
         part_reports.append(pr)
 
     # whole-model bbox
@@ -693,12 +724,25 @@ def describe_shape(obj, meta: dict | None = None, budget: int = FACE_BUDGET) -> 
     }
     if prims:
         summary["primitives"] = prims
+    if compact:
+        summary["detail_level"] = (
+            f"compact: {len(part_reports)} parts exceed the {PART_BUDGET}-part budget, so each "
+            "part shows bbox + volume + face count only (no per-face detail or feature detection)")
     if meta and meta.get("header"):
         summary["source"] = meta["header"]
     summary["units"] = "mm"  # OCCT normalises STEP lengths to millimetres on read
     pmi = (meta or {}).get("pmi")
     if pmi:
         summary["pmi_counts"] = {k: len(v) for k, v in pmi.items()}
+
+    # In a big assembly, list only the largest parts so the description can't balloon the prompt.
+    if compact and len(part_reports) > PART_LIST_CAP:
+        part_reports.sort(key=lambda pr: -(pr["bbox"]["size"][0] * pr["bbox"]["size"][1]
+                                           * pr["bbox"]["size"][2]))
+        omitted = len(part_reports) - PART_LIST_CAP
+        part_reports = part_reports[:PART_LIST_CAP]
+        summary["parts_shown"] = (f"{PART_LIST_CAP} largest of {summary['part_count']} parts; "
+                                  f"{omitted} smaller parts omitted")
 
     result = {
         "note": ("Geometry (boundary representation) read from the CAD file. It is the exact "

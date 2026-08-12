@@ -323,25 +323,20 @@ def _prism(shape, face, normal, distance):
     return _solid_of(_heal(mk.Shape()))
 
 
-def push_pull_face(shape, ref, distance):
-    """Move a planar face along its normal by `distance` (add material when positive, remove
-    when negative) — the core direct-modelling gesture, via BRepFeat_MakePrism.
+# Above this many blends on a face, suppress+replay is slow and rarely the intent (the face is
+# just surrounded by rounds, not rimmed by them), so we skip straight to a plain extend.
+_MAX_SUPPRESS_ROUNDS = 12
 
-    Fillets/rounds on the face's edges are dependent blends: if left alone they stay behind and
-    leave a torn edge. So we SUPPRESS them (defeature to sharp), move the face, then REPLAY the
-    same blends on the moved edges — the standard direct-modelling behaviour."""
-    face = resolve_face(shape, ref)
-    _p, n = _face_normal_mid(face)
-    if n is None:
-        raise ValueError("face has no well-defined normal")
-    normal = (n.X(), n.Y(), n.Z())
-    tc = _center(face)
-    rounds = _adjacent_rounds(shape, face)
 
-    if not rounds:
-        return _prism(shape, face, normal, distance)
+def _valid(shape) -> bool:
+    try:
+        return bool(cq.Shape.cast(shape).isValid())
+    except Exception:
+        return False
 
-    # suppress the blends → sharp solid, then re-find the (unmoved) target face by its center
+
+def _suppress_move_replay(shape, tc, normal, distance, rounds):
+    """Defeature the edge blends, move the (now sharp) face, then re-blend the moved edges."""
     faces = TopTools_ListOfShape()
     for b in rounds:
         faces.Append(b["face"])
@@ -351,8 +346,6 @@ def push_pull_face(shape, ref, distance):
     df.Build()
     sharp = _solid_of(df.Shape())
     moved = _prism(sharp, resolve_face(sharp, {"near": tc}), normal, distance)
-
-    # replay: re-blend the edges between the moved target face and each recorded neighbour
     moved_tc = tuple(tc[i] + distance * normal[i] for i in range(3))
     tgt = resolve_face(moved, {"near": moved_tc})
     mf = BRepFilletAPI_MakeFillet(moved)
@@ -363,8 +356,42 @@ def push_pull_face(shape, ref, distance):
             mf.Add(b["radius"], e)
             added += 1
     if added == 0:
-        return moved                       # nothing to re-blend (edges vanished) — keep the move
+        return moved                       # edges vanished — keep the plain move
     return _solid_of(mf.Shape())
+
+
+def push_pull_face(shape, ref, distance):
+    """Move a planar face along its normal by `distance` (add material when positive, remove
+    when negative) — the core direct-modelling gesture, via BRepFeat_MakePrism.
+
+    Fillets on the face's edges are dependent blends. When a face is rimmed by a few of them we
+    SUPPRESS them, move the face, then REPLAY them on the moved edges (a clean result). If that
+    is not possible (complex face, many blends), we fall back to a plain extend so the face
+    still moves. Either way the result is validated; if even the plain extend is unsound we say
+    so, so the AI can pick another face or add material a different way."""
+    face = resolve_face(shape, ref)
+    _p, n = _face_normal_mid(face)
+    if n is None:
+        raise ValueError("face has no well-defined normal")
+    normal = (n.X(), n.Y(), n.Z())
+    tc = _center(face)
+    rounds = _adjacent_rounds(shape, face)
+
+    # Preferred: suppress + move + replay the blends (only for a modestly-rimmed face).
+    if rounds and len(rounds) <= _MAX_SUPPRESS_ROUNDS:
+        try:
+            result = _suppress_move_replay(shape, tc, normal, distance, rounds)
+            if _valid(result):
+                return result
+        except Exception:
+            pass                            # fall back to a plain extend below
+    # Fallback: extend the face directly (blends may not follow perfectly, but it moves).
+    result = _prism(shape, face, normal, distance)
+    if not _valid(result):
+        raise ValueError(
+            "this face cannot be cleanly extended (its edges/blends make the result unsound). "
+            "Try a smaller distance, a different face, or add material with a boolean instead.")
+    return result
 
 
 def shell_solid(shape, refs, thickness):
