@@ -78,6 +78,32 @@ def test_chained_edits():
     assert report["valid"]
 
 
+def test_resize_hole_propagates_across_bolt_pattern():
+    # Four Ø6 holes in a pattern: selecting one and resizing must move the whole set (the AI
+    # does not have to track the relationship).
+    plate = (cq.Workplane("XY").box(60, 60, 8)
+             .faces(">Z").workplane().rect(40, 40, forConstruction=True).vertices().hole(6))
+    wall = next(f for f in describe_shape(plate)["parts"][0]["solids"][0]["faces"]
+                if f["type"] == "Cylinder")
+    r, report = apply_edits(plate, [{"op": "resize_hole", "edge": {"near": wall["point_on_face"]},
+                                     "diameter": 10}])
+    assert report["valid"]
+    holes = describe_shape(r)["parts"][0]["solids"][0]["features"]["holes"]
+    assert all(h["diameter"] == 10.0 for h in holes)      # all four followed
+    assert any("4 holes" in n for n in report.get("notes", []))
+
+
+def test_resize_hole_scope_one_only_selected():
+    plate = (cq.Workplane("XY").box(60, 60, 8)
+             .faces(">Z").workplane().rect(40, 40, forConstruction=True).vertices().hole(6))
+    wall = next(f for f in describe_shape(plate)["parts"][0]["solids"][0]["faces"]
+                if f["type"] == "Cylinder")
+    r, report = apply_edits(plate, [{"op": "resize_hole", "edge": {"near": wall["point_on_face"]},
+                                     "diameter": 10, "scope": "one"}])
+    diameters = sorted(h["diameter"] for h in describe_shape(r)["parts"][0]["solids"][0]["features"]["holes"])
+    assert diameters == [6.0, 10.0]                        # only one changed
+
+
 def test_bad_op_reports_error():
     box = cq.Workplane("XY").box(10, 10, 10)
     try:

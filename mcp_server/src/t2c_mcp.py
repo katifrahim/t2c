@@ -3128,8 +3128,11 @@ async def edit_model(operations: List[dict], name: Optional[str] = None,
     edge. Prefer the point_on_face value for a face, and a point on the wall for a hole.
 
     operations: a list applied in order. Each item is {"op": <name>, ...}:
-      • {"op":"resize_hole", "edge":{"near":[x,y,z]}, "diameter": D}
-          Change a hole's diameter (removes the old hole, heals, re-cuts at the new size).
+      • {"op":"resize_hole", "edge":{"near":[x,y,z]}, "diameter": D, "scope":"matching"}
+          Change a hole's diameter. By default ("matching") EVERY hole of the same diameter
+          resizes with it — a bolt pattern is one decision, so you select one hole and the
+          whole set follows automatically (the report says how many changed). Use
+          "scope":"one" to change only the selected hole.
       • {"op":"remove_feature", "faces":[{"near":[x,y,z]}, ...]}
           Delete features (holes, bosses, fillets, chamfers) and heal the gap.
       • {"op":"push_pull_face", "face":{"near":[x,y,z]}, "distance": d}

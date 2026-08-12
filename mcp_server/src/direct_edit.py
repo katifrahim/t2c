@@ -39,9 +39,9 @@ from OCP.BRepBndLib import BRepBndLib
 from OCP.gp import gp_Pnt, gp_Vec, gp_Dir, gp_Ax1, gp_Ax2, gp_Ax3, gp_Pln
 
 try:
-    from src.step_import import _faces, _SURF, _face_normal_mid, _r
+    from src.step_import import _faces, _SURF, _face_normal_mid, _r, _cylinder_concave
 except ImportError:
-    from step_import import _faces, _SURF, _face_normal_mid, _r
+    from step_import import _faces, _SURF, _face_normal_mid, _r, _cylinder_concave
 
 
 # =============================================================================
@@ -145,10 +145,30 @@ def _hole_faces(shape, ref):
         cyl = [f for f in _faces(shape) if _cyl_axis(f)]
         if not cyl:
             raise ValueError("no cylindrical hole found near that point")
-        face = min(cyl, key=lambda f: _dist(_center(f), pt))
+        face = min(cyl, key=lambda f: _dist_to(f, pt))
         axis = _cyl_axis(face)
     group = [f for f in _faces(shape) if _cyl_axis(f) and _same_axis(_cyl_axis(f), axis)]
     return group, axis
+
+
+def _hole_groups(shape):
+    """Every hole in the solid as a coaxial group of concave cylinder faces:
+    [{faces, axis_pt, axis_dir, radius}]. A "hole set" (bolt pattern) is several groups that
+    share a radius — the design-intent relationship we propagate edits across."""
+    groups = []
+    for f in _faces(shape):
+        ax = _cyl_axis(f)
+        if ax is None:
+            continue
+        if _cylinder_concave(f, BRepAdaptor_Surface(f)) is False:
+            continue                                   # convex → boss/outer wall, not a hole
+        for g in groups:
+            if _same_axis((g["axis_pt"], g["axis_dir"], g["radius"]), ax):
+                g["faces"].append(f)
+                break
+        else:
+            groups.append({"faces": [f], "axis_pt": ax[0], "axis_dir": ax[1], "radius": ax[2]})
+    return groups
 
 
 # =============================================================================
@@ -210,26 +230,44 @@ def remove_feature(shape, refs):
     return _solid_of(df.Shape())
 
 
-def resize_hole(shape, ref, diameter):
-    """Change a hole's diameter: defeature the old hole (remove + heal), then re-cut a clean
-    cylindrical hole on the same axis, over the same depth, at the new size."""
-    group, (axis_pt, axis_dir, _r0) = _hole_faces(shape, ref)
-    lo, hi = _bbox_range(group, axis_pt, axis_dir)     # hole extent along its axis
-    faces = TopTools_ListOfShape()
-    for f in group:
-        faces.Append(f)
+def resize_hole(shape, ref, diameter, scope="matching"):
+    """Change a hole's diameter, and — by default — every other hole of the same diameter with
+    it (a bolt pattern is one design decision, so the AI does not track the set by hand).
+
+    Each hole is removed + healed, then re-cut on its own axis over its own depth at the new
+    size. scope="matching" edits the whole equal-diameter set; scope="one" edits only the
+    selected hole. Returns (new_shape, note)."""
+    _sel, (sel_pt, sel_dir, r0) = _hole_faces(shape, ref)
+    groups = _hole_groups(shape)
+    if scope == "one":
+        targets = [g for g in groups
+                   if _same_axis((g["axis_pt"], g["axis_dir"], g["radius"]), (sel_pt, sel_dir, r0))]
+    else:
+        targets = [g for g in groups if abs(g["radius"] - r0) < 1e-4]   # the whole set
+    if not targets:
+        raise ValueError("could not identify the hole to resize")
+    # Record each hole's axis + depth BEFORE removing it, then defeature them all at once.
+    recut, faces = [], TopTools_ListOfShape()
+    for g in targets:
+        lo, hi = _bbox_range(g["faces"], g["axis_pt"], g["axis_dir"])
+        recut.append((g["axis_pt"], g["axis_dir"], lo, hi))
+        for f in g["faces"]:
+            faces.Append(f)
     df = BRepAlgoAPI_Defeaturing()
     df.SetShape(shape)
     df.AddFacesToRemove(faces)
     df.Build()
-    healed = _solid_of(df.Shape())
-    # Re-cut: a cylinder spanning the old extent (+margin so faces meet cleanly).
-    m = 0.01 * (hi - lo + 1)
-    start = gp_Pnt(*[axis_pt[i] + (lo - m) * axis_dir[i] for i in range(3)])
-    ax2 = gp_Ax2(start, gp_Dir(*axis_dir))
-    cyl = BRepPrimAPI_MakeCylinder(ax2, diameter / 2.0, (hi - lo) + 2 * m).Shape()
-    cut = BRepAlgoAPI_Cut(healed, cyl).Shape()
-    return _solid_of(_heal(cut))
+    result = _solid_of(df.Shape())
+    for axis_pt, axis_dir, lo, hi in recut:            # re-cut each at the new diameter
+        m = 0.01 * (hi - lo + 1)
+        start = gp_Pnt(*[axis_pt[i] + (lo - m) * axis_dir[i] for i in range(3)])
+        cyl = BRepPrimAPI_MakeCylinder(gp_Ax2(start, gp_Dir(*axis_dir)),
+                                       diameter / 2.0, (hi - lo) + 2 * m).Shape()
+        result = BRepAlgoAPI_Cut(result, cyl).Shape()
+    n = len(targets)
+    note = (f"resized {n} holes of Ø{round(r0 * 2, 3)} together (matching set) to Ø{diameter}"
+            if n > 1 else f"resized 1 hole to Ø{diameter}")
+    return _solid_of(_heal(result)), note
 
 
 def push_pull_face(shape, ref, distance):
@@ -278,7 +316,8 @@ def draft_face(shape, ref, angle_deg, neutral_point=None, pull=(0, 0, 1)):
 
 _OPS = {
     "remove_feature": lambda s, o: remove_feature(s, o["faces"]),
-    "resize_hole":    lambda s, o: resize_hole(s, o.get("edge") or o.get("face"), o["diameter"]),
+    "resize_hole":    lambda s, o: resize_hole(s, o.get("edge") or o.get("face"), o["diameter"],
+                                               o.get("scope", "matching")),
     "push_pull_face": lambda s, o: push_pull_face(s, o["face"], o["distance"]),
     "offset_face":    lambda s, o: push_pull_face(s, o["face"], o["distance"]),
     "shell":          lambda s, o: shell_solid(s, o["faces"], o["thickness"]),
@@ -293,13 +332,17 @@ def apply_edits(cq_shape, operations):
     shape = cq_shape.val().wrapped if hasattr(cq_shape, "val") else (
         cq_shape.wrapped if hasattr(cq_shape, "wrapped") else cq_shape)
     v0 = _volume(shape)
+    notes = []
     for i, op in enumerate(operations):
         kind = op.get("op")
         if kind not in _OPS:
             raise ValueError(f"operation {i}: unknown op {kind!r}; "
                              f"choose from {sorted(_OPS)}")
         try:
-            shape = _OPS[kind](shape, op)
+            res = _OPS[kind](shape, op)
+            shape, note = res if isinstance(res, tuple) else (res, None)
+            if note:
+                notes.append(note)
         except Exception as e:
             raise ValueError(f"operation {i} ({kind}) failed: {e}") from e
     result = cq.Shape.cast(shape)
@@ -308,4 +351,6 @@ def apply_edits(cq_shape, operations):
         "volume_before": _r(v0, 1),
         "volume_after": _r(_volume(shape), 1),
     }
+    if notes:
+        report["notes"] = notes            # e.g. "resized 4 holes together (matching set)"
     return result, report
