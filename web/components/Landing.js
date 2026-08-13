@@ -13,9 +13,18 @@ const BLUEPRINT = {
 };
 
 const EXAMPLES = [
-  { title: "Twisted Hexagonal Vase", desc: "LLM: GPT OSS", img: "/examples/twisted-hexa-vase.jpeg" },
-  { title: "Deriaz Turbine Runner", desc: "LLM: DeepSeek V4 Flash", img: "/examples/deriaz-turbine-runner.jpeg" },
-  { title: "Full Francis Turbine Assembly", desc: "LLM: GLM 5.2", img: "/examples/francis-turbine.jpeg" },
+  { title: "Deriaz turbine runner", desc: "LLM: DeepSeek V4 Flash", img: "/examples/deriaz-turbine-runner.jpeg" },
+  { title: "Francis turbine assembly", desc: "LLM: GLM 5.2", img: "/examples/francis-turbine.png" },
+  { title: "Chain drive", desc: "LLM: DeepSeek V4 Flash", img: "/examples/chain-drive.png" },
+  { title: "Ball bearing", desc: "LLM: DeepSeek V4 Flash", img: "/examples/bearings.png" },
+  { title: "Planetary helical gear", desc: "LLM: DeepSeek V4 Flash", img: "/examples/planetary-gear.png" },
+  { title: "M3 bolt, nut & heatsert", desc: "LLM: DeepSeek V4 Flash", img: "/examples/fastner.png" },
+  { title: "Workbench", desc: "LLM: Xiaomi Mimo V2.5", img: "/examples/workbench.jpeg" },
+  { title: "Flower vase", desc: "LLM: GPT OSS", img: "/examples/twisted-hexa-vase.jpeg" },
+  { title: "Roller coaster toy", desc: "LLM: GLM 5.2", img: "/examples/roller-coaster.png" },
+  { title: "Texture totem", desc: "LLM: DeepSeek V4 Flash", img: "/examples/texture-totem.png" },
+  { title: "Materials", desc: "LLM: DeepSeek V4 Flash", img: "/examples/materials.png" },
+  { title: "Textures", desc: "LLM: DeepSeek V4 Flash", img: "/examples/textures.png" },
 ];
 
 // Own scroll container + select-text: the globally-loaded three-cad-viewer.css
@@ -63,7 +72,7 @@ export default function Landing() {
         <div className="mb-8 flex items-center gap-4">
           <div className="h-px flex-1 bg-foreground/20" />
           <h2 className="text-lg font-semibold tracking-tight whitespace-nowrap">
-            Built with Text2CAD AI
+            Built by our AI
           </h2>
           <div className="h-px flex-1 bg-foreground/20" />
         </div>
