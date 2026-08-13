@@ -49,6 +49,7 @@ from OCP.GProp import GProp_GProps
 from OCP.Bnd import Bnd_Box
 from OCP.BRepBndLib import BRepBndLib
 from OCP.BRepTools import BRepTools
+from OCP.TopLoc import TopLoc_Location
 from OCP.gp import gp_Pnt, gp_Vec
 
 # --- enum -> name maps -------------------------------------------------------
@@ -364,29 +365,35 @@ def read_step(path: str):
         parts.append({"name": name, "color": color,
                       "placement": placement, "shape": shape})
 
-    def walk(lab, placement):
+    def walk(lab, acc):
+        """Descend the XCAF tree, composing each component's location with the accumulated
+        parent transform `acc`, so every leaf is placed in world coordinates. A nested
+        assembly reuses one shared *definition* label for every instance (the 6 legs are the
+        same sub-assembly placed 6 times); reading the leaf's own location alone drops the
+        parent-instance transforms above it and collapses all the copies onto one spot."""
         if st.IsAssembly_s(lab):
             comps = TDF_LabelSequence()
             st.GetComponents_s(lab, comps)
             for i in range(1, comps.Length() + 1):
                 comp = comps.Value(i)
-                cloc = _loc_to_placement(st.GetLocation_s(comp))
+                world = acc.Multiplied(st.GetLocation_s(comp))  # parent ∘ instance
                 ref = TDF_Label()
                 if st.GetReferredShape_s(comp, ref):
                     name = _label_name(comp) or _label_name(ref)
                     color = _label_color(ct, comp) or _label_color(ct, ref)
                     # component may itself be a sub-assembly
                     if st.IsAssembly_s(ref):
-                        walk(ref, cloc or placement)
+                        walk(ref, world)
                     else:
-                        add_part(name, color, cloc,
-                                 st.GetShape_s(comp))  # located instance
+                        add_part(name, color, _loc_to_placement(world),
+                                 st.GetShape_s(ref).Moved(world))  # leaf placed in world
         else:
-            add_part(_label_name(lab), _label_color(ct, lab), placement,
-                     st.GetShape_s(lab))
+            shape = st.GetShape_s(lab)
+            add_part(_label_name(lab), _label_color(ct, lab), _loc_to_placement(acc),
+                     shape if acc.IsIdentity() else shape.Moved(acc))
 
     for i in range(1, free.Length() + 1):
-        walk(free.Value(i), None)
+        walk(free.Value(i), TopLoc_Location())
 
     meta = {"header": _read_header(path), "parts": parts, "pmi": _read_pmi(doc)}
 
