@@ -3780,11 +3780,26 @@ async def _import(request):
 
 @mcp.custom_route("/model", methods=["GET"])
 async def _model(request):
+    import gzip
     from starlette.responses import JSONResponse, Response
     sess = _get_session(request.query_params.get("session"))
-    if sess.viewer["payload"] is None:
+    payload = sess.viewer["payload"]
+    if payload is None:
         return JSONResponse({"error": "no model yet"}, status_code=404)
-    return Response(json.dumps(sess.viewer["payload"]), media_type="application/json")
+    # The tessellation payload is large (tens of MB for a big assembly) and the viewer
+    # re-fetches it on every version bump. Serialise + gzip ONCE per version and cache the
+    # bytes (a 1250-part model is ~21 MB JSON → ~5 MB gzip), cutting both transfer and the
+    # browser's parse time. Repeated fetches of the same version reuse the cache.
+    ver = sess.viewer["version"]
+    cache = sess.viewer.get("_gz")
+    if not cache or cache[0] != ver:
+        cache = (ver, gzip.compress(json.dumps(payload).encode(), 5))
+        sess.viewer["_gz"] = cache
+    gz = cache[1]
+    if "gzip" in request.headers.get("accept-encoding", "").lower():
+        return Response(gz, media_type="application/json",
+                        headers={"Content-Encoding": "gzip", "Vary": "Accept-Encoding"})
+    return Response(gzip.decompress(gz), media_type="application/json")
 
 
 @mcp.custom_route("/version", methods=["GET"])
