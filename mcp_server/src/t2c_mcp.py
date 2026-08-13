@@ -1261,6 +1261,37 @@ def _payload_is_empty(payload: Any) -> bool:
     return not (data.get("shapes", {}) or {}).get("parts")
 
 
+# Above this many rendered parts, drop edge geometry from the tessellation payload. The
+# viewer builds one line-object (its own draw call + geometry) per part for edges, so on a big
+# assembly they ~double the scene's object/draw-call count and memory for little value at that
+# zoom. This is a level-of-detail cut for large models only; smaller models keep their edges.
+VIEWER_EDGE_LOD_PARTS = 300
+
+
+def _count_parts(shapes: dict) -> int:
+    """Number of leaf parts in a three-cad-viewer shapes tree."""
+    n = 0
+    for p in (shapes.get("parts") or []):
+        n += _count_parts(p) if "parts" in p else 1
+    return n
+
+
+def _lod_strip_edges(payload: dict) -> None:
+    """For a big assembly, blank the edge buffers so the viewer skips ~one line-object per part
+    (a large cut to draw calls, build time and memory). The viewer only builds edges when
+    `edges.length > 0`, so emptying the buffer (0 bytes → 0-length array) makes it skip them.
+    Format-agnostic: each buffer keeps its own encoding, we only blank its data + shape."""
+    data = payload.get("data") or {}
+    if _count_parts(data.get("shapes") or {}) <= VIEWER_EDGE_LOD_PARTS:
+        return
+    def blank(buf):
+        return {**buf, "buffer": "", "shape": [0]} if isinstance(buf, dict) and "buffer" in buf else buf
+    for inst in (data.get("instances") or []):
+        for k in ("edges", "edge_types", "segments_per_edge"):
+            if k in inst:
+                inst[k] = blank(inst[k])
+
+
 def _show_tessellate(obj: Any) -> None:
     """http: tessellate obj into the three-cad-viewer payload and store it for
     /model. Replaces the ocp_vscode websocket push (which can't work over HTTPS)."""
@@ -1280,6 +1311,7 @@ def _show_tessellate(obj: Any) -> None:
         if _payload_is_empty(payload):
             return
         _inject_studio_materials(payload)  # resolve builtin/texture material tags → appearance entries
+        _lod_strip_edges(payload)          # big assembly: drop edges (draw-call/memory LOD)
         payload["config"]["reset_camera"] = "iso"  # frame the part on each render
         sess = _sess()
         sess.viewer["payload"] = payload
