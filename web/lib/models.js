@@ -8,7 +8,7 @@
 //     | select(.supported_parameters|index("tools"))
 //     | "\(.id)\t\((.architecture.input_modalities//[])|index("image")!=null)"'
 export const MODELS = [
-  { id: "deepseek/deepseek-v4-flash", label: "DeepSeek V4 Flash (Best)", context: 1000000 }, // Ctx window: 1m toks
+  { id: "deepseek/deepseek-v4-flash-0731", label: "DeepSeek V4 Flash (Best)", context: 1000000 }, // Ctx window: 1m toks
   { id: "z-ai/glm-5.2", label: "GLM 5.2 (Best)", context: 1000000 }, // Ctx window: 1m toks
   { id: "openai/gpt-oss-120b", label: "GPT OSS 120B (Good)", context: 131000 }, // Ctx window: 131k toks
   { id: "xiaomi/mimo-v2.5", label: "Xiaomi Mimo V2.5 (Vision)", context: 1000000, vision: true }, // Ctx window: 1m toks
@@ -26,7 +26,7 @@ export const DEFAULT_MODEL = MODELS[0].id;
 // Values match the live /api/v1/models endpoint; all four models are covered.
 export const MODEL_PRICING = {
   "openai/gpt-oss-120b": { input: 0.04e-6, output: 0.17e-6 },
-  "deepseek/deepseek-v4-flash": { input: 0.14e-6, output: 0.28e-6 },
+  "deepseek/deepseek-v4-flash-0731": { input: 0.14e-6, output: 0.28e-6 },
   "z-ai/glm-5.2": { input: 0.67e-6, output: 2.1e-6 },
   "xiaomi/mimo-v2.5": { input: 0.14e-6, output: 0.28e-6 },
   "openai/gpt-5.6-luna-pro": { input: 1e-6, output: 6e-6 },
