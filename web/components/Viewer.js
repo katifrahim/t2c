@@ -1,6 +1,6 @@
 "use client";
 import { useEffect, useRef, useState } from "react";
-import { LoaderIcon } from "lucide-react";
+import { LoaderIcon, MonitorOff } from "lucide-react";
 import { useSessionStore } from "@/lib/session-store";
 import { useSelectionStore } from "@/lib/selection-store";
 import { useViewerThemeStore } from "@/lib/viewer-theme-store";
@@ -109,6 +109,28 @@ function loadTCV() {
     s.onerror = () => reject(new Error("failed to load three-cad-viewer"));
     document.head.appendChild(s);
   });
+}
+
+// Probe whether the browser/GPU can actually give us a WebGL context. Some
+// machines refuse it (hardware acceleration off, GPU blocklisted/crashed, too
+// many live contexts) — three.js then throws deep inside viewer.render(), which
+// our poll loop swallows, leaving the viewer stuck on a spinner. We check up
+// front so we can show a real message instead. The probe context is released
+// immediately so it doesn't occupy one of the browser's limited context slots.
+function isWebGLAvailable() {
+  try {
+    if (typeof document === "undefined") return false;
+    const canvas = document.createElement("canvas");
+    const ctx =
+      canvas.getContext("webgl2") ||
+      canvas.getContext("webgl") ||
+      canvas.getContext("experimental-webgl");
+    if (!ctx) return false;
+    try { ctx.getExtension("WEBGL_lose_context")?.loseContext(); } catch {}
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 // Extra HDRIs added to the built-in Studio "Environment" picker (DEV-EDITABLE:
@@ -335,6 +357,9 @@ export default function Viewer() {
   // Blank white until the backend/MCP server delivers the first model; show a
   // loader in the viewer area until then.
   const [hasModel, setHasModel] = useState(false);
+  // Set when the browser/GPU can't start WebGL, so we show a message instead of
+  // an endless spinner. null = fine, "webgl" = context unavailable.
+  const [viewerError, setViewerError] = useState(null);
   // Light/dark background of the 3D scene (three-cad-viewer's own theme). The
   // toggle lives in the chat top bar; we read/apply it via a shared store.
   const theme = useViewerThemeStore((s) => s.theme);
@@ -504,6 +529,14 @@ export default function Viewer() {
       try { useSelectionStore.getState().clear(); } catch {}
       container.innerHTML = "";
 
+      // Bail before TCV mounts its toolbar/tree if this machine can't do WebGL —
+      // otherwise those controls linger behind a spinner that never resolves.
+      if (!isWebGLAvailable()) {
+        container.innerHTML = "";
+        setViewerError("webgl");
+        return;
+      }
+
       const config = payload.config || {};
       const w = container.clientWidth || 800;
       const h = container.clientHeight || 600;
@@ -516,24 +549,40 @@ export default function Viewer() {
       // Desktop keeps trackball (free-roll rotation preferred with a mouse).
       if (window.innerWidth < 768) viewerOptions.control = "orbit";
 
-      const display = new TCV.Display(container, displayOptions);
-      ref.current.display = display; // tracked so we can dispose it on the next swap
-      const viewer = new TCV.Viewer(display, displayOptions, notify, null);
-      // Mobile: keep the X/Y/Z orientation legend visible regardless of the Tools
-      // panel state. The library ties the marker to the panel — showToolsPanel(flag)
-      // hides it when collapsed — so wrap showToolsPanel to always restore the marker
-      // on phones. Covers every toggle path (initial collapse and user taps).
-      if (window.innerWidth < 768) {
-        const showToolsPanel = display.showToolsPanel.bind(display);
-        display.showToolsPanel = (flag) => {
-          showToolsPanel(flag);
-          try {
-            viewer.rendered?.orientationMarker?.setVisible(true);
-            viewer.update(true, false);
-          } catch { /* ignore */ }
-        };
+      // Display mounts DOM (toolbar/tree) and Viewer.render() creates the WebGL
+      // renderer — the step that throws when the probe passed but the GPU still
+      // can't hand out a context (e.g. context limit). Catch it, tear the partial
+      // DOM back down, and surface the message instead of a dead spinner.
+      let display, viewer;
+      try {
+        display = new TCV.Display(container, displayOptions);
+        ref.current.display = display; // tracked so we can dispose it on the next swap
+        viewer = new TCV.Viewer(display, displayOptions, notify, null);
+        // Mobile: keep the X/Y/Z orientation legend visible regardless of the Tools
+        // panel state. The library ties the marker to the panel — showToolsPanel(flag)
+        // hides it when collapsed — so wrap showToolsPanel to always restore the marker
+        // on phones. Covers every toggle path (initial collapse and user taps).
+        if (window.innerWidth < 768) {
+          const showToolsPanel = display.showToolsPanel.bind(display);
+          display.showToolsPanel = (flag) => {
+            showToolsPanel(flag);
+            try {
+              viewer.rendered?.orientationMarker?.setVisible(true);
+              viewer.update(true, false);
+            } catch { /* ignore */ }
+          };
+        }
+        viewer.render(payload.data, renderOptions, viewerOptions);
+      } catch (e) {
+        console.error("3D viewer: WebGL init/render failed", e);
+        try { viewer?.dispose(); } catch {}
+        try { display?.dispose(); } catch {}
+        ref.current.viewer = null;
+        ref.current.display = null;
+        container.innerHTML = "";
+        setViewerError("webgl");
+        return;
       }
-      viewer.render(payload.data, renderOptions, viewerOptions);
       viewer.glassMode(displayOptions.glass);
       viewer.showTools(displayOptions.tools);
       // Add our extra HDRIs + turntable toggle into the viewer's own Studio panel.
@@ -544,6 +593,7 @@ export default function Viewer() {
         try { viewer.setView(rc); } catch {}
       }
       ref.current.viewer = viewer;
+      setViewerError(null); // a successful render clears any prior WebGL error
       setHasModel(true);
 
       // "Select" tool → prompt reference. The built-in notify only emits lossy
@@ -709,6 +759,17 @@ export default function Viewer() {
       } catch { /* backend not reachable yet */ }
     }
 
+    // A GPU-process crash mid-session fires webglcontextlost on the canvas and
+    // freezes the scene; surface the same message so it isn't a silent freeze.
+    // The event doesn't bubble, so listen in the capture phase on the container.
+    function handleContextLost(e) {
+      e.preventDefault();
+      console.error("3D viewer: WebGL context lost");
+      setViewerError("webgl");
+    }
+    const containerEl = containerRef.current;
+    containerEl?.addEventListener("webglcontextlost", handleContextLost, true);
+
     (async () => {
       try { ref.current.TCV = await loadTCV(); }
       catch (e) { console.error(e); return; }
@@ -763,6 +824,7 @@ export default function Viewer() {
       if (rafId) cancelAnimationFrame(rafId);
       if (ref.current.rotRaf) cancelAnimationFrame(ref.current.rotRaf); // stop the rotation loop
       ro.disconnect();
+      containerEl?.removeEventListener("webglcontextlost", handleContextLost, true);
       if (ref.current.viewer) { try { ref.current.viewer.dispose(); } catch {} }
       if (ref.current.display) { try { ref.current.display.dispose(); } catch {} }
     };
@@ -780,7 +842,7 @@ export default function Viewer() {
         }}
       />
 
-      {!hasModel && (
+      {!hasModel && !viewerError && (
         <div
           style={{
             position: "absolute", inset: 0, display: "flex",
@@ -788,6 +850,20 @@ export default function Viewer() {
           }}
         >
           <LoaderIcon className="animate-spin text-muted-foreground" size={28} />
+        </div>
+      )}
+
+      {viewerError && (
+        <div
+          className="absolute inset-0 flex flex-col items-center justify-center gap-3 bg-background px-6 text-center"
+        >
+          <MonitorOff className="text-muted-foreground" size={32} strokeWidth={1.5} />
+          <div className="text-base font-medium text-foreground">3D Viewer Failed</div>
+          <p className="max-w-xs text-xs leading-relaxed text-muted-foreground">
+            Your browser or device couldn&apos;t start WebGL.
+            <br />
+            Try turning on hardware acceleration, updating your browser, or opening this in another browser.
+          </p>
         </div>
       )}
     </div>
