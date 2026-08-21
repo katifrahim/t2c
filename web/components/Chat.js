@@ -9,7 +9,7 @@ import {
   useThreadListItem,
   useThreadListItemRuntime,
 } from "@assistant-ui/react";
-import { MenuIcon, PlusIcon, DownloadIcon, UploadIcon, LoaderIcon, LogOutIcon, Trash2Icon, PencilIcon, GripVerticalIcon, MoonIcon, SunIcon, LibraryIcon } from "lucide-react";
+import { MenuIcon, PlusIcon, DownloadIcon, UploadIcon, LoaderIcon, LogOutIcon, Trash2Icon, PencilIcon, GripVerticalIcon, MoonIcon, SunIcon, LibraryIcon, CheckIcon, XIcon } from "lucide-react";
 import {
   DndContext,
   PointerSensor,
@@ -136,6 +136,15 @@ function TopBar({ onToggleHistory, historyOpen, onToggleLibrary, libraryOpen }) 
   const importInputRef = useRef(null);
   const [importing, setImporting] = useState(false);
   const [importError, setImportError] = useState("");
+  // Transient success/failure feedback on the import icon (green tick / red X),
+  // mirroring the template-save button. Settles back to the upload icon after a beat.
+  const [importStatus, setImportStatus] = useState("idle"); // "idle" | "ok" | "error"
+
+  useEffect(() => {
+    if (importStatus === "idle") return;
+    const t = setTimeout(() => { setImportStatus("idle"); setImportError(""); }, 2500);
+    return () => clearTimeout(t);
+  }, [importStatus]);
 
   async function onImportFile(e) {
     const file = e.target.files?.[0];
@@ -143,9 +152,11 @@ function TopBar({ onToggleHistory, historyOpen, onToggleLibrary, libraryOpen }) 
     if (!file) return;
     if (!/\.(step|stp)$/i.test(file.name)) {
       setImportError("Only STEP files (.step / .stp) can be imported.");
+      setImportStatus("error");
       return;
     }
     setImportError("");
+    setImportStatus("idle");
     setImporting(true);
     try {
       const qs = new URLSearchParams({ session: sessionId, filename: file.name });
@@ -161,9 +172,10 @@ function TopBar({ onToggleHistory, historyOpen, onToggleLibrary, libraryOpen }) 
         description: data.description,
       });
       track(EVENTS.MODEL_IMPORTED, { converted: !!data.converted_to_ap242 });
+      setImportStatus("ok");
     } catch (err) {
       setImportError(String(err.message || err));
-      setTimeout(() => setImportError(""), 5000);
+      setImportStatus("error");
     } finally {
       setImporting(false);
     }
@@ -263,12 +275,20 @@ function TopBar({ onToggleHistory, historyOpen, onToggleLibrary, libraryOpen }) 
         style={{ display: "none" }}
       />
       <TopBarButton
-        tooltip={importError || (importing ? "Importing…" : "Import STEP file")}
+        tooltip={
+          importError ||
+          (importing ? "Importing…"
+            : importStatus === "ok" ? "Model imported"
+            : "Import STEP file")
+        }
         onClick={() => !importing && importInputRef.current?.click()}
         active={importing}
-        danger={!!importError}
+        danger={importStatus === "error"}
       >
-        {importing ? <LoaderIcon size={16} className="animate-spin" /> : <UploadIcon size={16} />}
+        {importing ? <LoaderIcon size={16} className="animate-spin" />
+          : importStatus === "ok" ? <CheckIcon size={16} color="#16a34a" />
+          : importStatus === "error" ? <XIcon size={16} color="#dc2626" />
+          : <UploadIcon size={16} />}
       </TopBarButton>
 
       <div style={{ position: "relative" }}>
