@@ -90,6 +90,21 @@ from cadquery.selectors import (
     StringSyntaxSelector,
 )
 
+# STEP file reader → structured description, and direct-edit ops (work as a script and as the
+# src package).
+try:
+    from src.step_import import (
+        read_step, describe_shape, to_ap242, ensure_ap242_schema,
+        SUPPORTED_IMPORT_EXTS, looks_like_step,
+    )
+    from src.direct_edit import apply_edits
+except ImportError:
+    from step_import import (
+        read_step, describe_shape, to_ap242, ensure_ap242_schema,
+        SUPPORTED_IMPORT_EXTS, looks_like_step,
+    )
+    from direct_edit import apply_edits
+
 # =============================================================================
 # EXTENSION PLUGINS  (gear generators + mechanical-part library)
 # =============================================================================
@@ -1246,6 +1261,37 @@ def _payload_is_empty(payload: Any) -> bool:
     return not (data.get("shapes", {}) or {}).get("parts")
 
 
+# Above this many rendered parts, drop edge geometry from the tessellation payload. The
+# viewer builds one line-object (its own draw call + geometry) per part for edges, so on a big
+# assembly they ~double the scene's object/draw-call count and memory for little value at that
+# zoom. This is a level-of-detail cut for large models only; smaller models keep their edges.
+VIEWER_EDGE_LOD_PARTS = 300
+
+
+def _count_parts(shapes: dict) -> int:
+    """Number of leaf parts in a three-cad-viewer shapes tree."""
+    n = 0
+    for p in (shapes.get("parts") or []):
+        n += _count_parts(p) if "parts" in p else 1
+    return n
+
+
+def _lod_strip_edges(payload: dict) -> None:
+    """For a big assembly, blank the edge buffers so the viewer skips ~one line-object per part
+    (a large cut to draw calls, build time and memory). The viewer only builds edges when
+    `edges.length > 0`, so emptying the buffer (0 bytes → 0-length array) makes it skip them.
+    Format-agnostic: each buffer keeps its own encoding, we only blank its data + shape."""
+    data = payload.get("data") or {}
+    if _count_parts(data.get("shapes") or {}) <= VIEWER_EDGE_LOD_PARTS:
+        return
+    def blank(buf):
+        return {**buf, "buffer": "", "shape": [0]} if isinstance(buf, dict) and "buffer" in buf else buf
+    for inst in (data.get("instances") or []):
+        for k in ("edges", "edge_types", "segments_per_edge"):
+            if k in inst:
+                inst[k] = blank(inst[k])
+
+
 def _show_tessellate(obj: Any) -> None:
     """http: tessellate obj into the three-cad-viewer payload and store it for
     /model. Replaces the ocp_vscode websocket push (which can't work over HTTPS)."""
@@ -1265,6 +1311,7 @@ def _show_tessellate(obj: Any) -> None:
         if _payload_is_empty(payload):
             return
         _inject_studio_materials(payload)  # resolve builtin/texture material tags → appearance entries
+        _lod_strip_edges(payload)          # big assembly: drop edges (draw-call/memory LOD)
         payload["config"]["reset_camera"] = "iso"  # frame the part on each render
         sess = _sess()
         sess.viewer["payload"] = payload
@@ -3059,6 +3106,93 @@ async def select_model(name: str, ctx: Context = None) -> str:
     except Exception as e:
         return _error(str(e), traceback.format_exc())
 
+
+_DETAIL_BUDGET = {"summary": 0, "standard": 200, "full": 100000}
+
+
+@mcp.tool(name="inspect_model")
+async def inspect_model(name: Optional[str] = None, detail: str = "standard",
+                        ctx: Context = None) -> str:
+    """
+    Read the geometry of a stored model as structured data — a far richer, exact substitute
+    for a 2D drawing.
+
+    Returns the SHAPE (boundary representation), not the build recipe: the exact dimensions,
+    surface/curve types, holes, fillets, bounding box, and — for assemblies — each part's
+    name, color, and placement. A STEP file (like most CAD exchange files) never stores the
+    sketch→extrude→fillet history, so infer any recipe you need from this geometry.
+
+    Use this to understand a model you did NOT build — e.g. a STEP file the user uploaded —
+    BEFORE editing it. To EDIT a specific face/edge, read its center coordinate here and pass
+    it to a coordinate selector (e.g. faces(cq.selectors.NearestToPointSelector((x,y,z)))) in
+    workplane_api(start_from="<name>") — that reliably targets one feature on a dumb solid.
+
+    name:   stored model name; omit for the active model.
+    detail: how much geometry to return.
+            - "summary"  — bbox, primitives, hole/fillet counts, part list only (smallest).
+            - "standard" — also the full face/edge list for solids up to ~200 faces (default).
+            - "full"     — always emit every face and edge (use for large/complex parts when
+                           you need to reference a specific feature; larger output).
+    """
+    _bind(_sid_from_ctx(ctx))
+    budget = _DETAIL_BUDGET.get(detail, _DETAIL_BUDGET["standard"])
+    try:
+        obj = _get(name)
+        description = await anyio.to_thread.run_sync(describe_shape, obj, None, budget)
+        return json.dumps({"status": "success", "name": name or _sess().current,
+                           "obj_type": _obj_type(obj), "detail": detail,
+                           "description": description})
+    except Exception as e:
+        return _error(str(e), traceback.format_exc())
+
+
+@mcp.tool(name="edit_model")
+async def edit_model(operations: List[dict], name: Optional[str] = None,
+                     store_as: Optional[str] = None, ctx: Context = None) -> str:
+    """
+    Directly edit a "dumb" solid — an imported STEP model, or any model with no build history —
+    in a parametric way, WITHOUT constructive-solid-geometry hacks. Use this instead of
+    building a separate shape and subtracting it.
+
+    First call inspect_model to get the geometry. Each face and edge has a point on it
+    ("point_on_face") and holes/fillets have an "axis_point"/center. You select a feature by
+    passing a point that lies ON it (a "near" point); the tool resolves it to the exact face or
+    edge. Prefer the point_on_face value for a face, and a point on the wall for a hole.
+
+    operations: a list applied in order. Each item is {"op": <name>, ...}:
+      • {"op":"resize_hole", "edge":{"near":[x,y,z]}, "diameter": D}
+          Change the selected hole's diameter (removes the old hole, heals, re-cuts at the new
+          size). Add "scope":"matching" to also resize every other hole of the same diameter
+          (a bolt pattern) in the same call.
+      • {"op":"remove_feature", "faces":[{"near":[x,y,z]}, ...]}
+          Delete features (holes, bosses, fillets, chamfers) and heal the gap.
+      • {"op":"push_pull_face", "face":{"near":[x,y,z]}, "distance": d}
+          Move a planar face along its normal: +d adds material, -d removes it.
+      • {"op":"offset_face", "face":{"near":[x,y,z]}, "distance": d}   (alias of push_pull_face)
+      • {"op":"shell", "faces":[{"near":[x,y,z]}], "thickness": t}
+          Hollow the solid, opening it at the given face(s).
+      • {"op":"draft_face", "face":{"near":[x,y,z]}, "angle_deg": a}
+          Taper a face by an angle (for moulded parts).
+
+    Returns a report with "valid" (is the result a sound solid?) and the volume before/after.
+    ALWAYS check "valid": if false, the edit did not apply cleanly — adjust and retry.
+
+    name:     stored model to edit; omit for the active model.
+    store_as: name to save the result under; omit to overwrite the edited model.
+    """
+    _bind(_sid_from_ctx(ctx))
+    try:
+        src_name = name or _sess().current
+        obj = _get(name)
+        result, report = await anyio.to_thread.run_sync(apply_edits, obj, operations)
+        out_name = store_as or src_name or _auto_name("edit")
+        _store(out_name, result)
+        await anyio.to_thread.run_sync(_show, result)
+        return json.dumps({"status": "success", "name": out_name,
+                           "obj_type": _obj_type(result), "report": report})
+    except Exception as e:
+        return _error(str(e), traceback.format_exc())
+
 # =============================================================================
 # TOOL — extension_api
 # =============================================================================
@@ -3532,6 +3666,42 @@ async def _session_import(request):
     return JSONResponse({"status": "ok", "objects": n})
 
 
+@mcp.custom_route("/session/adopt", methods=["POST"])
+async def _session_adopt(request):
+    """Move a new chat's live CAD state from its temporary local session id to the persistent
+    chat id. A brand-new chat has no chat id yet, so a model imported/built before the first
+    message is stored under the local id; when the first message creates the chat row the
+    backend session id switches to the chat id, orphaning that model. This re-homes it. No-op
+    when there is nothing to move or the target already holds work (never clobbers). Token-
+    gated. ?from=<localId>&to=<chatId>."""
+    from starlette.responses import JSONResponse
+    if not _authorized(request):
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+    frm = request.query_params.get("from")
+    to = request.query_params.get("to")
+    if not frm or not to or frm == to:
+        return JSONResponse({"status": "noop"})
+    src = _get_session(frm)
+    if not src.state:
+        return JSONResponse({"status": "noop"})          # nothing built/imported locally
+    dst = _bind(to)                                       # binds contextvar for _show below
+    if dst.state:
+        return JSONResponse({"status": "target-occupied"})  # keep existing work intact
+    dst.state.update(src.state)
+    dst.counters.update(src.counters)
+    dst.auto_names.update(src.auto_names)
+    dst.current = src.current
+    dst.rev += 1
+    src.state.clear()                                     # release the throwaway local session
+    src.current = None
+    try:
+        if dst.current and dst.current in dst.state:
+            _show(dst.state[dst.current])                # re-tessellate so the viewer shows it
+    except Exception as e:
+        _log_err(str(e), traceback.format_exc())
+    return JSONResponse({"status": "ok", "objects": len(dst.state)})
+
+
 @mcp.custom_route("/export", methods=["GET"])
 async def _export(request):
     """Export the current stored object so the web backend can serve it as a
@@ -3566,6 +3736,8 @@ async def _export(request):
         )
     import tempfile
     path = os.path.join(tempfile.gettempdir(), f"model.{ext}")
+    if export_type == "STEP":
+        ensure_ap242_schema()  # write STEP as AP242 (richest schema); falls back to default if unsupported
     try:
         if isinstance(obj, Assembly):
             if export_type == "STEP":
@@ -3585,13 +3757,81 @@ async def _export(request):
     return FileResponse(path, filename=f"model.{ext}")
 
 
+def _convert_and_read(body: bytes):
+    """Persist the upload, normalise it to AP242 (keep the original if that fails), then read
+    it. Returns (obj, meta, converted_bool). Runs in a worker thread (blocking OCCT work)."""
+    import tempfile
+    d = tempfile.gettempdir()
+    orig = os.path.join(d, "import_orig.step")
+    with open(orig, "wb") as fh:
+        fh.write(body)
+    ap242 = os.path.join(d, "import_ap242.step")
+    converted = to_ap242(orig, ap242)          # first thing: convert AP203/214/… → AP242
+    obj, meta = read_step(ap242 if converted else orig)
+    return obj, meta, converted
+
+
+@mcp.custom_route("/import", methods=["POST"])
+async def _import(request):
+    """Import an uploaded STEP file as the ACTIVE model and return a structured geometric
+    description the LLM reads in place of a 2D drawing. Any AP203/AP214 file is first converted
+    to AP242. The user can then edit it (workplane_api start_from=<name>). Token-gated. Raw
+    STEP bytes in the request body; ?session=<id>&name=<model-name>&filename=<original-name>."""
+    from starlette.responses import JSONResponse
+    if not _authorized(request):
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+    _bind(request.query_params.get("session"))
+    body = await request.body()
+    if not body:
+        return JSONResponse({"error": "empty file"}, status_code=400)
+    # Reject unsupported formats up front (extension + content sniff) with a clear message.
+    fname = (request.query_params.get("filename") or "").lower()
+    ext_ok = fname.endswith(SUPPORTED_IMPORT_EXTS) if fname else True
+    if not ext_ok or not looks_like_step(body):
+        return JSONResponse(
+            {"error": "unsupported file format. Only STEP files (.step / .stp) can be "
+                      "imported.", "supported": list(SUPPORTED_IMPORT_EXTS)},
+            status_code=415)
+    try:
+        obj, meta, converted = await anyio.to_thread.run_sync(_convert_and_read, body)
+    except Exception as e:
+        _log_err(str(e), traceback.format_exc())
+        return JSONResponse({"error": _scrub(f"could not read STEP file: {e}")},
+                            status_code=400)
+    name = request.query_params.get("name") or _auto_name("import")
+    _store(name, obj)
+    try:
+        description = await anyio.to_thread.run_sync(describe_shape, obj, meta)
+    except Exception as e:
+        _log_err(str(e), traceback.format_exc())
+        description = {"error": "description unavailable"}
+    await anyio.to_thread.run_sync(_show, obj)  # render it + load the measurement backend
+    return JSONResponse({"status": "ok", "name": name, "obj_type": _obj_type(obj),
+                         "converted_to_ap242": converted, "description": description})
+
+
 @mcp.custom_route("/model", methods=["GET"])
 async def _model(request):
+    import gzip
     from starlette.responses import JSONResponse, Response
     sess = _get_session(request.query_params.get("session"))
-    if sess.viewer["payload"] is None:
+    payload = sess.viewer["payload"]
+    if payload is None:
         return JSONResponse({"error": "no model yet"}, status_code=404)
-    return Response(json.dumps(sess.viewer["payload"]), media_type="application/json")
+    # The tessellation payload is large (tens of MB for a big assembly) and the viewer
+    # re-fetches it on every version bump. Serialise + gzip ONCE per version and cache the
+    # bytes (a 1250-part model is ~21 MB JSON → ~5 MB gzip), cutting both transfer and the
+    # browser's parse time. Repeated fetches of the same version reuse the cache.
+    ver = sess.viewer["version"]
+    cache = sess.viewer.get("_gz")
+    if not cache or cache[0] != ver:
+        cache = (ver, gzip.compress(json.dumps(payload).encode(), 5))
+        sess.viewer["_gz"] = cache
+    gz = cache[1]
+    if "gzip" in request.headers.get("accept-encoding", "").lower():
+        return Response(gz, media_type="application/json",
+                        headers={"Content-Encoding": "gzip", "Vary": "Accept-Encoding"})
+    return Response(gzip.decompress(gz), media_type="application/json")
 
 
 @mcp.custom_route("/version", methods=["GET"])

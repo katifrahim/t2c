@@ -9,7 +9,7 @@ import {
   useThreadListItem,
   useThreadListItemRuntime,
 } from "@assistant-ui/react";
-import { MenuIcon, PlusIcon, DownloadIcon, LogOutIcon, Trash2Icon, PencilIcon, GripVerticalIcon, MoonIcon, SunIcon, LibraryIcon } from "lucide-react";
+import { MenuIcon, PlusIcon, DownloadIcon, UploadIcon, LoaderIcon, LogOutIcon, Trash2Icon, PencilIcon, GripVerticalIcon, MoonIcon, SunIcon, LibraryIcon } from "lucide-react";
 import {
   DndContext,
   PointerSensor,
@@ -48,6 +48,7 @@ import ChatProvider from "@/components/ChatProvider";
 import { MODELS } from "@/lib/models";
 import { useModelStore } from "@/lib/model-store";
 import { useSessionStore } from "@/lib/session-store";
+import { useImportStore } from "@/lib/import-store";
 import { useThreadOrderStore } from "@/lib/thread-order-store";
 import { useViewerThemeStore } from "@/lib/viewer-theme-store";
 import { createClient, SUPABASE_CONFIGURED } from "@/lib/supabase/client";
@@ -131,6 +132,42 @@ function TopBar({ onToggleHistory, historyOpen, onToggleLibrary, libraryOpen }) 
   const [menuOpen, setMenuOpen] = useState(false);
   const [isSketch, setIsSketch] = useState(false);
   const [confirmSignOut, setConfirmSignOut] = useState(false);
+  const setImportPending = useImportStore((s) => s.setPending);
+  const importInputRef = useRef(null);
+  const [importing, setImporting] = useState(false);
+  const [importError, setImportError] = useState("");
+
+  async function onImportFile(e) {
+    const file = e.target.files?.[0];
+    e.target.value = "";  // let the same file be re-picked later
+    if (!file) return;
+    if (!/\.(step|stp)$/i.test(file.name)) {
+      setImportError("Only STEP files (.step / .stp) can be imported.");
+      return;
+    }
+    setImportError("");
+    setImporting(true);
+    try {
+      const qs = new URLSearchParams({ session: sessionId, filename: file.name });
+      const resp = await fetch(`/api/import?${qs.toString()}`, { method: "POST", body: file });
+      const data = await resp.json().catch(() => ({}));
+      if (!resp.ok || data.error) throw new Error(data.error || `import failed (${resp.status})`);
+      // Feed the structured description to the AI on the next prompt; the viewer refreshes
+      // itself via version polling once the backend makes this the active model.
+      setImportPending({
+        name: data.name,
+        filename: file.name,
+        converted: !!data.converted_to_ap242,
+        description: data.description,
+      });
+      track(EVENTS.MODEL_IMPORTED, { converted: !!data.converted_to_ap242 });
+    } catch (err) {
+      setImportError(String(err.message || err));
+      setTimeout(() => setImportError(""), 5000);
+    } finally {
+      setImporting(false);
+    }
+  }
 
   function newChat() {
     track(EVENTS.NEW_CHAT);
@@ -216,6 +253,22 @@ function TopBar({ onToggleHistory, historyOpen, onToggleLibrary, libraryOpen }) 
 
       <TopBarButton tooltip="Viewer theme" onClick={toggleViewerTheme}>
         {viewerTheme === "dark" ? <SunIcon size={16} /> : <MoonIcon size={16} />}
+      </TopBarButton>
+
+      <input
+        ref={importInputRef}
+        type="file"
+        accept=".step,.stp,model/step,application/step"
+        onChange={onImportFile}
+        style={{ display: "none" }}
+      />
+      <TopBarButton
+        tooltip={importError || (importing ? "Importing…" : "Import STEP file")}
+        onClick={() => !importing && importInputRef.current?.click()}
+        active={importing}
+        danger={!!importError}
+      >
+        {importing ? <LoaderIcon size={16} className="animate-spin" /> : <UploadIcon size={16} />}
       </TopBarButton>
 
       <div style={{ position: "relative" }}>

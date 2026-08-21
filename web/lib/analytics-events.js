@@ -11,6 +11,7 @@ export const EVENTS = {
   MODEL_SWITCHED: "chat:model_switched",
   NEW_CHAT: "chat:new_chat",
   EXPORT_CLICKED: "model:export_clicked",
+  MODEL_IMPORTED: "model:imported",
   TEMPLATE_SAVED: "template:saved",
   // Emitted server-side (see lib/analytics-server.js):
   GENERATION_SUCCEEDED: "chat:generation_succeeded",

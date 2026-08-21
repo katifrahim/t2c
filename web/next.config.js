@@ -10,6 +10,11 @@ const nextConfig = {
   // so don't let those third-party type/lint errors block the production build.
   typescript: { ignoreBuildErrors: true },
   eslint: { ignoreDuringBuilds: true },
+  // Middleware (auth-cookie refresh) runs on /api/import and buffers the whole
+  // request body first; Next's default cap is 10 MiB (middlewareClientMaxBodySize),
+  // so a larger STEP upload was silently truncated → the backend parsed a partial
+  // file and showed a box. Raise the cap so real CAD assemblies import intact.
+  experimental: { middlewareClientMaxBodySize: "100mb" },
   // PostHog sends a trailing slash on its API calls; don't let Next redirect it.
   skipTrailingSlashRedirect: true,
   // Expose Vercel's deploy env to the client so analytics can gate on "production
