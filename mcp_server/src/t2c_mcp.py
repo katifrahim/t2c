@@ -21,6 +21,7 @@ import sys
 import zlib
 
 import anyio
+from simpleeval import EvalWithCompoundTypes
 
 # Port of the standalone ocp_vscode viewer (`python -m ocp_vscode`) used by the
 # stdio viewer-push pipeline. NOTE: instantiating ViewerBackend(0) below calls
@@ -456,9 +457,22 @@ def _restore_into(sess: "Session", data: bytes) -> int:
 # REFERENCE & TYPE RESOLUTION
 # =============================================================================
 
-# Degree-based trig namespace for {"_expr": "..."} evaluation.
-# All angle arguments are in degrees; inverse trig returns degrees.
-_MATH_NS: Dict[str, Any] = {
+# -----------------------------------------------------------------------------
+# Sandboxed expression evaluation (simpleeval, AST-whitelisted).
+#
+#   {"_expr": "..."}  → one number. Trig is in DEGREES (legacy convention).
+#   {"_func": {...}}  → a Python callable f(*params) for CadQuery methods that
+#                       take a lambda (parametricCurve / parametricSurface).
+#                       Trig is in RADIANS (standard maths convention).
+#
+# simpleeval whitelists AST nodes, so it blocks attribute access, imports, and
+# oversized powers — AI-authored strings cannot escape the sandbox the way a
+# bare eval() can.
+# -----------------------------------------------------------------------------
+
+# Degree-based trig for {"_expr": ...}: angle args in degrees, inverse trig
+# returns degrees.
+_EXPR_FUNCS: Dict[str, Any] = {
     "cos":   lambda x: math.cos(math.radians(x)),
     "sin":   lambda x: math.sin(math.radians(x)),
     "tan":   lambda x: math.tan(math.radians(x)),
@@ -467,19 +481,66 @@ _MATH_NS: Dict[str, Any] = {
     "atan":  lambda x: math.degrees(math.atan(x)),
     "atan2": lambda y, x: math.degrees(math.atan2(y, x)),
     "sqrt":  math.sqrt,
-    "pi":    math.pi,
-    "e":     math.e,
     "abs":   abs,
     "pow":   pow,
     "ceil":  math.ceil,
     "floor": math.floor,
 }
+_EXPR_CONSTS: Dict[str, Any] = {"pi": math.pi, "e": math.e}
+
+# Standard radians maths for {"_func": ...} parametric formulas.
+_FUNC_FUNCS: Dict[str, Any] = {
+    "sin": math.sin, "cos": math.cos, "tan": math.tan,
+    "asin": math.asin, "acos": math.acos, "atan": math.atan, "atan2": math.atan2,
+    "sinh": math.sinh, "cosh": math.cosh, "tanh": math.tanh,
+    "exp": math.exp, "log": math.log, "log10": math.log10,
+    "sqrt": math.sqrt, "pow": pow, "hypot": math.hypot,
+    "floor": math.floor, "ceil": math.ceil, "abs": abs,
+    "min": min, "max": max, "round": round,
+    "degrees": math.degrees, "radians": math.radians,
+}
+_FUNC_CONSTS: Dict[str, Any] = {"pi": math.pi, "tau": math.tau, "e": math.e}
+
+
+def _safe_eval_expr(expr: str) -> float:
+    """Evaluate an {"_expr"} string to a number (degree-based namespace)."""
+    ev = EvalWithCompoundTypes(functions=_EXPR_FUNCS, names=dict(_EXPR_CONSTS))
+    return ev.eval(expr)
+
+
+def _make_func(spec: dict):
+    """Build a Python callable from {"_func": {"params": [...], "expr": "..."}}.
+
+    The expression is evaluated in the radians maths namespace with each call's
+    positional arguments bound to `params` (default ["t"]). A list/tuple result
+    such as "[x, y, z]" is returned as a tuple so CadQuery can wrap it in a
+    Vector. Powers parametricCurve (f(t)) and parametricSurface (f(u, v))."""
+    params = spec.get("params") or ["t"]
+    expr   = spec["expr"]
+    ev     = EvalWithCompoundTypes(functions=_FUNC_FUNCS, names=dict(_FUNC_CONSTS))
+    node   = ev.parse(expr)  # validate once; raises on bad syntax
+
+    def _fn(*args):
+        ev.names = {**_FUNC_CONSTS, **dict(zip(params, args))}
+        out = ev.eval(expr, previously_parsed=node)
+        if not isinstance(out, (list, tuple)):
+            raise ValueError(
+                f"_func expr {expr!r} must return [x, y] or [x, y, z], got {out!r}")
+        coords = tuple(out)
+        if len(coords) not in (2, 3) or not all(
+                isinstance(c, (int, float)) for c in coords):
+            raise ValueError(
+                f"_func expr {expr!r} must return 2 or 3 numbers, got {coords!r}")
+        return coords
+
+    return _fn
 
 
 def resolve_value(value: Any) -> Any:
     """Resolve {"_ref": name} → stored object, {"_type": ...} → CadQuery type,
     {"_attr": ...} → attribute access, {"_call": ...} → method call,
-    {"_run_on": ...} → run ops on object without storing."""
+    {"_run_on": ...} → run ops on object without storing,
+    {"_func": ...} → sandboxed callable f(*params), {"_expr": ...} → number."""
     if isinstance(value, dict):
         if "_ref" in value:
             return _get(value["_ref"])
@@ -503,8 +564,10 @@ def resolve_value(value: Any) -> Any:
             spec = value["_run_on"]
             obj  = resolve_value(spec["obj"])
             return _run(obj, spec["ops"])
+        elif "_func" in value:
+            return _make_func(value["_func"])
         elif "_expr" in value:
-            return float(eval(value["_expr"], {"__builtins__": {}}, _MATH_NS))
+            return float(_safe_eval_expr(value["_expr"]))
         else:
             return {k: resolve_value(v) for k, v in value.items()}
     elif isinstance(value, list):
@@ -1389,10 +1452,20 @@ def _properties(obj: Any) -> dict:
 
     try:
         shape = obj.val() if hasattr(obj, "val") else obj
-        for attr, key in [("Volume", "volume"), ("Area", "area")]:
-            if hasattr(shape, attr):
-                try: props[key] = getattr(shape, attr)()
-                except Exception: pass
+        # Report the metric that matches the shape's dimensionality: length for
+        # 1D wires/edges (e.g. parametricCurve), area for 2D faces/shells (e.g.
+        # parametricSurface), volume (+area) for solids/compounds.
+        if isinstance(shape, (Wire, Edge)):
+            try: props["length"] = shape.Length()
+            except Exception: pass
+        elif isinstance(shape, (Face, Shell)):
+            try: props["area"] = shape.Area()
+            except Exception: pass
+        else:
+            for attr, key in [("Volume", "volume"), ("Area", "area")]:
+                if hasattr(shape, attr):
+                    try: props[key] = getattr(shape, attr)()
+                    except Exception: pass
         if hasattr(shape, "Center"):
             try:
                 c = shape.Center()
@@ -1601,11 +1674,18 @@ async def workplane_api(
 	        - Draw an elliptical arc with x and y radiuses either with start point at current point or current point being the center of the arc. 
             - angle1 is starting angle, angle2 is ending angle.
         parametricCurve(func: Callable[[float], Union[Tuple[float, float], Tuple[float, float, float], Vector]], N: int=400, start: float=0, stop: float=1, tol: float=1e-06, minDeg: int=1, maxDeg: int=6, smoothing: Optional[Tuple[float, float, float]]=(1, 1, 1), makeWire: bool=True)
-	        - Create a spline curve approximating the provided function of one independent variable. 
-            - lambda function required [not supported]
+	        - Create a spline curve approximating the provided function of one independent variable.
+            - Pass "func" as {"_func": {"params": ["t"], "expr": "[x, y, z]"}} (trig in RADIANS).
+            - e.g. a helix: {"method": "parametricCurve", "params": {"func": {"_func": {"params": ["t"], "expr": "[10*cos(2*pi*t), 10*sin(2*pi*t), 20*t]"}}, "N": 200}}
+            - A closed curve makes a closed wire you can then extrude/loft into a solid.
         parametricSurface(func: Callable[[float, float], Union[Tuple[float, float], Tuple[float, float, float], Vector]], N: int=20, start: float=0, stop: float=1, tol: float=0.01, minDeg: int=1, maxDeg: int=6, smoothing: Optional[Tuple[float, float, float]]=(1, 1, 1))
-	        - Create a spline surface approximating the provided function of two independent variables. 
-            - lambda function required [not supported]
+	        - Create a spline surface approximating the provided function of two independent variables.
+            - Pass "func" as {"_func": {"params": ["u", "v"], "expr": "[x, y, z]"}} (trig in RADIANS).
+            - "start"/"stop" apply to BOTH u and v; keep them 0..1 and scale inside the expr.
+            - e.g. a sphere: {"method": "parametricSurface", "params": {"func": {"_func": {"params": ["u", "v"], "expr": "[15*sin(pi*v)*cos(2*pi*u), 15*sin(pi*v)*sin(2*pi*u), 15*cos(pi*v)]"}}, "N": 30, "start": 0, "stop": 1}}
+            - To make a solid from an OPEN patch (a sheet over a rectangular u,v range), follow with {"method": "val"} then {"method": "thicken", "args": [<thickness>]}.
+            - Do NOT thicken a wrapped/closed surface (sphere, cylinder, dome): its u-seam and poles leave sliver faces + stray edges. Build solids of revolution with revolve on a profile instead.
+            - May need "tol" tuning (raise it) if the approximation fails.
       # arrays:
         rarray(xSpacing: float, ySpacing: float, xCount: int, yCount: int, center: Union[bool, Tuple[bool, bool]]=True)
 	        - Creates a rectangular array of points and pushes them onto the stack.
@@ -1768,11 +1848,12 @@ async def workplane_api(
 	        - Pushes a list of 2D points onto the stack as vertices.
             - Creates an array of custom 2D points and pushed them onto the stack (similar to "rarray" or "polarArray")
       each(callback: Callable[[Union[Vector, Location, Shape, Sketch]], Shape], useLocalCoordinates: bool=False, combine: Union[bool, Literal['cut', 'a', 's']]=True, clean: bool=True)
-	        - Runs the provided function on each value in the stack, and collects the return values into a new model object. 
-            - lambda function [not supported]
+	        - Runs the provided function on each value in the stack, and collects the return values into a new model object.
+            - Needs a geometry-building callback [not supported]. To place a stored part at each point, use eachpoint instead.
       eachpoint(arg: Union[Shape, ForwardRef('Workplane'), Callable[[Location], Shape]], useLocalCoordinates: bool=False, combine: Union[bool, Literal['cut', 'a', 's']]=False, clean: bool=True)
-	        - Same as each(), except arg is translated by the positions on the stack. 
-            - lambda function [not supported] or obj
+	        - Places a copy of a stored part at every point on the stack (after rarray/polarArray/pushPoints).
+            - Pass the part as "arg": {"_ref": "part_name"} and set "combine": true so the result is one object.
+            - e.g. an 8-hole bolt circle: [{"method": "polarArray", "args": [25, 0, 360, 8]}, {"method": "eachpoint", "params": {"arg": {"_ref": "peg"}, "combine": true}}]
       val()
 	        - Return the first value on the stack. 
             - convert workplane obj to shape obj
@@ -1908,6 +1989,17 @@ async def workplane_api(
              "x": {"_expr": "cos(30)*cos(45)"},
              "y": {"_expr": "sin(30)*cos(45)"},
              "z": {"_expr": "sin(45)"}}
+
+      {"_func": {"params": ["t"], "expr": "[10*cos(2*pi*t), 10*sin(2*pi*t), 20*t]"}}
+        - Build a math function (a callable) from a formula string. This is how
+          you supply the lambda that parametricCurve / parametricSurface need.
+        - "params": the variable names bound per call — ["t"] for parametricCurve
+          (a curve), ["u", "v"] for parametricSurface (a surface). Default ["t"].
+        - "expr": must return the point as a list [x, y, z] (or 2D [x, y]).
+        - Trig here uses RADIANS (standard maths). Available: sin, cos, tan,
+          asin, acos, atan, atan2, sinh, cosh, tanh, exp, log, log10, sqrt, pow,
+          hypot, floor, ceil, abs, min, max, round, degrees, radians, pi, tau, e.
+        - Conditionals work: "0 if t<0.5 else 1" (piecewise formulas).
 
     Canonical use-case — tag a reference point on a part for Assembly constraints:
 

@@ -209,4 +209,5 @@ def test_finger_jointed_box_in_workplane():
             {"method": "makeFingerJoints", "params": {"materialThickness": 3, "targetFingerWidth": 5}},
         ], store_as="fjbox")))
     assert r["status"] == "success"
-    assert r["properties"]["volume"] > 0
+    # makeFingerJoints yields flat panels (Faces), so the reported metric is area.
+    assert r["properties"]["area"] > 0
