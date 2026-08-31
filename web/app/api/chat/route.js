@@ -9,7 +9,7 @@ import {
   createUIMessageStreamResponse,
 } from "ai";
 import { startActiveObservation, LangfuseOtelSpanAttributes as LF } from "@langfuse/tracing";
-import { MODELS, DEFAULT_MODEL, MODEL_PRICING, CREDITS_PER_USD } from "@/lib/models";
+import { MODELS, MODEL_PRICING, CREDITS_PER_USD, TEXT_TO_CAD_MODEL, IMAGE_TO_CAD_MODEL } from "@/lib/models";
 import { createClient } from "@/lib/supabase/server";
 import { embedText } from "@/lib/embeddings";
 import { langfuseSpanProcessor } from "@/instrumentation";
@@ -202,13 +202,19 @@ async function chargeUsage({ supabase, uid, session, model, totalUsage, traceId,
   }
 }
 
-// True if any message carries an image attachment. The client sends images as
-// file parts with an image/* media type. OpenRouter rejects the WHOLE request if
-// any message has an image and the model is text-only, so we check every message.
-function hasImagePart(messages) {
-  return (messages ?? []).some((m) =>
-    (m?.parts ?? []).some((p) => p?.type === "file" && p?.mediaType?.startsWith("image/")),
-  );
+// An image attachment part. The client sends images as file parts with an image/*
+// media type.
+const isImagePart = (p) => p?.type === "file" && p?.mediaType?.startsWith("image/");
+
+// True if the CURRENT prompt carries an image, i.e. the newest USER message (not the
+// whole thread) has an image part. This drives mode routing: image in the immediate
+// prompt → Image-to-CAD (Opus); otherwise → Text-to-CAD (GPT), even when older
+// messages hold images. Checking the last USER message (not the very last message)
+// keeps auto-continue turns — where the last message is the assistant's — on the same
+// model as the prompt they continue.
+function promptHasImage(messages) {
+  const last = [...(messages ?? [])].reverse().find((m) => m.role === "user");
+  return (last?.parts ?? []).some(isImagePart);
 }
 
 // Plain text of the newest user message — used as the trace's top-level input so
@@ -411,19 +417,25 @@ function friendlyError(e) {
   // imply it self-heals; point the user at us.
   if (status === "402" || low.includes("insufficient"))
     return "The service is temporarily unavailable. If this keeps happening, please contact us.";
-  // Backstop for a "vision" model whose routed provider still refuses the image
-  // (the pre-send guard catches the common text-only case).
+  // Defensive backstop if a routed provider still refuses the image (both modes are
+  // vision-capable, so this should be rare). No "switch mode" wording — routing is
+  // automatic, there is nothing for the user to switch.
   if (low.includes("image") && (low.includes("not support") || low.includes("modalit") || low.includes("no endpoints")))
-    return "This mode can't read images.  \n> Please switch to \"Image-to-CAD\".";
+    return "Couldn't read the image. Please try again.";
   return raw;
 }
 
 export async function POST(req) {
-  const { messages, system, tools, model, id, sessionId } = await req.json();
+  const { messages, system, tools, id, sessionId } = await req.json();
   // assistant-ui's transport sends the thread's remoteId as `id`; that IS the
   // chat's persistent session id. Fall back to sessionId for older callers.
   const session = id ?? sessionId;
-  const selectedModel = model || DEFAULT_MODEL;
+  // Mode is auto-routed server-side from the CURRENT prompt — the client no longer
+  // chooses a model. An image in the latest user message → Image-to-CAD (Opus);
+  // otherwise → Text-to-CAD (GPT, the cheaper default). Both models are vision-
+  // capable, so a text prompt can fall back to GPT even when earlier turns hold
+  // images (GPT re-reads them) without OpenRouter rejecting the request.
+  const selectedModel = promptHasImage(messages) ? IMAGE_TO_CAD_MODEL : TEXT_TO_CAD_MODEL;
   // The chat id for analytics/metering — null for unsynced local-only chats.
   const chatId = session && !session.startsWith("__LOCALID") ? session : null;
   // A fresh user prompt (last msg is theirs) vs. a client auto-continue of an
@@ -470,23 +482,13 @@ export async function POST(req) {
   const budgetUsd =
     creditsRemaining != null ? Math.max(0, (creditsRemaining - MIN_RESERVE) / CREDITS_PER_USD) : null;
 
-  // Only vision-capable models accept image input; text-only models make
-  // OpenRouter reject the whole request. Refuse early — before opening the MCP
-  // client or calling the model — with a clear, unbilled notice so the user
-  // switches models instead of seeing a cryptic provider error.
-  if (!MODELS.find((m) => m.id === selectedModel)?.vision && hasImagePart(messages)) {
-    return noticeResponse(
-      "> This mode can't read images.  \n> Please switch to \"Image-to-CAD\".",
-    );
-  }
-
-  // A real new prompt that cleared the credit + image gates. Auto-continues (last
-  // msg is the assistant's) don't re-count — they resume the same submission.
+  // A real new prompt that cleared the credit gate. Auto-continues (last msg is the
+  // assistant's) don't re-count — they resume the same submission.
   if (isNewPrompt) {
     await captureServer(EVENTS.PROMPT_SUBMITTED, {
       model: selectedModel,
       prompt_length: (lastUserText(messages) ?? "").length,
-      has_image: hasImagePart(messages),
+      has_image: promptHasImage(messages),
       chat_id: chatId,
     });
   }
