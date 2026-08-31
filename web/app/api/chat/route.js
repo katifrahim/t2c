@@ -517,6 +517,12 @@ export async function POST(req) {
   const providerOptions = {
     openrouter: {
       usage: { include: true },
+      // Sticky routing: pin this chat's requests to whichever upstream first served
+      // it, so prompt caches stay warm across steps AND turns without locking a
+      // provider (keeps throughput routing + failover). Deterministic where plain
+      // throughput is a coin-flip. Works for Anthropic (explicit cache_control) and
+      // OpenAI/others (automatic caching) alike.
+      ...(session ? { session_id: session } : {}),
       ...(reasoning ? { reasoning: { effort: reasoning } } : {}),
     },
   };
@@ -625,15 +631,11 @@ export async function POST(req) {
       // require_parameters: only route to providers that actually support the
       // `tools` param, so we avoid ones that mis-parse tool calls into text.
       model: openrouter(selectedModel, {
-        // Anthropic models: pin the Anthropic upstream so prompt-cache reads land on
-        // the same endpoint across steps/turns. Caches do NOT transfer between the
-        // Anthropic/Bedrock/Vertex upstreams that "throughput" load-balances across —
-        // without pinning, the cache_control breakpoints only ever pay the 1.25x write
-        // premium and rarely read (net-negative). `order` still allows fallback if
-        // Anthropic is down (that turn just re-writes). Non-Anthropic keep throughput.
-        provider: selectedModel.startsWith("anthropic/")
-          ? { ignore: ["Groq", "groq"], require_parameters: true, order: ["anthropic"] }
-          : { ignore: ["Groq", "groq"], require_parameters: true, sort: "throughput" },
+        // Cache continuity across steps/turns is handled by providerOptions.session_id
+        // (OpenRouter sticky routing keeps the chat on one warm upstream), so we keep
+        // throughput sort here rather than pinning a single provider — preserving
+        // multi-upstream routing and failover.
+        provider: { ignore: ["Groq", "groq"], require_parameters: true, sort: "throughput" },
       }),
       providerOptions,
       // Tie generation (and in-flight MCP tool calls) to the client connection so
