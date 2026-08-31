@@ -10,39 +10,18 @@ import { useAISDKRuntime, AssistantChatTransport } from "@assistant-ui/react-ai-
 import { useChat } from "@ai-sdk/react";
 import { lastAssistantMessageIsCompleteWithToolCalls } from "ai";
 import { useSupabaseThreadListAdapter } from "@/lib/thread-list-adapter";
-import { useModelStore } from "@/lib/model-store";
 import { useCreditStore } from "@/lib/credit-store";
+import { useReplyModelStore } from "@/lib/reply-model-store";
 import { useSessionStore } from "@/lib/session-store";
 import { useImportStore } from "@/lib/import-store";
 import { useThreadOrderStore } from "@/lib/thread-order-store";
 
-// Keep a stable transport reference while its config (model) changes underneath,
-// mirroring assistant-ui's internal useChatThreadRuntime.
-function useDynamicTransport(transport) {
-  const ref = useRef(transport);
-  useEffect(() => {
-    ref.current = transport;
-  });
-  return useMemo(
-    () =>
-      new Proxy(ref.current, {
-        get(_t, prop) {
-          const res = ref.current[prop];
-          return typeof res === "function" ? res.bind(ref.current) : res;
-        },
-      }),
-    [],
-  );
-}
-
 // Per-thread runtime: an AI SDK chat wired to /api/chat, with the transport glue
-// that auto-injects the thread's remoteId as `id` in the request body.
+// that auto-injects the thread's remoteId as `id` in the request body. The model is
+// no longer sent — api/chat routes it server-side from the prompt — so the transport
+// is static (no per-model reconstruction).
 function useThreadRuntime() {
-  const model = useModelStore((s) => s.model);
-
-  const transport = useDynamicTransport(
-    useMemo(() => new AssistantChatTransport({ api: "/api/chat", body: { model } }), [model]),
-  );
+  const transport = useMemo(() => new AssistantChatTransport({ api: "/api/chat" }), []);
 
   const id = useAuiState((s) => s.threadListItem.id);
   const aui = useAui();
@@ -51,6 +30,14 @@ function useThreadRuntime() {
     // A turn just settled (success or stop/error) — the server bills as the stream
     // closes, so refresh shortly after to catch the new balance; the 5s poll backs it up.
     setTimeout(() => useCreditStore.getState().refresh(), 1500);
+  };
+  // On finish, stash which model actually answered (api/chat stamps the resolved model
+  // in the reply's metadata) so the thread can show the per-reply mode. Keyed by the
+  // AI-SDK message id, which assistant-ui preserves — see reply-model-store.
+  const onFinish = ({ message }) => {
+    const model = message?.metadata?.model;
+    if (message?.id && model) useReplyModelStore.getState().set(message.id, model);
+    refreshCredits();
   };
   // These callbacks MUST live on useChat: useAISDKRuntime silently drops
   // sendAutomaticallyWhen / onFinish / onError (they aren't in its option set), which
@@ -61,7 +48,7 @@ function useThreadRuntime() {
     // Auto-continue when a turn ends mid-task (tool calls resolved, no final answer
     // yet) so long builds finish without the user typing "continue".
     sendAutomaticallyWhen: lastAssistantMessageIsCompleteWithToolCalls,
-    onFinish: refreshCredits,
+    onFinish,
     onError: refreshCredits,
   });
 

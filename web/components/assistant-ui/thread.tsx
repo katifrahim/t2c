@@ -81,6 +81,8 @@ import {
 import { useCreditStore } from "@/lib/credit-store";
 import { useSelectionStore } from "@/lib/selection-store";
 import { useImportStore } from "@/lib/import-store";
+import { useReplyModelStore } from "@/lib/reply-model-store";
+import { modeLabelForModel } from "@/lib/models";
 
 export type ThreadGroupPart = MessagePrimitive.GroupedParts.GroupPart;
 
@@ -756,6 +758,24 @@ const MessageError: FC = () => {
   );
 };
 
+// Small muted label showing which mode actually answered this reply — Text-to-CAD
+// (GPT) or Image-to-CAD (Opus). The resolved model is stashed per message id in
+// useChat.onFinish (see reply-model-store); renders nothing until it's known.
+const ReplyModeLabel: FC = () => {
+  const id = useAuiState((s) => s.message.id);
+  const model = useReplyModelStore((s) => s.byId[id]);
+  const label = modeLabelForModel(model);
+  if (!label) return null;
+  return (
+    <span
+      data-slot="aui_assistant-message-mode"
+      className="text-muted-foreground ms-2 self-center text-xs"
+    >
+      {label}
+    </span>
+  );
+};
+
 const AssistantMessage: FC = () => {
   const {
     ToolFallback: ToolFallbackComponent = ToolFallback,
@@ -866,6 +886,7 @@ const AssistantMessage: FC = () => {
       >
         <BranchPicker />
         <AssistantActionBar />
+        <ReplyModeLabel />
       </div>
     </MessagePrimitive.Root>
   );

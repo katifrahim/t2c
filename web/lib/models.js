@@ -15,7 +15,7 @@
 //     | "\(.id)\t\((.architecture.input_modalities//[])|index("image")!=null)"'
 export const MODELS = [
   { id: "openai/gpt-5.6-sol", label: "Text-to-CAD", mode: "text", context: 1000000 }, // Ctx window: 1m toks
-  { id: "anthropic/claude-opus-5", label: "Image-to-CAD", mode: "image", context: 1000000 }, // Ctx window: 1m toks
+  { id: "anthropic/claude-opus-5", label: "Image-to-CAD", mode: "image", context: 1000000, vision: false }, // Ctx window: 1m toks
 ];
 
 // Model per mode — the routing targets used by api/chat.
@@ -25,6 +25,17 @@ export const IMAGE_TO_CAD_MODEL = MODELS.find((m) => m.mode === "image").id;
 // Default for background/non-chat rebuilds (e.g. template capture): the cheap text
 // mode. Interactive chat turns are routed per-prompt in api/chat, not via this.
 export const DEFAULT_MODEL = TEXT_TO_CAD_MODEL;
+
+// Mode label ("Text-to-CAD" / "Image-to-CAD") for a resolved model id — used by the
+// UI to show which mode actually answered a turn (the reply carries the model id in
+// its metadata). Substring match tolerates any provider suffix OpenRouter appends;
+// falls back by vendor so a never-seen id still maps sensibly.
+export function modeLabelForModel(modelId) {
+  if (!modelId) return null;
+  const m = MODELS.find((x) => modelId.includes(x.id));
+  if (m) return m.label;
+  return /opus|anthropic/i.test(modelId) ? "Image-to-CAD" : "Text-to-CAD";
+}
 
 // Per-token prices ($/token) from OpenRouter, used only as a cost fallback when
 // OpenRouter doesn't return the real cost (we prefer usage.cost from the response).

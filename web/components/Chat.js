@@ -46,7 +46,6 @@ import { Thread } from "@/components/assistant-ui/thread";
 import TemplateLibrary from "@/components/TemplateLibrary";
 import ChatProvider from "@/components/ChatProvider";
 import { MODELS } from "@/lib/models";
-import { useModelStore } from "@/lib/model-store";
 import { useSessionStore } from "@/lib/session-store";
 import { useImportStore } from "@/lib/import-store";
 import { useThreadOrderStore } from "@/lib/thread-order-store";
@@ -121,8 +120,12 @@ function TopBarButton({ tooltip, onClick, active, danger, children }) {
 }
 
 function TopBar({ onToggleHistory, historyOpen, onToggleLibrary, libraryOpen }) {
-  const model = useModelStore((s) => s.model);
-  const setModel = useModelStore((s) => s.setModel);
+  // Read-only mode indicator. The model is auto-routed server-side from the prompt
+  // (see api/chat), so this just previews what the NEXT send will use: an image queued
+  // in the composer → Image-to-CAD, otherwise Text-to-CAD. `?? []` keeps it safe if
+  // composer state isn't in scope yet.
+  const composerHasImage = useAuiState((s) => (s.composer?.attachments ?? []).some((a) => a.type === "image"));
+  const modeLabel = MODELS.find((m) => m.mode === (composerHasImage ? "image" : "text"))?.label;
   const sessionId = useSessionStore((s) => s.sessionId);
   const viewerTheme = useViewerThemeStore((s) => s.theme);
   const toggleViewerTheme = useViewerThemeStore((s) => s.toggleTheme);
@@ -230,33 +233,25 @@ function TopBar({ onToggleHistory, historyOpen, onToggleLibrary, libraryOpen }) 
       <Tooltip>
         <TooltipTrigger
           render={
-            <select
-              value={model}
-              onChange={(e) => { setModel(e.target.value); track(EVENTS.MODEL_SWITCHED, { model: e.target.value }); }}
-              aria-label="Model"
+            <div
+              aria-label="Mode"
               style={{
                 flex: 1, minWidth: 0, fontSize: 13,
-                padding: "5px 26px 5px 8px",
+                padding: "5px 8px",
                 border: "1px solid #e0e0e0", borderRadius: 6,
-                color: "#333", cursor: "pointer",
-                appearance: "none", WebkitAppearance: "none", MozAppearance: "none",
-                textOverflow: "ellipsis",
-                backgroundColor: "#fff",
-                backgroundImage: "url(\"data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='24' height='24' viewBox='0 0 24 24' fill='none' stroke='%23666666' stroke-width='2.5' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m6 9 6 6 6-6'/%3E%3C/svg%3E\")",
-                backgroundRepeat: "no-repeat",
-                backgroundPosition: "right 8px center",
-                backgroundSize: "14px",
+                color: "#333",
+                backgroundColor: "#fafafa",
+                display: "flex", alignItems: "center",
+                overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap",
               }}
-              onMouseEnter={(e) => (e.currentTarget.style.borderColor = "#a3a3a3")}
-              onMouseLeave={(e) => (e.currentTarget.style.borderColor = "#e0e0e0")}
             >
-              {MODELS.map((m) => (
-                <option key={m.id} value={m.id}>{m.label}</option>
-              ))}
-            </select>
+              {modeLabel}
+            </div>
           }
         />
-        <TooltipContent side="bottom" sideOffset={10}>Select LLM</TooltipContent>
+        <TooltipContent side="bottom" sideOffset={10}>
+          Mode is picked automatically: add an image for Image-to-CAD, otherwise Text-to-CAD.
+        </TooltipContent>
       </Tooltip>
 
       <TopBarButton tooltip="New chat" onClick={newChat}>
