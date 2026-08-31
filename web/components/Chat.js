@@ -241,7 +241,7 @@ function TopBar({ onToggleHistory, historyOpen, onToggleLibrary, libraryOpen }) 
                 border: "1px solid #e0e0e0", borderRadius: 6,
                 color: "#333",
                 backgroundColor: "#fafafa",
-                display: "flex", alignItems: "center",
+                display: "flex", alignItems: "center", justifyContent: "center",
                 overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap",
               }}
             >
@@ -249,9 +249,7 @@ function TopBar({ onToggleHistory, historyOpen, onToggleLibrary, libraryOpen }) 
             </div>
           }
         />
-        <TooltipContent side="bottom" sideOffset={10}>
-          Mode is picked automatically: add an image for Image-to-CAD, otherwise Text-to-CAD.
-        </TooltipContent>
+        <TooltipContent side="bottom" sideOffset={10}>Mode</TooltipContent>
       </Tooltip>
 
       <TopBarButton tooltip="New chat" onClick={newChat}>
