@@ -45,7 +45,6 @@ import {
 import { Thread } from "@/components/assistant-ui/thread";
 import TemplateLibrary from "@/components/TemplateLibrary";
 import ChatProvider from "@/components/ChatProvider";
-import { MODELS } from "@/lib/models";
 import { useSessionStore } from "@/lib/session-store";
 import { useImportStore } from "@/lib/import-store";
 import { useThreadOrderStore } from "@/lib/thread-order-store";
@@ -120,12 +119,6 @@ function TopBarButton({ tooltip, onClick, active, danger, children }) {
 }
 
 function TopBar({ onToggleHistory, historyOpen, onToggleLibrary, libraryOpen }) {
-  // Read-only mode indicator. The model is auto-routed server-side from the prompt
-  // (see api/chat), so this just previews what the NEXT send will use: an image queued
-  // in the composer → Image-to-CAD, otherwise Text-to-CAD. `?? []` keeps it safe if
-  // composer state isn't in scope yet.
-  const composerHasImage = useAuiState((s) => (s.composer?.attachments ?? []).some((a) => a.type === "image"));
-  const modeLabel = MODELS.find((m) => m.mode === (composerHasImage ? "image" : "text"))?.label;
   const sessionId = useSessionStore((s) => s.sessionId);
   const viewerTheme = useViewerThemeStore((s) => s.theme);
   const toggleViewerTheme = useViewerThemeStore((s) => s.toggleTheme);
@@ -230,30 +223,8 @@ function TopBar({ onToggleHistory, historyOpen, onToggleLibrary, libraryOpen }) 
         <LibraryIcon size={16} />
       </TopBarButton>
 
-      <Tooltip>
-        <TooltipTrigger
-          render={
-            <div
-              aria-label="Mode"
-              style={{
-                flex: 1, minWidth: 0, fontSize: 13,
-                padding: "5px 8px",
-                border: "1px solid #e0e0e0", borderRadius: 6,
-                color: "#333",
-                backgroundColor: "#fafafa",
-                display: "flex", alignItems: "center",
-                overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap",
-              }}
-            >
-              {modeLabel}
-            </div>
-          }
-        />
-        <TooltipContent side="bottom" sideOffset={10}>Mode</TooltipContent>
-      </Tooltip>
-
-      {/* Equal flex spacer: shares the free space 50/50 with the mode box above, so
-          the box is half-width while the right-side buttons stay pinned to the edge. */}
+      {/* Flex spacer: keeps history/library on the left and the action buttons pinned
+          to the right edge. */}
       <div aria-hidden style={{ flex: 1 }} />
 
       <TopBarButton tooltip="New chat" onClick={newChat}>

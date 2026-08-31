@@ -11,7 +11,6 @@ import { useChat } from "@ai-sdk/react";
 import { lastAssistantMessageIsCompleteWithToolCalls } from "ai";
 import { useSupabaseThreadListAdapter } from "@/lib/thread-list-adapter";
 import { useCreditStore } from "@/lib/credit-store";
-import { useReplyModelStore } from "@/lib/reply-model-store";
 import { useSessionStore } from "@/lib/session-store";
 import { useImportStore } from "@/lib/import-store";
 import { useThreadOrderStore } from "@/lib/thread-order-store";
@@ -31,14 +30,6 @@ function useThreadRuntime() {
     // closes, so refresh shortly after to catch the new balance; the 5s poll backs it up.
     setTimeout(() => useCreditStore.getState().refresh(), 1500);
   };
-  // On finish, stash which model actually answered (api/chat stamps the resolved model
-  // in the reply's metadata) so the thread can show the per-reply mode. Keyed by the
-  // AI-SDK message id, which assistant-ui preserves — see reply-model-store.
-  const onFinish = ({ message }) => {
-    const model = message?.metadata?.model;
-    if (message?.id && model) useReplyModelStore.getState().set(message.id, model);
-    refreshCredits();
-  };
   // These callbacks MUST live on useChat: useAISDKRuntime silently drops
   // sendAutomaticallyWhen / onFinish / onError (they aren't in its option set), which
   // is why auto-continue never fired and post-turn credit refresh never ran.
@@ -48,7 +39,7 @@ function useThreadRuntime() {
     // Auto-continue when a turn ends mid-task (tool calls resolved, no final answer
     // yet) so long builds finish without the user typing "continue".
     sendAutomaticallyWhen: lastAssistantMessageIsCompleteWithToolCalls,
-    onFinish,
+    onFinish: refreshCredits,
     onError: refreshCredits,
   });
 

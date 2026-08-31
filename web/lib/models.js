@@ -1,7 +1,7 @@
 // The two workspace "modes", each backed by one OpenRouter model. The user never
 // picks a model — api/chat routes by the CURRENT prompt: an image in the latest
 // user message → Image-to-CAD (Opus, best at image→CAD); otherwise → Text-to-CAD
-// (GPT, the cheaper default). `mode` drives both that routing and the UI badge label.
+// (GPT, the cheaper default). The `mode` field is what api/chat routes on.
 //
 // BOTH models are vision-capable on OpenRouter (verified: tools + image input). GPT's
 // vision matters even though it's the "text" mode: after an image turn, a follow-up
@@ -25,17 +25,6 @@ export const IMAGE_TO_CAD_MODEL = MODELS.find((m) => m.mode === "image").id;
 // Default for background/non-chat rebuilds (e.g. template capture): the cheap text
 // mode. Interactive chat turns are routed per-prompt in api/chat, not via this.
 export const DEFAULT_MODEL = TEXT_TO_CAD_MODEL;
-
-// Mode label ("Text-to-CAD" / "Image-to-CAD") for a resolved model id — used by the
-// UI to show which mode actually answered a turn (the reply carries the model id in
-// its metadata). Substring match tolerates any provider suffix OpenRouter appends;
-// falls back by vendor so a never-seen id still maps sensibly.
-export function modeLabelForModel(modelId) {
-  if (!modelId) return null;
-  const m = MODELS.find((x) => modelId.includes(x.id));
-  if (m) return m.label;
-  return /opus|anthropic/i.test(modelId) ? "Image-to-CAD" : "Text-to-CAD";
-}
 
 // Per-token prices ($/token) from OpenRouter, used only as a cost fallback when
 // OpenRouter doesn't return the real cost (we prefer usage.cost from the response).
