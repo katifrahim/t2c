@@ -625,7 +625,15 @@ export async function POST(req) {
       // require_parameters: only route to providers that actually support the
       // `tools` param, so we avoid ones that mis-parse tool calls into text.
       model: openrouter(selectedModel, {
-        provider: { ignore: ["Groq", "groq"], require_parameters: true, sort: "throughput"},
+        // Anthropic models: pin the Anthropic upstream so prompt-cache reads land on
+        // the same endpoint across steps/turns. Caches do NOT transfer between the
+        // Anthropic/Bedrock/Vertex upstreams that "throughput" load-balances across —
+        // without pinning, the cache_control breakpoints only ever pay the 1.25x write
+        // premium and rarely read (net-negative). `order` still allows fallback if
+        // Anthropic is down (that turn just re-writes). Non-Anthropic keep throughput.
+        provider: selectedModel.startsWith("anthropic/")
+          ? { ignore: ["Groq", "groq"], require_parameters: true, order: ["anthropic"] }
+          : { ignore: ["Groq", "groq"], require_parameters: true, sort: "throughput" },
       }),
       providerOptions,
       // Tie generation (and in-flight MCP tool calls) to the client connection so
@@ -648,6 +656,33 @@ export async function POST(req) {
         },
         ...modelMessages,
       ],
+      // Per-step cache breakpoints (Anthropic only). The system message above keeps
+      // the tools+system prefix cached; prepareStep additionally moves a breakpoint
+      // onto the LAST message each step, so the growing tool-call/result tail — and,
+      // across a multi-turn session, the whole prior conversation — re-reads at ~0.1x
+      // instead of full price. Anthropic allows <=4 breakpoints/request; we use 2
+      // (system + last message). Non-Anthropic models are left untouched.
+      prepareStep: selectedModel.startsWith("anthropic/")
+        ? ({ messages: stepMessages }) => {
+            if (!stepMessages.length) return undefined;
+            const tag = (m) => ({
+              ...m,
+              providerOptions: {
+                ...m.providerOptions,
+                openrouter: {
+                  ...m.providerOptions?.openrouter,
+                  cacheControl: { type: "ephemeral" },
+                },
+              },
+            });
+            const last = stepMessages.length - 1;
+            return {
+              messages: stepMessages.map((m, i) =>
+                m.role === "system" || i === last ? tag(m) : m,
+              ),
+            };
+          }
+        : undefined,
       tools: {
         ...mcpTools, // server-side t2c tools (executed here via the MCP client)
         ...frontendTools(tools ?? {}), // any client-side tools assistant-ui forwards
