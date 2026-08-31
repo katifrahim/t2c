@@ -12,13 +12,12 @@ export const MODELS = [
   { id: "anthropic/claude-opus-5", label: "Image-to-CAD", context: 1000000, vision: true }, // Ctx window: 1m toks
 ];
 
-// Default: DeepSeek V4 Flash — cheap and a 1M-token context so long/complex
-// sessions don't hit a wall. Users can switch models from the dropdown.
+// Default: Text-to-CAD
 export const DEFAULT_MODEL = MODELS[0].id;
 
 // Per-token prices ($/token) from OpenRouter, used only as a cost fallback when
 // OpenRouter doesn't return the real cost (we prefer usage.cost from the response).
-// Values match the live /api/v1/models endpoint; all four models are covered.
+// Values match the live /api/v1/models endpoint; both models are covered.
 export const MODEL_PRICING = {
   "openai/gpt-5.6-sol": { input: 4e-6, output: 20e-6 }, // Input: $4/m toks, Output: $20/m toks
   "anthropic/claude-opus-5": { input: 5e-6, output: 25e-6 }, // Input: $5/m toks, Output: $25/m toks
