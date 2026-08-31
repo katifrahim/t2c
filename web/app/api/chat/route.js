@@ -414,7 +414,7 @@ function friendlyError(e) {
   // Backstop for a "vision" model whose routed provider still refuses the image
   // (the pre-send guard catches the common text-only case).
   if (low.includes("image") && (low.includes("not support") || low.includes("modalit") || low.includes("no endpoints")))
-    return "This model can't read images.  \n> Please switch to a \"Vision\" model.";
+    return "This mode can't read images.  \n> Please switch to \"Image-to-CAD\".";
   return raw;
 }
 
@@ -476,7 +476,7 @@ export async function POST(req) {
   // switches models instead of seeing a cryptic provider error.
   if (!MODELS.find((m) => m.id === selectedModel)?.vision && hasImagePart(messages)) {
     return noticeResponse(
-      "> This model can't read images.  \n> Please switch to a \"Vision\" model.",
+      "> This mode can't read images.  \n> Please switch to \"Image-to-CAD\".",
     );
   }
 
@@ -625,14 +625,29 @@ export async function POST(req) {
       // require_parameters: only route to providers that actually support the
       // `tools` param, so we avoid ones that mis-parse tool calls into text.
       model: openrouter(selectedModel, {
-        provider: { ignore: ["Groq", "groq"], require_parameters: true },
+        provider: { ignore: ["Groq", "groq"], require_parameters: true, sort: "throughput"},
       }),
       providerOptions,
       // Tie generation (and in-flight MCP tool calls) to the client connection so
       // the Stop button / a closed tab actually halts backend work — it didn't before.
       abortSignal: req.signal,
-      system: [SYSTEM_PROMPT, templateBlock, system].filter(Boolean).join("\n\n"),
-      messages: modelMessages,
+      // Cache the fixed prefix (tools + system) on Anthropic models via one ephemeral
+      // breakpoint on the system block — Anthropic renders tools -> system -> messages,
+      // so caching the system block also caches the (large) MCP tool schemas. Across
+      // the multi-step agentic loop the prefix is re-read at ~0.1x instead of re-sent
+      // at full price, and each turn (<=240s) fits inside the 5-min cache TTL.
+      // Non-Anthropic models ignore it (OpenAI/Gemini cache implicitly; the rest don't
+      // use cache_control), so we only tag anthropic/* to avoid unsupported fields.
+      messages: [
+        {
+          role: "system",
+          content: [SYSTEM_PROMPT, templateBlock, system].filter(Boolean).join("\n\n"),
+          ...(selectedModel.startsWith("anthropic/")
+            ? { providerOptions: { openrouter: { cacheControl: { type: "ephemeral" } } } }
+            : {}),
+        },
+        ...modelMessages,
+      ],
       tools: {
         ...mcpTools, // server-side t2c tools (executed here via the MCP client)
         ...frontendTools(tools ?? {}), // any client-side tools assistant-ui forwards
