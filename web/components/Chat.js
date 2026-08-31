@@ -241,7 +241,7 @@ function TopBar({ onToggleHistory, historyOpen, onToggleLibrary, libraryOpen }) 
                 border: "1px solid #e0e0e0", borderRadius: 6,
                 color: "#333",
                 backgroundColor: "#fafafa",
-                display: "flex", alignItems: "center", justifyContent: "center",
+                display: "flex", alignItems: "center",
                 overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap",
               }}
             >
@@ -251,6 +251,10 @@ function TopBar({ onToggleHistory, historyOpen, onToggleLibrary, libraryOpen }) 
         />
         <TooltipContent side="bottom" sideOffset={10}>Mode</TooltipContent>
       </Tooltip>
+
+      {/* Equal flex spacer: shares the free space 50/50 with the mode box above, so
+          the box is half-width while the right-side buttons stay pinned to the edge. */}
+      <div aria-hidden style={{ flex: 1 }} />
 
       <TopBarButton tooltip="New chat" onClick={newChat}>
         <PlusIcon size={16} />
