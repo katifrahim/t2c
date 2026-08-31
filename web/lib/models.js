@@ -15,7 +15,7 @@
 //     | "\(.id)\t\((.architecture.input_modalities//[])|index("image")!=null)"'
 export const MODELS = [
   { id: "openai/gpt-5.6-sol", label: "Text-to-CAD", mode: "text", context: 1000000 }, // Ctx window: 1m toks
-  { id: "anthropic/claude-opus-5", label: "Image-to-CAD", mode: "image", context: 1000000, vision: false }, // Ctx window: 1m toks
+  { id: "anthropic/claude-opus-5", label: "Image-to-CAD", mode: "image", context: 1000000 }, // Ctx window: 1m toks
 ];
 
 // Model per mode — the routing targets used by api/chat.
