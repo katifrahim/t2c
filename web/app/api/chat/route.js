@@ -9,7 +9,7 @@ import {
   createUIMessageStreamResponse,
 } from "ai";
 import { startActiveObservation, LangfuseOtelSpanAttributes as LF } from "@langfuse/tracing";
-import { MODELS, DEFAULT_MODEL, MODEL_PRICING, CREDITS_PER_USD } from "@/lib/models";
+import { MODELS, MODEL_PRICING, CREDITS_PER_USD, TEXT_TO_CAD_MODEL, IMAGE_TO_CAD_MODEL } from "@/lib/models";
 import { createClient } from "@/lib/supabase/server";
 import { embedText } from "@/lib/embeddings";
 import { langfuseSpanProcessor } from "@/instrumentation";
@@ -202,13 +202,19 @@ async function chargeUsage({ supabase, uid, session, model, totalUsage, traceId,
   }
 }
 
-// True if any message carries an image attachment. The client sends images as
-// file parts with an image/* media type. OpenRouter rejects the WHOLE request if
-// any message has an image and the model is text-only, so we check every message.
-function hasImagePart(messages) {
-  return (messages ?? []).some((m) =>
-    (m?.parts ?? []).some((p) => p?.type === "file" && p?.mediaType?.startsWith("image/")),
-  );
+// An image attachment part. The client sends images as file parts with an image/*
+// media type.
+const isImagePart = (p) => p?.type === "file" && p?.mediaType?.startsWith("image/");
+
+// True if the CURRENT prompt carries an image, i.e. the newest USER message (not the
+// whole thread) has an image part. This drives mode routing: image in the immediate
+// prompt → Image-to-CAD (Opus); otherwise → Text-to-CAD (GPT), even when older
+// messages hold images. Checking the last USER message (not the very last message)
+// keeps auto-continue turns — where the last message is the assistant's — on the same
+// model as the prompt they continue.
+function promptHasImage(messages) {
+  const last = [...(messages ?? [])].reverse().find((m) => m.role === "user");
+  return (last?.parts ?? []).some(isImagePart);
 }
 
 // Plain text of the newest user message — used as the trace's top-level input so
@@ -411,19 +417,25 @@ function friendlyError(e) {
   // imply it self-heals; point the user at us.
   if (status === "402" || low.includes("insufficient"))
     return "The service is temporarily unavailable. If this keeps happening, please contact us.";
-  // Backstop for a "vision" model whose routed provider still refuses the image
-  // (the pre-send guard catches the common text-only case).
+  // Defensive backstop if a routed provider still refuses the image (both modes are
+  // vision-capable, so this should be rare). No "switch mode" wording — routing is
+  // automatic, there is nothing for the user to switch.
   if (low.includes("image") && (low.includes("not support") || low.includes("modalit") || low.includes("no endpoints")))
-    return "This model can't read images.  \n> Please switch to a \"Vision\" model.";
+    return "Couldn't read the image. Please try again.";
   return raw;
 }
 
 export async function POST(req) {
-  const { messages, system, tools, model, id, sessionId } = await req.json();
+  const { messages, system, tools, id, sessionId } = await req.json();
   // assistant-ui's transport sends the thread's remoteId as `id`; that IS the
   // chat's persistent session id. Fall back to sessionId for older callers.
   const session = id ?? sessionId;
-  const selectedModel = model || DEFAULT_MODEL;
+  // Mode is auto-routed server-side from the CURRENT prompt — the client no longer
+  // chooses a model. An image in the latest user message → Image-to-CAD (Opus);
+  // otherwise → Text-to-CAD (GPT, the cheaper default). Both models are vision-
+  // capable, so a text prompt can fall back to GPT even when earlier turns hold
+  // images (GPT re-reads them) without OpenRouter rejecting the request.
+  const selectedModel = promptHasImage(messages) ? IMAGE_TO_CAD_MODEL : TEXT_TO_CAD_MODEL;
   // The chat id for analytics/metering — null for unsynced local-only chats.
   const chatId = session && !session.startsWith("__LOCALID") ? session : null;
   // A fresh user prompt (last msg is theirs) vs. a client auto-continue of an
@@ -470,23 +482,13 @@ export async function POST(req) {
   const budgetUsd =
     creditsRemaining != null ? Math.max(0, (creditsRemaining - MIN_RESERVE) / CREDITS_PER_USD) : null;
 
-  // Only vision-capable models accept image input; text-only models make
-  // OpenRouter reject the whole request. Refuse early — before opening the MCP
-  // client or calling the model — with a clear, unbilled notice so the user
-  // switches models instead of seeing a cryptic provider error.
-  if (!MODELS.find((m) => m.id === selectedModel)?.vision && hasImagePart(messages)) {
-    return noticeResponse(
-      "> This model can't read images.  \n> Please switch to a \"Vision\" model.",
-    );
-  }
-
-  // A real new prompt that cleared the credit + image gates. Auto-continues (last
-  // msg is the assistant's) don't re-count — they resume the same submission.
+  // A real new prompt that cleared the credit gate. Auto-continues (last msg is the
+  // assistant's) don't re-count — they resume the same submission.
   if (isNewPrompt) {
     await captureServer(EVENTS.PROMPT_SUBMITTED, {
       model: selectedModel,
       prompt_length: (lastUserText(messages) ?? "").length,
-      has_image: hasImagePart(messages),
+      has_image: promptHasImage(messages),
       chat_id: chatId,
     });
   }
@@ -517,6 +519,12 @@ export async function POST(req) {
   const providerOptions = {
     openrouter: {
       usage: { include: true },
+      // Sticky routing: pin this chat's requests to whichever upstream first served
+      // it, so prompt caches stay warm across steps AND turns without locking a
+      // provider (keeps throughput routing + failover). Deterministic where plain
+      // throughput is a coin-flip. Works for Anthropic (explicit cache_control) and
+      // OpenAI/others (automatic caching) alike.
+      ...(session ? { session_id: session } : {}),
       ...(reasoning ? { reasoning: { effort: reasoning } } : {}),
     },
   };
@@ -625,14 +633,60 @@ export async function POST(req) {
       // require_parameters: only route to providers that actually support the
       // `tools` param, so we avoid ones that mis-parse tool calls into text.
       model: openrouter(selectedModel, {
-        provider: { ignore: ["Groq", "groq"], require_parameters: true },
+        // Cache continuity across steps/turns is handled by providerOptions.session_id
+        // (OpenRouter sticky routing keeps the chat on one warm upstream), so we keep
+        // throughput sort here rather than pinning a single provider — preserving
+        // multi-upstream routing and failover.
+        provider: { ignore: ["Groq", "groq"], require_parameters: true, sort: "throughput" },
       }),
       providerOptions,
       // Tie generation (and in-flight MCP tool calls) to the client connection so
       // the Stop button / a closed tab actually halts backend work — it didn't before.
       abortSignal: req.signal,
-      system: [SYSTEM_PROMPT, templateBlock, system].filter(Boolean).join("\n\n"),
-      messages: modelMessages,
+      // Cache the fixed prefix (tools + system) on Anthropic models via one ephemeral
+      // breakpoint on the system block — Anthropic renders tools -> system -> messages,
+      // so caching the system block also caches the (large) MCP tool schemas. Across
+      // the multi-step agentic loop the prefix is re-read at ~0.1x instead of re-sent
+      // at full price, and each turn (<=240s) fits inside the 5-min cache TTL.
+      // Non-Anthropic models ignore it (OpenAI/Gemini cache implicitly; the rest don't
+      // use cache_control), so we only tag anthropic/* to avoid unsupported fields.
+      messages: [
+        {
+          role: "system",
+          content: [SYSTEM_PROMPT, templateBlock, system].filter(Boolean).join("\n\n"),
+          ...(selectedModel.startsWith("anthropic/")
+            ? { providerOptions: { openrouter: { cacheControl: { type: "ephemeral" } } } }
+            : {}),
+        },
+        ...modelMessages,
+      ],
+      // Per-step cache breakpoints (Anthropic only). The system message above keeps
+      // the tools+system prefix cached; prepareStep additionally moves a breakpoint
+      // onto the LAST message each step, so the growing tool-call/result tail — and,
+      // across a multi-turn session, the whole prior conversation — re-reads at ~0.1x
+      // instead of full price. Anthropic allows <=4 breakpoints/request; we use 2
+      // (system + last message). Non-Anthropic models are left untouched.
+      prepareStep: selectedModel.startsWith("anthropic/")
+        ? ({ messages: stepMessages }) => {
+            if (!stepMessages.length) return undefined;
+            const tag = (m) => ({
+              ...m,
+              providerOptions: {
+                ...m.providerOptions,
+                openrouter: {
+                  ...m.providerOptions?.openrouter,
+                  cacheControl: { type: "ephemeral" },
+                },
+              },
+            });
+            const last = stepMessages.length - 1;
+            return {
+              messages: stepMessages.map((m, i) =>
+                m.role === "system" || i === last ? tag(m) : m,
+              ),
+            };
+          }
+        : undefined,
       tools: {
         ...mcpTools, // server-side t2c tools (executed here via the MCP client)
         ...frontendTools(tools ?? {}), // any client-side tools assistant-ui forwards
