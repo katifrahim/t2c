@@ -52,6 +52,7 @@ log ""
 log "## Run $TS — drawing: \`$(basename "$DRAWING")\` — target $TARGET%"
 echo "run dir: $RUN"
 start_server || exit 1
+RUN_START_HEAD="$(git -C "$WT" rev-parse HEAD)"   # to list this run's own edits for the editor
 
 mode="build"; feedback=""; best=-1; noimp=0; outcome="max-iters"
 for ((it=1; it<=MAX_ITERS; it++)); do
@@ -125,7 +126,9 @@ PY
   if [ -n "$SERVER_ISSUES" ] || [ "$FR_SUBSTANTIVE" -eq 1 ]; then
     echo "-> server-edit round"
     HEAD_BEFORE="$(git -C "$WT" rev-parse HEAD)"
-    export SERVER_ISSUES FRICTION="${FR:-None}"
+    export SERVER_ISSUES
+    export ALL_FRICTION="$(for f in "$RUN"/friction.*.md; do [ -f "$f" ] && { echo "===== $(basename "$f") ====="; sed -n '/## Friction/,$p' "$f"; echo; }; done)"
+    export PRIOR_COMMITS="$(git -C "$WT" log --oneline "$RUN_START_HEAD"..HEAD -- mcp_server/ 2>/dev/null)"; [ -z "$PRIOR_COMMITS" ] && export PRIOR_COMMITS="(none yet this run)"
     EPROMPT="$(render "$SELF/prompts/editor.md")"
     stop_server
     "$CLAUDE" -p "$EPROMPT" --add-dir "$WT" --strict-mcp-config --mcp-config "$RUN/mcp_none.json" \
