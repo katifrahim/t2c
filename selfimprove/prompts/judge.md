@@ -17,12 +17,21 @@ Check, at minimum:
 - Number of distinct parts, and how they are positioned/oriented/constrained relative to each other.
 - Anything present in the drawing that is missing from the calls, or present in the calls but not in the drawing.
 
-Then produce your structured verdict:
-- `accuracy`: an integer 0–100. 100 = an exact replica of the drawing (all dimensions, features, and relationships correct). Be strict: a missing or mis-sized major feature should cost many points.
-- `summary`: one paragraph explaining the score.
-- `issues`: an array. For each concrete discrepancy, give:
-    - `severity`: "low", "medium", or "high".
-    - `description`: exactly what is wrong and what the drawing requires instead (cite dimensions).
-    - `root_cause`: "modeling" if the builder simply used the tools incorrectly or omitted something it could have done; "server-limitation" if the T2C tools or their documentation appear to lack a needed capability, be buggy, or mislead such that expressing the correct result was hard or impossible.
+Do your assessment as detailed PROSE FIRST — walk through the drawing feature by feature (overall envelope, each part, each hole/slot/feature, the assembly relationships) and state, citing the drawing's own dimensions, exactly where the built model matches and where it fails. This written analysis is the real work; do it thoroughly before you summarise.
 
-Return every discrepancy you find. If the model is a faithful replica, return a high accuracy and an empty or near-empty issues array.
+THEN, as the very last thing in your reply, output a SINGLE fenced JSON code block with your verdict. Output nothing after the closing fence. Use this exact shape, filled with your REAL assessment — never placeholder or example text:
+
+```json
+{
+  "accuracy": 0,
+  "summary": "one paragraph justifying the score, referencing the concrete discrepancies",
+  "issues": [
+    {"severity": "high", "description": "the specific discrepancy and what the drawing requires instead, citing the dimension", "root_cause": "modeling"}
+  ]
+}
+```
+
+Rules for the JSON:
+- `accuracy`: integer 0–100. 100 = exact replica (all dimensions, features, relationships correct). Be strict — a missing or mis-sized major feature costs many points.
+- `root_cause`: "modeling" if the builder simply used the tools incorrectly or omitted something it could have done with the current tools; "server-limitation" if the T2C tools or their documentation appear to lack a needed capability, be buggy, or mislead such that the correct result was hard or impossible to express.
+- Put EVERY discrepancy you found in the prose into `issues`. Empty `issues` only if the model is a faithful replica. Never emit placeholder strings like "test" — every field must carry your actual finding.

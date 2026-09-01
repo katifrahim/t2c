@@ -24,7 +24,6 @@ TS="$(date +%Y%m%d-%H%M%S)"
 RUN="$SELF/runs/$TS"; mkdir -p "$RUN"
 LOG="$SELF/SELFIMPROVE_LOG.md"
 MODEL_TOOLS="mcp__t2c__workplane_api,mcp__t2c__sketch_api,mcp__t2c__assembly_api,mcp__t2c__extension_api,mcp__t2c__query_docs,mcp__t2c__select_model,mcp__t2c__report_learning"
-JUDGE_SCHEMA='{"type":"object","properties":{"accuracy":{"type":"integer"},"summary":{"type":"string"},"issues":{"type":"array","items":{"type":"object","properties":{"severity":{"type":"string"},"description":{"type":"string"},"root_cause":{"type":"string","enum":["modeling","server-limitation"]}},"required":["severity","description","root_cause"]}}},"required":["accuracy","summary","issues"]}'
 
 printf '{"mcpServers":{"t2c":{"type":"http","url":"http://127.0.0.1:%s/mcp","headers":{"Authorization":"Bearer %s","X-Session-Id":"%s"}}}}' "$PORT" "$TOK" "$SID" > "$RUN/mcp_http.json"
 echo '{"mcpServers":{}}' > "$RUN/mcp_none.json"
@@ -82,9 +81,9 @@ for ((it=1; it<=MAX_ITERS; it++)); do
   JPROMPT="$(render "$SELF/prompts/judge.md")"
   "$CLAUDE" -p "$JPROMPT" --strict-mcp-config --mcp-config "$RUN/mcp_none.json" \
     --add-dir "$(dirname "$DRAWING")" \
-    --permission-mode dontAsk --output-format json --json-schema "$JUDGE_SCHEMA" \
+    --permission-mode dontAsk --output-format json \
     < /dev/null > "$RUN/judge.$it.raw.json" 2>"$RUN/judge.$it.err"
-  "$PY" -c "import json,sys;d=json.load(open('$RUN/judge.$it.raw.json'));open('$RUN/judge.$it.json','w').write(json.dumps(d.get('structured_output') or {}, indent=2))" 2>/dev/null
+  "$PY" "$SELF/parse_verdict.py" "$RUN/judge.$it.raw.json" "$RUN/judge.$it.json" 2>/dev/null
 
   ACC="$("$PY" -c "import json;print(json.load(open('$RUN/judge.$it.json')).get('accuracy',-1))" 2>/dev/null || echo -1)"
   echo "accuracy=$ACC (calls=$NCALLS)"
