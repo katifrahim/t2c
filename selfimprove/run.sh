@@ -25,7 +25,7 @@ export ENABLE_TOOL_SEARCH=0                             # load all t2c schemas u
 
 DRAWING="${1:-/Users/apple/Desktop/Assy/Assy 6.pdf}"
 DRAW_DIR="$(dirname "$DRAWING")"
-TARGET="${TARGET:-95}"; STAGNANT="${STAGNANT:-5}"; INNER_CAP="${INNER_CAP:-4}"; MAX_ITERS="${MAX_ITERS:-12}"
+TARGET="${TARGET:-95}"; STAGNANT="${STAGNANT:-4}"; INNER_CAP="${INNER_CAP:-4}"; MAX_ITERS="${MAX_ITERS:-12}"
 
 TS="$(date +%Y%m%d-%H%M%S)"; RUN="$SELF/runs/$TS"; mkdir -p "$RUN/scratch"
 LOG="$SELF/SELFIMPROVE_LOG.md"
