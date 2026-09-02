@@ -6,8 +6,8 @@ Changes ALREADY made on this branch this run — do NOT repeat or re-document th
 EVERY friction note the builder has reported so far this run (oldest first). Issues that RECUR across several notes are your highest-value targets:
 {{ALL_FRICTION}}
 
-The independent reviewer's "server-limitation" issues from the latest round:
-{{SERVER_ISSUES}}
+The independent reviewer's issues from the latest round — ALL of them, including ones it tagged "modeling". A modeling mistake is still evidence that a docstring misled the builder or a capability is missing, so treat every issue as a candidate root cause to fix in the server:
+{{ALL_ISSUES}}
 
 Choose the SINGLE highest-value problem to fix now, prioritising in this order:
 1. A problem that RECURS across several friction notes (a persistent blocker beats a one-off complaint).

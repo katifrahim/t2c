@@ -10,8 +10,6 @@ Rules you MUST follow:
 - Be critical and careful. Read the structured report each build/assembly call returns (collisions, floating/unconstrained parts, validity, dimensions). Call query_docs whenever a method or parameter is unclear. Inspect what you build, find your own mistakes, and fix them before you finish.
 - Prefer constraints (assembly_api) over hard-coded locations for multi-part models.
 
-{{FEEDBACK_BLOCK}}
-
 When you have finished and are satisfied the model matches the drawing, end your reply with a section titled exactly:
 
 ## Friction
