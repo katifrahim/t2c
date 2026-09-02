@@ -27,6 +27,7 @@ RUN="$SELF/runs/$TS"; mkdir -p "$RUN/scratch"
 LOG="$SELF/SELFIMPROVE_LOG.md"
 T2C_TOOLS="mcp__t2c__workplane_api,mcp__t2c__sketch_api,mcp__t2c__assembly_api,mcp__t2c__extension_api,mcp__t2c__query_docs,mcp__t2c__select_model,mcp__t2c__report_learning"
 EDIT_BASH="Bash($PY*),Bash(git add*),Bash(git commit*),Bash(git status*),Bash(git diff*),Bash(git rev-parse*),Bash(git log*),Bash(git restore*),Bash(rm *)"
+VERIFY_TOOLS="$T2C_TOOLS,Bash(git show*),Bash(git diff*),Bash(git log*),Bash(git rev-parse*)"   # verifier: t2c + READ-ONLY git to inspect the editor's diffs
 
 # t2c over stdio from THIS worktree's code (absolute paths -> cwd-independent). Fresh per call
 # => clean store + picks up the editor's latest commit automatically.
@@ -131,9 +132,9 @@ PY
     # ---- VERIFIER — t2c + read src, fresh on the edited code
     export EDITOR_COMMITS="$(git -C "$WT" log --oneline "$ITER_START_HEAD"..HEAD -- mcp_server/ 2>/dev/null)"
     VPROMPT="$(render "$SELF/prompts/verifier.md")"
-    "$CLAUDE" -p "$VPROMPT" --strict-mcp-config --mcp-config "$RUN/mcp_t2c.json" \
+    "$CLAUDE" -p "$VPROMPT" --add-dir "$WT" --strict-mcp-config --mcp-config "$RUN/mcp_t2c.json" \
       --add-dir "$DRAW_DIR" --max-turns 120 \
-      --permission-mode dontAsk --allowedTools "$T2C_TOOLS" \
+      --permission-mode dontAsk --allowedTools "$VERIFY_TOOLS" \
       --output-format json < /dev/null > "$RUN/verifier.$N.$M.raw.json" 2>"$RUN/verifier.$N.$M.err"
     save_transcript "$(sid_of "$RUN/verifier.$N.$M.raw.json")" "$RUN/verifier.$N.$M.transcript.jsonl"
     "$PY" "$SELF/parse_verifier.py" "$RUN/verifier.$N.$M.raw.json" "$RUN/verifier.$N.$M.json" 2>/dev/null
@@ -144,7 +145,11 @@ PY
     if [ "$EDITS_WORK" = "True" ] && [ "$NUNRES" -eq 0 ] 2>/dev/null; then
       log "- iter $N verified: edits work and all server-fixable issues resolved"; break
     fi
-    UNRESOLVED_BLOCK="$(printf 'The verifier checked your previous edits on the live server and reports these STILL UNRESOLVED — address them now (fix or justify a decline):\n%s\n' "$(list_text "$RUN/verifier.$N.$M.json" unresolved)")"
+    UNRESOLVED_BLOCK="$(printf 'The verifier checked your previous edits on the live server and reports these STILL UNRESOLVED — address them now (fix, or justify a decline):\n%s\n' "$(list_text "$RUN/verifier.$N.$M.json" unresolved)")"
+    _declined="$(list_text "$RUN/verifier.$N.$M.json" declined)"
+    [ -n "$_declined" ] && UNRESOLVED_BLOCK="$UNRESOLVED_BLOCK
+The verifier notes these are NOT server problems; be careful before touching them again (the verifier can be wrong — you are the final decision-maker on the code):
+$_declined"
     [ "$M" -eq "$INNER_CAP" ] && log "- iter $N inner cap ($INNER_CAP) hit with $NUNRES unresolved — proceeding to next build"
   done
 done
