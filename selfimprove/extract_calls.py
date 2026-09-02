@@ -12,7 +12,7 @@ Usage:
     extract_calls.py <capture.jsonl> [--drawing PATH] [-o out.json]
     extract_calls.py --selftest
 """
-import argparse, json, sys
+import argparse, json, re, sys
 from datetime import datetime, timezone
 
 
@@ -90,8 +90,21 @@ def main():
         open(a.out, "w", encoding="utf-8").write(text)
     else:
         print(text)
-    if a.friction_out and friction:
-        open(a.friction_out, "w", encoding="utf-8").write(friction)
+    if a.friction_out:
+        # The modeller ends with a fenced ```json {"friction":[...], "build_note":"..."} block.
+        fj = {"friction": [], "build_note": ""}
+        blocks = re.findall(r"```(?:json)?\s*(\{.*?\})\s*```", friction or "", re.DOTALL)
+        if blocks:
+            try:
+                d = json.loads(blocks[-1])
+                if isinstance(d.get("friction"), list):
+                    fj["friction"] = [str(x) for x in d["friction"]]
+                fj["build_note"] = str(d.get("build_note", ""))
+            except json.JSONDecodeError:
+                pass
+        if not fj["friction"] and not fj["build_note"]:      # fallback: no valid block
+            fj["build_note"] = (friction or "").strip().splitlines()[0][:200] if friction else ""
+        open(a.friction_out, "w", encoding="utf-8").write(json.dumps(fj, indent=2, ensure_ascii=False))
 
 
 def _selftest():

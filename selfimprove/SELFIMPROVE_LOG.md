@@ -37,3 +37,43 @@ editor: Documented that `revolve`'s `axisStart/axisEnd` are in **local** workpla
   - [low/modeling] Base mounting slots are modeled as plain through-slots though the drawing labels them M8; block pin seats are Ø8 vs the M10 pin's Ø10 tip.
 editor: Documented the two opposite slot conventions in `sketch_api`/`workplane_api` docstrings — `slot2D(length, diameter)` uses overall end-to-end length (straight = length−diameter, so length must exceed diameter, else the silent `BRep_API: command not done` degenerate failure) while `Sketch.slot(w, h)` 
 - **server edit committed**: `ed943ec583dbec6fda8d31749f15dcdc585f2c57` (was `b929c1a298f591f6bd4984184c31f1a99feb3281`)
+
+## Run 20260902-130319 — drawing: `Assy 6.pdf` — target 95%
+
+### Iter 1 — accuracy=**78%** — t2c calls=75
+- summary: Faithful and near-complete build of the 12-part swivel bearing: all 14 BOM instances are present with correct materials, the spindle (Ø26 collar + Ø20 shaft, real M20×2.5 thread, 100 long), bush (Ø24/Ø18/54, Ø3 oil hole) and bearing block (Ø48/Ø40/Ø48, 54 tall, Ø24 bore, oil hole, two Ø10 pivot seats) are essentially exact, the fork's stepped bore Ø20/26/32/36 and 14+60+14=88 lug layout are correct, fastener sizes (M6×9, M8×11, M10×33, thin M10 lock nuts) are right, and the assembly solves cleanly (residual 0, no collisions/floating) with the correct three perpendicular axes. Points are lost f
+  - [medium/modeling] Base foot length: front views (sheets 2 & 3) dimension the overall foot at 134, but the model foot is only 102 long (base bbox x ±51); the foot is ~32 mm short and the M8 slot positions (±40) are not tied to a drawing dimension.
+  - [medium/modeling] Fork overall height: drawing = 54 (sheet 4), model fork is ~40 tall; the clevis arms are ~14 mm short and the cast profile (R8/R15 fillets, curved 8-thick web) is reduced to plain boxes.
+  - [medium/modeling] Discs (parts 5 & 7) modeled as Ø9-OD / Ø11-OD washers with Ø4.5 / Ø6.5 center holes, whereas the drawing shows small solid brass discs of Ø4.5 and Ø6.5 (2.5 thick) with no bore — OD roughly doubled and spurious holes added.
+  - [low/modeling] Internal threads not modeled: the base M20 boss (should be M20 tapped, ~Ø20) is a plain Ø21 hole, and the knurled-nut bore (should be M20 tapped) is a plain Ø21 hole; a threadedHole/tapHole or internal IsoThread was available.
+  - [low/modeling] Base cast transition simplified: the 6 mm curved web with R4 fillets and the Ø70 pad→Ø46 boss horn are replaced by a smooth cone loft with no ribs/fillets.
+  - [low/modeling] Bearing block left ~3.4° off vertical (rotation_deg ry 86.6 vs 90) by an under-constrained solve; only 6 of 14 parts are constraint-solved, the other 8 (discs, set screws, lock nuts) are placed by literal Location rather than constrained.
+  - [low/modeling] Bearing-block oil-hole Ø3 countersink (Ø3 CSK at 90° to Ø6) omitted; only the Ø6 + Ø10 counterbore was cut.
+  - [low/server-limitation] Set screws (parts 6, 8, 11) are drawn slotted with 60° cone/dog points, but only hex-socket geometry could be produced: extension_api SetScrew exposes exactly one standard_type, 'iso4026' (verified from the tool's own options output). No slotted/cone-point set-screw is available.
+  - [low/server-limitation] workplane_api cylinder() ignores the 'direct' orientation vector — a requested X-axis cylinder (direct=(1,0,0)) returns geometry whose height still lies on Z (reproduced: Ø10×40 came out bbox z ±20). Real bug; the builder had to rebuild all radial features via circle+extrude on YZ/XZ planes (did not
+  - [low/server-limitation] workplane_api box(centered=[True,True,False]) and extrude(both=True) both ignore the Z flag through the JSON layer (reproduced: 2.5×0.9×16 box returned z −8…+8 still centered; circle.extrude(8, both=True) returned z 0…8 one-sided). Real bugs; the builder worked around them so final part sizes are co
+editor 1.1: Committed cleanly. Here's my summary.
+
+## FIXED
+- **Local-frame confusion behind the three "server-limitation" bugs (cylinder `direct`, box `centered`, extrude `both`)** — Empirically, all three work correctly in CadQuery *and* through the server's JSON `_run` dispatch. The reviewer's exact symptom ("Ø10×40 came out on global Z") only reproduces when the primitive is built on a **side plane** (`ri
+- editor 1.1: Committed cleanly. Here's my summary.
+
+## FIXED
+- **Local-frame confusion behind the three "server-limitation" bugs (cylinder `direct`, box `centered`, extrude `both`)** — Empirically, all three work correctly in CadQuery *and* through the server's JSON `_run` dispatch. The reviewer's exact symptom ("Ø10×40 came out on global Z") only reproduces when the primitive is built on a **side plane** (`ri
+- commits so far this iter: 837b88b docs(t2c): document local-frame semantics of primitive direct/centered args [iter 1.1] 
+- verifier 1.1: edits_work=True unresolved=1 declined=7
+editor 1.2: Committed. Working tree now shows only the pre-existing `SELFIMPROVE_LOG.md` change, which I left untouched.
+
+## Summary
+
+**FIXED**
+- **SetScrew capability gap** — documented in `extension_api` that `SetScrew` is `iso4026` **only** (hex-socket, flat-point grub screw): no slotted/hex/square drive and no cone/dog/cup point exists, and instructed the builder to model such set screws from primitives (
+- editor 1.2: Committed. Working tree now shows only the pre-existing `SELFIMPROVE_LOG.md` change, which I left untouched.
+
+## Summary
+
+**FIXED**
+- **SetScrew capability gap** — documented in `extension_api` that `SetScrew` is `iso4026` **only** (hex-socket, flat-point grub screw): no slotted/hex/square drive and no cone/dog/cup point exists, and instructed the builder to model such set screws from primitives (
+- commits so far this iter: 94e0b75 docs(t2c): document SetScrew iso4026-only limit and primitive fallback for slotted/cone-point set screws [iter 1.2] 837b88b docs(t2c): document local-frame semantics of primitive direct/centered args [iter 1.1] 
+- verifier 1.2: edits_work=True unresolved=0 declined=7
+- iter 1 verified: edits work and all server-fixable issues resolved

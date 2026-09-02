@@ -1,27 +1,35 @@
-You are improving the T2C MCP CAD server (Python) in THIS git worktree, so its recurring build failures stop. You edit the server CODE only — you do NOT have the t2c CAD tools; you reproduce behaviour with throwaway `mcp_server/.venv/bin/python` scripts.
+You improve the T2C MCP CAD server (Python) in this git worktree. A critical review of the server's behaviour while it was used to build a CAD model produced the issue list below. Your job: for each issue with a genuine root cause in the server, fix that root cause in the server code, so the same problem stops happening.
 
-Changes ALREADY made on this branch this run — do NOT repeat or re-document these:
+Changes already committed to the server this session — do NOT repeat or re-document these:
 {{PRIOR_COMMITS}}
 
-The reviewer's VERIFIED issue list for this iteration (it already reproduced these against the real server). Each is tagged `root_cause` "server-limitation" or "modeling" — but even a "modeling" issue can have a server root cause (e.g. a docstring that misled the builder), so treat every one as a candidate to fix in the server:
+The issues to address (each tagged `severity` / `root_cause`; even a "modeling"-tagged issue can have a server root cause — e.g. a docstring that misled the build — so weigh every one):
 {{ISSUES}}
 {{UNRESOLVED_BLOCK}}
-Your goal: resolve every issue that has a genuine SERVER root cause, this round. For each, EITHER fix it in the server OR decline it (below). Do the highest-severity / recurring blockers first; a real code FEATURE (a new helper, or turning a silent failure into a raised error) outranks an easy docstring tweak when a hard blocker recurs.
+Your tools: you can edit files under `mcp_server/src/` (and add tests under `mcp_server/tests/`), run Python and pytest, run git, and search the web / library docs. You also have the T2C CAD tools themselves — use them to REPRODUCE how the server behaves.
 
-Fix each issue by editing only `mcp_server/src/` (plus `mcp_server/tests/` for a regression test):
-- **Empirically verify the real behaviour BEFORE you write.** The description can be incomplete or wrong. Write a throwaway script run with `mcp_server/.venv/bin/python` that REPRODUCES the problem and CONFIRMS your fix; document/implement ONLY what you actually observed — never a guess.
-- Docstring fix: the docstring is the model's only guide, so it must be exactly correct — state the real trigger and real symptom (raised error vs silent wrong result).
-- Code fix: implement minimally; add/extend a test in `mcp_server/tests/` that fails without your change.
-- Make a focused commit per fix (several commits this round is fine).
+CRITICAL about the T2C tools you can call: they run the server code as it was when this session started and do NOT reflect edits you make now (no hot-reload). So: use the T2C tools to *reproduce* a reported problem as it originally occurs; but *verify your fix* with a throwaway Python script and `pytest` (a fresh `import` picks up your edit) — the T2C tools will still show the old behaviour after you edit.
 
-DECLINE an issue only if it is genuinely NOT a server problem — e.g. the builder misread a drawing dimension or miscounted parts, and no docstring or code change could have prevented it. State it in your reply as `DECLINE: <issue> — <one-line reason>`. Do not decline something a clearer doc or a new tool could have prevented.
+For each issue, EITHER fix it OR decline it:
+- **Fix:** first REPRODUCE the real behaviour (call the T2C tool and/or run a small Python script and read the exact source) — the issue description can be incomplete or wrong, so document/implement only what you actually observe. Then make the MINIMAL change: correct a docstring (it must be exactly true against real behaviour — cite the real trigger and symptom, raised-error vs silent-wrong-result), or fix the tool logic (implement minimally; add a `mcp_server/tests/` test that fails without your change). Prefer a real capability/clear-error fix over an easy doc tweak when a hard blocker recurs.
+- **Decline:** only if the issue is genuinely NOT a server problem — e.g. the drawing was misread, a part miscounted, or a modelling choice no docstring/code change could have prevented. Do not decline something a clearer doc or a new capability could have prevented.
 
 Rules:
 - Edit only `mcp_server/src/` and `mcp_server/tests/`. Never touch `web/`, `.github/`, `main`, or anything else.
-- No refactors, renames, or speculative features.
+- No refactors, renames, or speculative features. Change only what removes a real blocker.
 - Run `mcp_server/.venv/bin/python -m pytest mcp_server/tests -q`; it must pass.
 - **DELETE every throwaway/scratch file you created.** After committing, `git status` must show nothing but your intended `mcp_server/` changes.
-- Commit with a Conventional Commit message and APPEND the tag `[iter {{ITER_LABEL}}]` to the subject, e.g. `fix(t2c): raise on perpendicular revolve axis [iter {{ITER_LABEL}}]`. No AI attribution, no `Co-Authored-By`.
-- Reply with a short list: what you FIXED (one line each) and what you DECLINED (with reasons).
+- Commit each fix with a Conventional Commit message and APPEND the tag `[iter {{ITER_LABEL}}]` to the subject, e.g. `fix(t2c): raise on perpendicular revolve axis [iter {{ITER_LABEL}}]`. No AI attribution, no `Co-Authored-By`. Several small commits this session is fine.
+- Do not use the report_learning tool.
 
-If NOTHING in the list is a genuine server limitation, make no change, do not commit, and reply exactly `NO-EDIT: <one-line reason>`.
+End your reply with a SINGLE fenced JSON block and nothing after it:
+
+```json
+{
+  "fixed": ["one line per issue you fixed: what you changed and why it is correct"],
+  "declined": ["one line per issue you declined: the issue + why it is not a server problem"],
+  "commits": ["<short-sha> <commit subject>", "..."]
+}
+```
+
+If NOTHING in the list is a genuine server problem, make no change, do not commit, leave `fixed`/`commits` empty and list everything under `declined`.

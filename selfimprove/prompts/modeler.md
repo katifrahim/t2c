@@ -1,17 +1,22 @@
-The file at this path is a technical engineering drawing (2D orthographic views, dimensions, and a title block) of a single 3D object or assembly:
+The file at this path is a technical engineering drawing — 2D orthographic views, dimensions, and a title block — of a single 3D object or assembly:
 
     {{DRAWING}}
 
-Read it carefully and use ONLY the T2C MCP server tools to build a high-fidelity BREP CAD replica of the object it depicts. High fidelity, quality, and dimensional accuracy are crucial — reproduce every dimension, feature (holes, fillets, chamfers, threads, pockets), spatial relationship, and part shown in the drawing, at the correct sizes and positions.
+Read it carefully, then build a high-fidelity BREP CAD replica of the object it depicts, using the T2C CAD tools. High fidelity, quality, and dimensional accuracy are crucial — reproduce every dimension, every feature (holes, fillets, chamfers, threads, pockets, counterbores), every part, and every spatial relationship shown in the drawing, at the correct sizes and positions.
 
-Rules you MUST follow:
-- Use ONLY the T2C MCP tools: workplane_api, sketch_api, assembly_api, extension_api, query_docs, select_model. Do NOT write raw Python, shell, or CLI code, and do NOT edit any files — that is cheating and is disallowed. Build the model purely through T2C tool calls.
+Rules:
+- Build the model ONLY through the T2C CAD tools (workplane, sketch, assembly, ready-made parts, etc.). Do not write or run code, and do not edit files — build purely through the tools.
 - Work in millimetres unless the drawing states otherwise.
-- Be critical and careful. Read the structured report each build/assembly call returns (collisions, floating/unconstrained parts, validity, dimensions). Call query_docs whenever a method or parameter is unclear. Inspect what you build, find your own mistakes, and fix them before you finish.
-- Prefer constraints (assembly_api) over hard-coded locations for multi-part models.
+- Be critical and careful. Read the structured report each build/assembly call returns (collisions, floating/unconstrained parts, validity, dimensions) and act on it. When a method or parameter is unclear, look up its documentation before guessing. Inspect what you build, find your own mistakes, and fix them before you finish.
+- Prefer constraints over hard-coded locations for multi-part models.
 
-When you have finished and are satisfied the model matches the drawing, end your reply with a section titled exactly:
+When you are satisfied the model faithfully matches the drawing, end your reply with a SINGLE fenced JSON block — and nothing after it — reporting every place where a T2C CAD tool or its documentation made high fidelity hard or impossible: a wrong, missing, or misleading parameter/behaviour doc; a tool that misbehaved or errored where it should have worked; or a capability that was simply absent (so you had to approximate or work around it). Be specific — name the tool, the method, the parameter, and the exact symptom you observed. Put every such point here (this is the complete record of tool/doc friction, so include anything you noted while building). Use an empty list only if nothing hindered you.
 
-## Friction
-
-List, as a few short bullets, anything where a T2C tool limitation, a missing capability, a bug, or unclear / insufficient / incorrect tool documentation made it hard or impossible to reach higher fidelity. Be specific (name the tool, the method, the parameter, the doc line). If nothing blocked you, write exactly "None". This note is used to improve the T2C server, so it matters.
+```json
+{
+  "friction": [
+    "specific tool/method/parameter problem + the exact symptom that blocked or slowed faithful modelling"
+  ],
+  "build_note": "one line: what you built, and any part you could not fully reproduce and why"
+}
+```
