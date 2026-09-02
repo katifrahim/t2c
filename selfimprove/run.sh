@@ -67,7 +67,7 @@ for ((N=1; N<=MAX_ITERS; N++)); do
   MPROMPT="$(render "$SELF/prompts/modeler.md")"
   ( cd "$RUN/scratch" && "$CLAUDE" -p "$MPROMPT" \
       --strict-mcp-config --mcp-config "$RUN/mcp_t2c.json" \
-      --add-dir "$DRAW_DIR" --max-turns 200 \
+      --add-dir "$DRAW_DIR" --max-turns "${MODELER_TURNS:-200}" \
       --permission-mode dontAsk --allowedTools "$T2C_TOOLS" \
       --output-format stream-json --verbose < /dev/null \
       > "$RUN/modeller.$N.transcript.jsonl" 2>"$RUN/modeller.$N.err" )
