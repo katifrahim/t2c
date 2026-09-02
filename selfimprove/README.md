@@ -1,34 +1,46 @@
 # t2c self-improvement loop (serial MVP)
 
-One worktree = one drawing = one branch. A headless agent builds a CAD replica of a
-drawing with the **t2c MCP server only**; a fresh-context agent grades it against the
-drawing; then an editor agent fixes the **server** root cause (a modeling mistake is a
-symptom of a weak/misleading tool or doc), verifies with `pytest`, and commits to this
-branch. Rebuild on the improved code. Loop until ≥ target or no server fixes remain.
+One worktree = one drawing = one branch. Four fresh-context `claude -p` agents improve the
+**t2c server** through a build → judge → (editor↔verifier) loop until the model scores ≥95%
+or no server fixes remain. Everything a build reveals is fuel for improving the server.
 
-There is **no LLM orchestrator** — `run.sh` (a bash script) sequences the three agents.
-They share nothing in memory; they hand off through files in `runs/<ts>/` (a blackboard)
-and through git (the server code). The flow is always **build → judge → editor**, never
-judge → modeler: fixing one model would patch the symptom, not the server that misled it.
+There is **no LLM orchestrator** — `run.sh` (a bash script) sequences the agents. They share
+nothing in memory; they hand off through files in `runs/<ts>/` (a blackboard) and through
+git. The flow is always **build → judge → editor**, never judge → modeler: fixing one model
+would patch the symptom, not the server that misled it.
 
-## Roles (each a separate, fresh `claude -p` process — isolated context)
-- **Modeler** (`prompts/modeler.md`) — MCP-only, cannot edit code (`dontAsk` + t2c tools).
-  Uses a fresh **stdio** t2c spawned from THIS worktree's code, so every build runs the
-  latest committed edits with a clean store. Ends with a `## Friction` note — its own
-  report of where a capability/doc was missing (signal the tool calls alone don't show).
-- **Judge** (`prompts/judge.md`) — fresh context, sees only the drawing + `calls.json`
-  (reasoning stripped, so it stays unbiased). Emits prose + a fenced JSON verdict
+## Roles & access matrix (each a separate, fresh `claude -p`, isolated context)
+| Agent | t2c MCP | Read `mcp_server/src` | Edit code |
+|---|---|---|---|
+| **Modeller** | ✅ (stdio, worktree code) | ❌ enforced (scratch cwd) | ❌ |
+| **Judge** | ✅ | ✅ read | ❌ |
+| **Editor** | ❌ | ✅ read+write | ✅ |
+| **Verifier** | ✅ | ✅ read | ❌ |
+
+- **Modeller** (`prompts/modeler.md`) — builds with t2c only; runs in a scratch cwd so it
+  cannot read the server source. Ends with a `## Friction` self-report of missing/wrong
+  tools/docs (a signal the tool calls alone don't reveal). Fresh stdio t2c per build ⇒ clean
+  store + auto-loads the editor's latest commit.
+- **Judge** (`prompts/judge.md`) — sees drawing + `calls.json` (reasoning stripped, so it
+  stays unbiased) **+ friction**. It has t2c + read-source, so it **empirically verifies**
+  each friction claim (reproduce via t2c / read source) before folding it into one issue
+  list. `accuracy` stays purely geometric. Output: prose + fenced JSON
   `{accuracy, summary, issues[{severity,description,root_cause}]}`.
-- **Editor** (`prompts/editor.md`) — the only code-editor. Gets ALL judge issues + the
-  full friction history this run + the run's prior commits; picks the highest-value
-  RECURRING blocker; **empirically reproduces** the behaviour before writing (the builder
-  often misdiagnoses); fixes `mcp_server/src/`, runs `pytest`, deletes scratch, commits.
+- **Editor** (`prompts/editor.md`) — the only code-editor, **no t2c**. Gets the judge's
+  verified issue list (+ any verifier `unresolved` + prior commits). Fixes each server root
+  cause or **declines** genuine non-server issues; empirically reproduces before writing;
+  runs `pytest`, deletes scratch, commits `[iter N.M]`.
+- **Verifier** (`prompts/verifier.md`) — independent check (t2c + read-source, no edit).
+  Confirms the editor's edits actually work on the live server and classifies each issue
+  `resolved` / `unresolved` / `declined`. Drives the inner loop until nothing is `unresolved`.
 
 ## Artifacts per iteration (`runs/<ts>/`, git-ignored)
-`model.N.jsonl` (modeler's full stream-json transcript) · `calls.N.json` (extracted t2c
-calls, judge input) · `friction.N.md` (modeler's self-report) · `judge.N.{raw,}.json` +
-`judge.N.transcript.jsonl` · `editor.N.json` + `editor.N.transcript.jsonl`. The
-`*.transcript.jsonl` are Claude Code's own full session logs, copied in for debugging.
+`modeller.N.transcript.jsonl` (stream-json = full transcript + extractor input) ·
+`calls.N.json` (extracted t2c calls) · `friction.N.md` (modeller self-report, → judge) ·
+`judge.N.{raw.json,json,transcript.jsonl}` · `editor.N.M.{json,transcript.jsonl}` ·
+`verifier.N.M.{raw.json,json,transcript.jsonl}`. Non-modeller `*.transcript.jsonl` are
+Claude Code's own session logs, copied in by `session_id`. Commit tag `[iter N.M]` joins
+commits ↔ transcripts ↔ artifacts at merge time.
 
 ## Why a per-worktree venv
 `t2c_mcp` is editable-installed via a meta-path finder that maps `src` → **main's** src,
