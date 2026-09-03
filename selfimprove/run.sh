@@ -61,7 +61,7 @@ jlen(){ "$PY" -c "import json,sys;v=json.load(open(sys.argv[1])).get(sys.argv[2]
 issues_text(){ "$PY" - "$1" <<'PY'
 import json,sys
 d=json.load(open(sys.argv[1]))
-print("\n".join(f"- [{i.get('severity')}/{i.get('root_cause')}] {(i.get('description') or '').strip()}" for i in d.get("issues",[])) or "(no issues)")
+print("\n".join(f"- [{i.get('severity')}/{i.get('source') or i.get('root_cause')}] {(i.get('description') or '').strip()}" for i in d.get("issues",[])) or "(no issues)")
 PY
 }
 list_text(){ "$PY" -c "import json,sys;print(chr(10).join('- '+str(x) for x in json.load(open(sys.argv[1])).get(sys.argv[2],[])))" "$1" "$2" 2>/dev/null; }
@@ -141,7 +141,8 @@ for ((N=1; N<=MAX_ITERS; N++)); do
       --output-format json < /dev/null > "$RUN/verifier.$N.$M.raw.json" 2>"$RUN/verifier.$N.$M.err"
     save_transcript "$(sid_of "$RUN/verifier.$N.$M.raw.json")" "$RUN/verifier.$N.$M.transcript.jsonl"
     "$PY" "$SELF/parse_json_block.py" "$RUN/verifier.$N.$M.raw.json" "$RUN/verifier.$N.$M.json" >/dev/null 2>&1
-    logw verifier "$N" "$M" "$RUN/verifier.$N.$M.transcript.jsonl" "$RUN/verifier.$N.$M.json"
+    NCOMMITS="$(git -C "$WT" rev-list --count "$ITER_START_HEAD"..HEAD -- mcp_server/ 2>/dev/null || echo 0)"
+    logw verifier "$N" "$M" "$RUN/verifier.$N.$M.transcript.jsonl" "$RUN/verifier.$N.$M.json" "$NISS" "$NCOMMITS"
 
     EDITS_WORK="$(jget "$RUN/verifier.$N.$M.json" edits_work False)"
     NUNRES="$(jlen "$RUN/verifier.$N.$M.json" unresolved)"

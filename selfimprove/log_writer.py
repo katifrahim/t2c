@@ -9,7 +9,7 @@ Sections (argv[2]) and their args:
   judge         N  TRANSCRIPT  JUDGE_JSON
   inner_header  N  M
   editor        N  M  TRANSCRIPT  EDITOR_JSON  N_ISSUES  N_UNRESOLVED  COMMITS
-  verifier      N  M  TRANSCRIPT  VERIFIER_JSON
+  verifier      N  M  TRANSCRIPT  VERIFIER_JSON  N_ISSUES  N_COMMITS
   outcome       OUTCOME  BEST  N
 """
 import json, os, sys
@@ -62,14 +62,14 @@ def main():
         N, tr, jp = a
         j = load(jp)
         iss = j.get("issues", [])
-        issue_lines = [f"[{i.get('severity')} / {i.get('root_cause')}] {(i.get('description') or '').strip()}" for i in iss]
+        issue_lines = [f"[{i.get('severity')} / {i.get('source') or i.get('root_cause')}] {(i.get('description') or '').strip()}" for i in iss]
         out = [
             "", "#### Judge",
             f"- **Input:** drawing + `calls.{N}.json` + `friction.{N}.json`",
             f"- **Verification effort:** {usage(tr)}",
             f"- **Accuracy: {j.get('accuracy', '?')}%**",
             f"- **Justification:** {(j.get('justification') or j.get('summary') or '(none)').strip()}",
-            f"- **Issues (severity / root-cause — description) [{len(iss)}]:**",
+            f"- **Issues (severity / source — description) [{len(iss)}]:**",
             bullets(issue_lines, "  "),
         ]
 
@@ -90,11 +90,12 @@ def main():
         ]
 
     elif section == "verifier":
-        N, M, tr, vp = a
+        N, M, tr, vp, nissues, ncommits = a
         v = load(vp)
         r, u, d = v.get("resolved", []), v.get("unresolved", []), v.get("declined", [])
         out = [
             "", "##### Verifier",
+            f"- **Input:** {nissues} issues · {ncommits} commit(s) under review",
             f"- **Actions:** {usage(tr)}",
             f"- **edits_work:** {v.get('edits_work', False)}",
             f"- **Resolved [{len(r)}]:**", bullets(r, "  "),
