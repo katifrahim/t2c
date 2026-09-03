@@ -86,11 +86,11 @@ for ((N=1; N<=MAX_ITERS; N++)); do
       > "$RUN/modeller.$N.transcript.jsonl" 2>"$RUN/modeller.$N.err" )
   "$PY" "$SELF/extract_calls.py" "$RUN/modeller.$N.transcript.jsonl" --drawing "$DRAWING" \
     -o "$RUN/calls.$N.json" --friction-out "$RUN/friction.$N.json" 2>>"$RUN/modeller.$N.err"
-  "$PY" "$SELF/export_model.py" "$RUN/calls.$N.json" "$RUN/CAD.$N.step" 2>>"$RUN/modeller.$N.err" || true
+  "$PY" "$SELF/export_model.py" "$RUN/calls.$N.json" "$RUN/CAD.$N.step" "$RUN/geometry.$N.json" 2>>"$RUN/modeller.$N.err" || true
   logw modeller "$N" "$RUN/calls.$N.json" "$RUN/friction.$N.json" "$RUN/modeller.$N.transcript.jsonl" "$RUN/CAD.$N.step"
 
   # ---- ② JUDGE — t2c + docs + read src; scores geometry, verifies friction → one issue list
-  export CALLS_JSON="$RUN/calls.$N.json" FRICTION_MD="$RUN/friction.$N.json"
+  export CALLS_JSON="$RUN/calls.$N.json" FRICTION_MD="$RUN/friction.$N.json" GEOMETRY_JSON="$RUN/geometry.$N.json"
   "$CLAUDE" -p "$(render "$SELF/prompts/judge.md")" --model "$MODEL" \
     --strict-mcp-config --mcp-config "$RUN/mcp_t2c_ctx7.json" --add-dir "$DRAW_DIR" \
     --max-turns 120 --permission-mode dontAsk --allowedTools "$JUDGE_TOOLS" \

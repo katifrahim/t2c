@@ -8,7 +8,9 @@ export the active model. Best-effort: a call that failed for the modeller is ski
 fatal — we just want the final geometry the modeller ended up with.
 
 Runs the replay in a spawn child with a timeout, because a bad OCCT op can hang
-uninterruptibly from Python. Usage: export_model.py <calls.N.json> <out.step>
+uninterruptibly from Python. With a 3rd arg it also writes inspect_model(detail="standard")
+geometry of the reconstructed model (exact bbox / features / per-part placement) for the judge.
+Usage: export_model.py <calls.N.json> <out.step> [geometry.json]
 """
 import asyncio, inspect, json, multiprocessing as mp, os, sys
 
@@ -17,7 +19,7 @@ if _MCP_SRC not in sys.path:
     sys.path.insert(0, _MCP_SRC)
 
 
-async def _replay_and_export(calls, out):
+async def _replay_and_export(calls, out, geom_out=None):
     import t2c_mcp as _mcp
     import cadquery as cq
     _mcp._sessions.pop(_mcp._LOCAL_SID, None)                 # fresh workspace
@@ -48,25 +50,32 @@ async def _replay_and_export(calls, out):
     else:
         shape = obj.val() if hasattr(obj, "val") else obj
         cq.exporters.export(shape, out, exportType="STEP")
+    if geom_out:                                             # exact geometry for the judge (best-effort)
+        try:
+            g = await _mcp.inspect_model(ctx=None, detail="standard")
+            open(geom_out, "w").write(g if isinstance(g, str) else json.dumps(g, indent=2))
+        except Exception:
+            pass
     return ran, sess.current
 
 
-def _worker(calls, out, q):
+def _worker(calls, out, geom_out, q):
     try:
-        ran, active = asyncio.run(_replay_and_export(calls, out))
+        ran, active = asyncio.run(_replay_and_export(calls, out, geom_out))
         q.put(("ok", f"replayed {ran} calls, active='{active}'"))
     except Exception as e:
         q.put(("err", str(e)[:200]))
 
 
 def main():
-    if len(sys.argv) != 3:
-        print("usage: export_model.py <calls.json> <out.step>"); return 1
+    if len(sys.argv) < 3:
+        print("usage: export_model.py <calls.json> <out.step> [geometry.json]"); return 1
     calls_path, out = sys.argv[1], sys.argv[2]
+    geom_out = sys.argv[3] if len(sys.argv) > 3 else None
     calls = json.load(open(calls_path)).get("calls", [])
     ctx = mp.get_context("spawn")
     q = ctx.Queue()
-    p = ctx.Process(target=_worker, args=(calls, out, q))
+    p = ctx.Process(target=_worker, args=(calls, out, geom_out, q))
     p.start(); p.join(240)
     if p.is_alive():
         p.terminate(); p.join()

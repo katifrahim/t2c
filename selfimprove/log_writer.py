@@ -65,7 +65,7 @@ def main():
         issue_lines = [f"[{i.get('severity')} / {i.get('source') or i.get('root_cause')}] {(i.get('description') or '').strip()}" for i in iss]
         out = [
             "", "#### Judge",
-            f"- **Input:** drawing + `calls.{N}.json` + `friction.{N}.json`",
+            f"- **Input:** drawing + `calls.{N}.json` + `friction.{N}.json` + `geometry.{N}.json`",
             f"- **Verification effort:** {usage(tr)}",
             f"- **Accuracy: {j.get('accuracy', '?')}%**",
             f"- **Justification:** {(j.get('justification') or j.get('summary') or '(none)').strip()}",
