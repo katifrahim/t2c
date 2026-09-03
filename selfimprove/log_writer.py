@@ -48,7 +48,7 @@ def main():
         c = load(calls_p); f = load(fric_p)
         cad_rel = os.path.relpath(cad, os.path.dirname(os.path.dirname(log))) if cad and os.path.exists(cad) else "(export failed)"
         out = [
-            "", "#### ① Modeller",
+            "", "#### Modeller",
             f"- **Input:** drawing `{os.path.basename(c.get('drawing') or '?')}`",
             f"- **Output:** model `{cad_rel}` · {c.get('n_calls', 0)} t2c calls · "
             f"{c.get('n_errors', 0)} t2c errors · {len(f.get('friction', []))} friction points",
@@ -64,7 +64,7 @@ def main():
         iss = j.get("issues", [])
         issue_lines = [f"[{i.get('severity')} / {i.get('root_cause')}] {(i.get('description') or '').strip()}" for i in iss]
         out = [
-            "", "#### ② Judge",
+            "", "#### Judge",
             f"- **Input:** drawing + `calls.{N}.json` + `friction.{N}.json`",
             f"- **Verification effort:** {usage(tr)}",
             f"- **Accuracy: {j.get('accuracy', '?')}%**",
@@ -81,7 +81,7 @@ def main():
         e = load(ep)
         clines = [x for x in commits.splitlines() if x.strip()]
         out = [
-            "", "##### ③ Editor",
+            "", "##### Editor",
             f"- **Input:** {nissues} issues" + (f", {nunres} unresolved carried over" if int(nunres or 0) else ""),
             f"- **Actions:** {usage(tr)}",
             f"- **Fixed [{len(e.get('fixed', []))}]:**", bullets(e.get("fixed", []), "  "),
@@ -94,7 +94,7 @@ def main():
         v = load(vp)
         r, u, d = v.get("resolved", []), v.get("unresolved", []), v.get("declined", [])
         out = [
-            "", "##### ④ Verifier",
+            "", "##### Verifier",
             f"- **Actions:** {usage(tr)}",
             f"- **edits_work:** {v.get('edits_work', False)}",
             f"- **Resolved [{len(r)}]:**", bullets(r, "  "),

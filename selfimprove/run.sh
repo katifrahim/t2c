@@ -26,6 +26,7 @@ export ENABLE_TOOL_SEARCH=0                             # load all t2c schemas u
 DRAWING="${1:-/Users/apple/Desktop/Assy/Assy 6.pdf}"
 DRAW_DIR="$(dirname "$DRAWING")"
 TARGET="${TARGET:-95}"; STAGNANT="${STAGNANT:-4}"; INNER_CAP="${INNER_CAP:-4}"; MAX_ITERS="${MAX_ITERS:-12}"
+MODEL="${MODEL:-claude-opus-5[1m]}"   # all agents run on Opus 5, 1M context (the `opus` alias is stale → 4.8)
 
 TS="$(date +%Y%m%d-%H%M%S)"; RUN="$SELF/runs/$TS"; mkdir -p "$RUN/scratch"
 LOG="$SELF/SELFIMPROVE_LOG.md"
@@ -78,7 +79,7 @@ for ((N=1; N<=MAX_ITERS; N++)); do
   # ---- ① MODELLER — prod-like, t2c only; cwd=scratch so it CANNOT read mcp_server/src.
   #      NEVER add `--add-dir "$WT"` here or that wall breaks.
   export DRAWING; MPROMPT="$(render "$SELF/prompts/modeler.md")"
-  ( cd "$RUN/scratch" && "$CLAUDE" -p "$MPROMPT" \
+  ( cd "$RUN/scratch" && "$CLAUDE" -p "$MPROMPT" --model "$MODEL" \
       --strict-mcp-config --mcp-config "$RUN/mcp_t2c.json" --add-dir "$DRAW_DIR" \
       --max-turns "${MODELER_TURNS:-200}" --permission-mode dontAsk --allowedTools "$MODELER_TOOLS" \
       --output-format stream-json --verbose < /dev/null \
@@ -90,7 +91,7 @@ for ((N=1; N<=MAX_ITERS; N++)); do
 
   # ---- ② JUDGE — t2c + docs + read src; scores geometry, verifies friction → one issue list
   export CALLS_JSON="$RUN/calls.$N.json" FRICTION_MD="$RUN/friction.$N.json"
-  "$CLAUDE" -p "$(render "$SELF/prompts/judge.md")" \
+  "$CLAUDE" -p "$(render "$SELF/prompts/judge.md")" --model "$MODEL" \
     --strict-mcp-config --mcp-config "$RUN/mcp_t2c_ctx7.json" --add-dir "$DRAW_DIR" \
     --max-turns 120 --permission-mode dontAsk --allowedTools "$JUDGE_TOOLS" \
     --output-format json < /dev/null > "$RUN/judge.$N.raw.json" 2>"$RUN/judge.$N.err"
@@ -118,7 +119,7 @@ for ((N=1; N<=MAX_ITERS; N++)); do
     logw inner_header "$N" "$M"
 
     # ③ EDITOR — t2c repro + code edit + docs (no report_learning)
-    "$CLAUDE" -p "$(render "$SELF/prompts/editor.md")" \
+    "$CLAUDE" -p "$(render "$SELF/prompts/editor.md")" --model "$MODEL" \
       --strict-mcp-config --mcp-config "$RUN/mcp_t2c_ctx7.json" --add-dir "$WT" \
       --max-turns 100 --permission-mode acceptEdits --allowedTools "$EDITOR_TOOLS" \
       --output-format json < /dev/null > "$RUN/editor.$N.$M.raw.json" 2>"$RUN/editor.$N.$M.err"
@@ -134,7 +135,7 @@ for ((N=1; N<=MAX_ITERS; N++)); do
 
     # ④ VERIFIER — t2c (fresh, edited code) + read src + read-only git
     export EDITOR_COMMITS
-    "$CLAUDE" -p "$(render "$SELF/prompts/verifier.md")" \
+    "$CLAUDE" -p "$(render "$SELF/prompts/verifier.md")" --model "$MODEL" \
       --strict-mcp-config --mcp-config "$RUN/mcp_t2c_ctx7.json" --add-dir "$WT" --add-dir "$DRAW_DIR" \
       --max-turns 120 --permission-mode dontAsk --allowedTools "$VERIFY_TOOLS" \
       --output-format json < /dev/null > "$RUN/verifier.$N.$M.raw.json" 2>"$RUN/verifier.$N.$M.err"
