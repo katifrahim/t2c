@@ -61,7 +61,7 @@ jlen(){ "$PY" -c "import json,sys;v=json.load(open(sys.argv[1])).get(sys.argv[2]
 issues_text(){ "$PY" - "$1" <<'PY'
 import json,sys
 d=json.load(open(sys.argv[1]))
-print("\n".join(f"- [{i.get('severity')}/{i.get('source') or i.get('root_cause')}] {(i.get('description') or '').strip()}" for i in d.get("issues",[])) or "(no issues)")
+print("\n".join(f"- [{i.get('severity')}] {(i.get('description') or '').strip()}" for i in d.get("issues",[])) or "(no issues)")
 PY
 }
 list_text(){ "$PY" -c "import json,sys;print(chr(10).join('- '+str(x) for x in json.load(open(sys.argv[1])).get(sys.argv[2],[])))" "$1" "$2" 2>/dev/null; }
@@ -135,6 +135,7 @@ for ((N=1; N<=MAX_ITERS; N++)); do
 
     # ④ VERIFIER — t2c (fresh, edited code) + read src + read-only git
     export EDITOR_COMMITS
+    export VERIFY_CHECKLIST="$(list_text "$RUN/editor.$N.$M.json" verify)"; [ -z "$VERIFY_CHECKLIST" ] && export VERIFY_CHECKLIST="(the author listed no specific checks)"
     "$CLAUDE" -p "$(render "$SELF/prompts/verifier.md")" --model "$MODEL" \
       --strict-mcp-config --mcp-config "$RUN/mcp_t2c_ctx7.json" --add-dir "$WT" --add-dir "$DRAW_DIR" \
       --max-turns 120 --permission-mode dontAsk --allowedTools "$VERIFY_TOOLS" \
