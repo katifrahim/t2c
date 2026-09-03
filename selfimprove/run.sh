@@ -22,6 +22,12 @@ case "$(readlink -f "$CLAUDE" 2>/dev/null)" in
      exit 1 ;;
 esac
 export ENABLE_TOOL_SEARCH=0                             # load all t2c schemas up front, untruncated
+# Opus 5 does heavy extended thinking (counts toward the OUTPUT-token cap). Its planning turns hit a
+# ~64K thinking ceiling (observed 63.9K in two failed runs), blowing Claude Code's 32K default and
+# killing the modeller before any build call. Opus 5 accepts a larger cap (verified 128K ok); set it
+# well above the ~64K ceiling so the turn fits. Override via the same env var; lower it for speed/cost
+# (or add `--effort medium` to the agents) if the heavy thinking is too slow.
+export CLAUDE_CODE_MAX_OUTPUT_TOKENS="${CLAUDE_CODE_MAX_OUTPUT_TOKENS:-128000}"
 
 DRAWING="${1:-/Users/apple/Desktop/Assy/Assy 6.pdf}"
 DRAW_DIR="$(dirname "$DRAWING")"
