@@ -3,7 +3,7 @@ You improve the T2C MCP CAD server (Python) in this git worktree. The issue list
 Changes already committed to the server this session — do NOT repeat or re-document these:
 {{PRIOR_COMMITS}}
 
-The issues to address (each tagged `severity` / `source`, where source is provenance: "friction-derived" = a problem already reproduced against the server, "comparison-derived" = a drawing-vs-model discrepancy. ANY issue — whatever its source — may have a server root cause, e.g. a tool docstring or tool code that needs to change, so determine the real cause of each one yourself and weigh them all):
+The issues to address (each has a `severity`). Any issue may or may not have a genuine server root cause — a tool docstring or tool code that needs to change — so determine the real cause of each one yourself and weigh them all:
 {{ISSUES}}
 
 {{UNRESOLVED_BLOCK}}
