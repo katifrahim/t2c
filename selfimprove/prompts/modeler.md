@@ -1,16 +1,14 @@
-The file at this path is a technical engineering drawing — 2D orthographic views, dimensions, and a title block — of a single 3D object or assembly:
-
+The file at this path is the 2D technical engineering drawing of a 3D object:
     {{DRAWING}}
 
-Read it carefully, then build a high-fidelity BREP CAD replica of the object it depicts, using the T2C CAD tools. High fidelity, quality, and dimensional accuracy are crucial — reproduce every dimension, every feature (holes, fillets, chamfers, threads, pockets, counterbores), every part, and every spatial relationship shown in the drawing, at the correct sizes and positions.
+Read it carefully, then use the available T2C CAD tools to build a highly-detailed, high-fidelity BREP CAD replica of the object it depicts. The model you build should be an exact replica of the object shown in the drawing. High fidelity, quality, and accuracy are crucial. Reproduce every dimension, every feature, every part, and every spatial relationship shown in the drawing, at the correct sizes and positions. Aim for 100% accuracy.
 
-Rules:
-- Build the model ONLY through the T2C CAD tools (workplane, sketch, assembly, ready-made parts, etc.). Do not write or run code, and do not edit files — build purely through the tools.
-- Work in millimetres unless the drawing states otherwise.
-- Be critical and careful. Read the structured report each build/assembly call returns (collisions, floating/unconstrained parts, validity, dimensions) and act on it. When a method or parameter is unclear, look up its documentation before guessing. Inspect what you build, find your own mistakes, and fix them before you finish.
-- Prefer constraints over hard-coded locations for multi-part models.
+Rule:
+- Build the model ONLY through the T2C CAD tools. Do not write/run any external code or edit files (that's cheating).
 
-When you are satisfied the model faithfully matches the drawing, end your reply with a SINGLE fenced JSON block — and nothing after it — reporting every place where a T2C CAD tool or its documentation made high fidelity hard or impossible: a wrong, missing, or misleading parameter/behaviour doc; a tool that misbehaved or errored where it should have worked; or a capability that was simply absent (so you had to approximate or work around it). Be specific — name the tool, the method, the parameter, and the exact symptom you observed. Put every such point here (this is the complete record of tool/doc friction, so include anything you noted while building). Use an empty list only if nothing hindered you.
+When you are satisfied the model accurately matches the drawing, end your reply with a SINGLE fenced JSON block (and nothing after it) reporting every place where a T2C CAD tool or its documentation made high-fidelity hard or impossible: tool operations/capabilities or tool docs that was wrong, missing, misleading, misbehaving or insufficient. You can also include useful things that you didn't know at the beginning, but later learned through trial and error, and wish that you had known upfront to avoid unnecessary friction. This basically covers everything that the report_learning tool is for, but you need to prioritize this JSON block instead of that tool.
+
+Be specific (name the tool, the method, the parameter, and the exact symptom you observed). Put every such pain point here (this is the complete record of tool/doc friction, so include anything you noted while building). Use an empty list only if nothing hindered you. Never emit placeholder strings.
 
 ```json
 {
