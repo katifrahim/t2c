@@ -20,7 +20,7 @@ Rules:
 - Edit only `mcp_server/src/` and `mcp_server/tests/`. Never touch `web/`, `.github/`, `main`, or anything else.
 - No refactors, renames, or speculative features. Change only what removes a real blocker and fixes the issues.
 - Run `mcp_server/.venv/bin/python -m pytest mcp_server/tests -q`; it must pass.
-- **DELETE every throwaway/scratch file you created.** After committing, `git status` must show nothing but your intended `mcp_server/` changes.
+- **DELETE every throwaway/scratch file you created, and never end your turn with uncommitted work.** Commit as you go rather than saving it all for the end; `git status` must be clean when you finish. Uncommitted changes are still live for everyone downstream but appear in no diff, so they get reviewed by nobody.
 - Commit each fix with a Conventional Commit message and APPEND the tag `[iter {{ITER_LABEL}}]` to the subject, e.g. `fix(t2c): raise on perpendicular revolve axis [iter {{ITER_LABEL}}]`. No AI attribution, no `Co-Authored-By`. Several small commits this session is fine. 
 - Commit messages must be objective & state facts, e.g. what you changed. No subjectivity or bias, because we haven't yet verified anything on the updated server.
 - Do not use the report_learning tool.

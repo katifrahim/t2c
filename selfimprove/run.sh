@@ -173,20 +173,29 @@ for ((N=1; N<=MAX_ITERS; N++)); do
     "$PY" "$SELF/parse_json_block.py" "$RUN/editor.$N.$M.raw.json" "$RUN/editor.$N.$M.json" >/dev/null 2>&1
     limit_hit "$RUN/editor.$N.$M.raw.json"
     [ -n "$ABORT" ] && break
+
+    # INVARIANT: the tree is clean once the editor's turn is over.
+    # Uncommitted changes are LIVE — the verifier's t2c server, the next modeller's server and
+    # every later iteration all read the working tree — while no commit records them. So the
+    # verifier would review a diff that omits them, and the next iteration would silently build
+    # against a server nobody reviewed. A prompt cannot guarantee this: an editor killed mid-work
+    # never reaches its commit, and that is precisely the case that leaves the tree dirty.
+    # Committing on its behalf is what makes the changes reviewable instead of invisible.
+    if [ -n "$(git -C "$WT" status --porcelain -- mcp_server/ 2>/dev/null)" ]; then
+      git -C "$WT" add -A mcp_server/ >/dev/null 2>&1
+      git -C "$WT" commit -q -m "fix(t2c): editor changes left uncommitted [iter $ITER_LABEL]" \
+        -m "Committed by run.sh, not by the editor: it ended its turn with these changes still in the working tree. They were already live for every later agent; recording them keeps the verifier's review and the next iteration's baseline honest." >/dev/null 2>&1
+      logw note "editor $N.$M ended with an unclean tree — run.sh committed its changes so the verifier reviews them instead of them being silently live"
+    fi
+
     HEAD_AFTER="$(git -C "$WT" rev-parse HEAD)"
     EDITOR_COMMITS="$(git -C "$WT" log --oneline "$ITER_START_HEAD"..HEAD -- mcp_server/ 2>/dev/null)"
     logw editor "$N" "$M" "$RUN/editor.$N.$M.transcript.jsonl" "$RUN/editor.$N.$M.json" "$NISS" "$NUNRES" "$(git -C "$WT" log --oneline "$HEAD_BEFORE"..HEAD -- mcp_server/ 2>/dev/null)"
 
+    # HEAD can only be unchanged now if the editor genuinely touched nothing (it declined every
+    # issue). There is then nothing for the verifier to check, so end the inner loop.
     if [ "$HEAD_BEFORE" = "$HEAD_AFTER" ]; then
-      # An editor that edited but never committed did NOT complete its task, and its changes stay
-      # live in the tree — silently altering the server for later iterations with no commit to
-      # show for it. Say so loudly instead of logging a bare "no commit".
-      if [ -n "$(git -C "$WT" status --porcelain -- mcp_server/ 2>/dev/null)" ]; then
-        logw note "editor $N.$M left UNCOMMITTED changes under mcp_server/ — they are live for later iterations but recorded by no commit; review \`git status\` before trusting anything downstream"
-      else
-        logw note "editor $N.$M made no commit and changed nothing — ending inner loop"
-      fi
-      break
+      logw note "editor $N.$M changed nothing — ending inner loop"; break
     fi
 
     # ④ VERIFIER — t2c (fresh, edited code) + read src + read-only git
