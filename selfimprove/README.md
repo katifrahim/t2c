@@ -63,10 +63,14 @@ action) · `log_writer.py` (all markdown formatting) · `render_prompt.py` (`{{V
 ## Run
 ```bash
 selfimprove/setup_worktree.sh                 # once per worktree
-selfimprove/run.sh "/Users/apple/Desktop/Assy/Assy 6.pdf"
+selfimprove/run.sh "/Users/apple/Desktop/assy/Assy 6"   # a FOLDER of page images (PNG/JPG)
 ```
 Tunables (env): `TARGET` (95), `STAGNANT` (4), `INNER_CAP` (4), `MAX_ITERS` (12),
-`MODELER_TURNS` (200, lower for a fast smoke), `CONTEXT7_API_KEY` (optional). No ports/tokens.
+`MODELER_TURNS` (200, lower for a fast smoke), `EFFORT` (medium — see run.sh for why).
+`CONTEXT7_API_KEY` is read from the git-ignored `.env` at the worktree root.
+
+The drawing is a **folder of page images**, one image per sheet (no PDFs: `Read` on a PDF needs
+poppler and a `pages` argument, and returns a bare size stub without them).
 
 ## Deferred (designed-for, not built)
 Parallel worktrees (one drawing each, human-merged); a 24/7 queue driver.

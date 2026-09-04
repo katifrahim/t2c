@@ -22,15 +22,38 @@ case "$(readlink -f "$CLAUDE" 2>/dev/null)" in
      exit 1 ;;
 esac
 export ENABLE_TOOL_SEARCH=0                             # load all t2c schemas up front, untruncated
-# Opus 5 does heavy extended thinking (counts toward the OUTPUT-token cap). Its planning turns hit a
-# ~64K thinking ceiling (observed 63.9K in two failed runs), blowing Claude Code's 32K default and
-# killing the modeller before any build call. Opus 5 accepts a larger cap (verified 128K ok); set it
-# well above the ~64K ceiling so the turn fits. Override via the same env var; lower it for speed/cost
-# (or add `--effort medium` to the agents) if the heavy thinking is too slow.
-export CLAUDE_CODE_MAX_OUTPUT_TOKENS="${CLAUDE_CODE_MAX_OUTPUT_TOKENS:-128000}"
 
-DRAWING="${1:-/Users/apple/Desktop/Assy/Assy 6.pdf}"
-DRAW_DIR="$(dirname "$DRAWING")"
+# --- secrets: CONTEXT7_API_KEY lives in the (git-ignored) .env at the worktree root --------------
+[ -f "$WT/.env" ] && set -a && . "$WT/.env" && set +a
+
+# --- thinking / effort --------------------------------------------------------------------------
+# Opus 5 is ADAPTIVE-THINKING-ONLY: there is no thinking budget to set, only `effort` (soft guidance)
+# and max_tokens (a hard ceiling on thinking + response text combined). An 11-condition matrix on the
+# real modeller task found that peak thinking-tokens-in-one-turn separates success from failure with
+# NO overlap:   built (7 runs): 24,050-56,500 peak   ·   built nothing (4 runs): 63,950-68,700 peak
+# Effort is the dominant lever: same prompt, same cap, high -> 0 build calls, medium -> 40.
+EFFORT="${EFFORT:-medium}"              # low|medium|high|xhigh|max
+#
+# DELIBERATELY NOT SET (previously `export CLAUDE_CODE_MAX_OUTPUT_TOKENS=128000`): raising the ceiling
+# was a symptomatic fix for over-thinking. It let a runaway planning turn burn silently for 25 min
+# instead of failing fast, and at medium effort the DEFAULT cap beat 128K (40 vs 20 build calls) while
+# sitting further below the ~60K cliff. Leave it unset unless you have measured a reason not to.
+# export CLAUDE_CODE_MAX_OUTPUT_TOKENS="${CLAUDE_CODE_MAX_OUTPUT_TOKENS:-128000}"
+#
+# ALSO DELIBERATELY NOT SET: MAX_THINKING_TOKENS. Claude Code maps it to the legacy
+# thinking:{type:"enabled",budget_tokens:N} API which Opus 5 does not support; verified ignored
+# (a 10,000 budget still peaked at 66,350 thinking tokens and built nothing).
+
+# --- the drawing: a FOLDER of page images (PNG/JPG), one image per sheet. No PDFs. ---------------
+DRAWING="${1:-/Users/apple/Desktop/assy/Assy 6}"
+[ -d "$DRAWING" ] || { echo "run.sh STOPPED: '$DRAWING' is not a directory."
+  echo "  The loop takes a FOLDER of page images, e.g. '/Users/apple/Desktop/assy/Assy 6'."; exit 1; }
+DRAW_DIR="$DRAWING"                                     # agents get read access to the folder itself
+DRAWING_IMAGES="$(find "$DRAWING" -maxdepth 1 -type f \( -iname '*.png' -o -iname '*.jpg' -o -iname '*.jpeg' \) | sort -V | sed 's/^/    /')"
+[ -n "$DRAWING_IMAGES" ] || { echo "run.sh STOPPED: no .png/.jpg sheets in '$DRAWING'."; exit 1; }
+N_SHEETS="$(printf '%s\n' "$DRAWING_IMAGES" | grep -c .)"
+DRAWING_NAME="$(basename "$DRAWING")"
+export DRAWING_IMAGES N_SHEETS DRAWING_NAME
 TARGET="${TARGET:-95}"; STAGNANT="${STAGNANT:-4}"; INNER_CAP="${INNER_CAP:-4}"; MAX_ITERS="${MAX_ITERS:-12}"
 MODEL="${MODEL:-claude-opus-5[1m]}"   # all agents run on Opus 5, 1M context (the `opus` alias is stale → 4.8)
 
@@ -73,7 +96,7 @@ PY
 list_text(){ "$PY" -c "import json,sys;print(chr(10).join('- '+str(x) for x in json.load(open(sys.argv[1])).get(sys.argv[2],[])))" "$1" "$2" 2>/dev/null; }
 
 RUN_START_HEAD="$(git -C "$WT" rev-parse HEAD)"
-{ echo ""; echo "## Run $TS — drawing: \`$(basename "$DRAWING")\` — target ${TARGET}%"; } >> "$LOG"
+{ echo ""; echo "## Run $TS — drawing: \`$DRAWING_NAME\` ($N_SHEETS sheets) — effort ${EFFORT} — target ${TARGET}%"; } >> "$LOG"
 echo "run dir: $RUN"
 
 best=-1; stag=0; outcome="max-iters"
@@ -85,7 +108,7 @@ for ((N=1; N<=MAX_ITERS; N++)); do
   # ---- ① MODELLER — prod-like, t2c only; cwd=scratch so it CANNOT read mcp_server/src.
   #      NEVER add `--add-dir "$WT"` here or that wall breaks.
   export DRAWING; MPROMPT="$(render "$SELF/prompts/modeler.md")"
-  ( cd "$RUN/scratch" && "$CLAUDE" -p "$MPROMPT" --model "$MODEL" \
+  ( cd "$RUN/scratch" && "$CLAUDE" -p "$MPROMPT" --model "$MODEL" --effort "$EFFORT" \
       --strict-mcp-config --mcp-config "$RUN/mcp_t2c.json" --add-dir "$DRAW_DIR" \
       --max-turns "${MODELER_TURNS:-200}" --permission-mode dontAsk --allowedTools "$MODELER_TOOLS" \
       --output-format stream-json --verbose < /dev/null \
@@ -97,7 +120,7 @@ for ((N=1; N<=MAX_ITERS; N++)); do
 
   # ---- ② JUDGE — t2c + docs + read src; scores geometry, verifies friction → one issue list
   export CALLS_JSON="$RUN/calls.$N.json" FRICTION_MD="$RUN/friction.$N.json" GEOMETRY_JSON="$RUN/geometry.$N.json"
-  "$CLAUDE" -p "$(render "$SELF/prompts/judge.md")" --model "$MODEL" \
+  "$CLAUDE" -p "$(render "$SELF/prompts/judge.md")" --model "$MODEL" --effort "$EFFORT" \
     --strict-mcp-config --mcp-config "$RUN/mcp_t2c_ctx7.json" --add-dir "$DRAW_DIR" \
     --max-turns 120 --permission-mode dontAsk --allowedTools "$JUDGE_TOOLS" \
     --output-format json < /dev/null > "$RUN/judge.$N.raw.json" 2>"$RUN/judge.$N.err"
@@ -125,7 +148,7 @@ for ((N=1; N<=MAX_ITERS; N++)); do
     logw inner_header "$N" "$M"
 
     # ③ EDITOR — t2c repro + code edit + docs (no report_learning)
-    "$CLAUDE" -p "$(render "$SELF/prompts/editor.md")" --model "$MODEL" \
+    "$CLAUDE" -p "$(render "$SELF/prompts/editor.md")" --model "$MODEL" --effort "$EFFORT" \
       --strict-mcp-config --mcp-config "$RUN/mcp_t2c_ctx7.json" --add-dir "$WT" \
       --max-turns 100 --permission-mode acceptEdits --allowedTools "$EDITOR_TOOLS" \
       --output-format json < /dev/null > "$RUN/editor.$N.$M.raw.json" 2>"$RUN/editor.$N.$M.err"
@@ -142,7 +165,7 @@ for ((N=1; N<=MAX_ITERS; N++)); do
     # ④ VERIFIER — t2c (fresh, edited code) + read src + read-only git
     export EDITOR_COMMITS
     export VERIFY_CHECKLIST="$(list_text "$RUN/editor.$N.$M.json" verify)"; [ -z "$VERIFY_CHECKLIST" ] && export VERIFY_CHECKLIST="(the author listed no specific checks)"
-    "$CLAUDE" -p "$(render "$SELF/prompts/verifier.md")" --model "$MODEL" \
+    "$CLAUDE" -p "$(render "$SELF/prompts/verifier.md")" --model "$MODEL" --effort "$EFFORT" \
       --strict-mcp-config --mcp-config "$RUN/mcp_t2c_ctx7.json" --add-dir "$WT" --add-dir "$DRAW_DIR" \
       --max-turns 120 --permission-mode dontAsk --allowedTools "$VERIFY_TOOLS" \
       --output-format json < /dev/null > "$RUN/verifier.$N.$M.raw.json" 2>"$RUN/verifier.$N.$M.err"

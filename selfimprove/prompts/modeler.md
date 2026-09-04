@@ -1,7 +1,11 @@
-The file at this path is the 2D technical engineering drawing of a 3D object:
-    {{DRAWING}}
+These {{N_SHEETS}} images are the sheets of ONE 2D technical engineering drawing of a 3D object:
+{{DRAWING_IMAGES}}
 
-Read it carefully, then use the available T2C CAD tools to build a highly-detailed, high-fidelity BREP CAD replica of the object it depicts. The model you build should be an exact replica of the object shown in the drawing. High fidelity, quality, and accuracy are crucial. Reproduce every dimension, every feature, every part, and every spatial relationship shown in the drawing, at the correct sizes and positions. Aim for 100% accuracy.
+Read every sheet with the Read tool before you build anything. Each sheet carries information the
+others do not — typically a general-assembly sheet plus per-part detail sheets — so a part's true
+dimensions are often on a different sheet from where it first appears.
+
+Read them carefully, then use the available T2C CAD tools to build a highly-detailed, high-fidelity BREP CAD replica of the object it depicts. The model you build should be an exact replica of the object shown in the drawing. High fidelity, quality, and accuracy are crucial. Reproduce every dimension, every feature, every part, and every spatial relationship shown in the drawing, at the correct sizes and positions. Aim for 100% accuracy.
 
 Rule:
 - Build the model ONLY through the T2C CAD tools. Do not write/run any external code or edit files (that's cheating).

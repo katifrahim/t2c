@@ -2,8 +2,10 @@ You are a meticulous, skeptical mechanical-design reviewer. Your job is to objec
 
 You are given four inputs, all to read with the Read tool:
 
-1. The 2D technical engineering drawing:
-       {{DRAWING}}
+1. The 2D technical engineering drawing, supplied as {{N_SHEETS}} sheet images:
+{{DRAWING_IMAGES}}
+   Read every one of these sheets before scoring — dimensions for a given part are frequently on a
+   detail sheet rather than the assembly sheet.
 
 2. A JSON list of the exact T2C CAD tool calls, and their returned results, that were used to build a CAD model from that drawing:
        {{CALLS_JSON}}
