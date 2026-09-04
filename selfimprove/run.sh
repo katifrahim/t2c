@@ -55,7 +55,11 @@ N_SHEETS="$(printf '%s\n' "$DRAWING_IMAGES" | grep -c .)"
 DRAWING_NAME="$(basename "$DRAWING")"
 export DRAWING_IMAGES N_SHEETS DRAWING_NAME
 TARGET="${TARGET:-95}"; STAGNANT="${STAGNANT:-4}"; INNER_CAP="${INNER_CAP:-4}"; MAX_ITERS="${MAX_ITERS:-12}"
-MODEL="${MODEL:-claude-opus-5[1m]}"   # all agents run on Opus 5, 1M context (the `opus` alias is stale → 4.8)
+# Opus 5 for the two agents that READ THE DRAWING IMAGES (it is markedly better at images);
+# Opus 4.8 for the two text-only agents, which cuts usage substantially. The `opus` alias is stale
+# on this binary (resolves to 4.8), so both ids are explicit.
+MODEL_VISION="${MODEL_VISION:-claude-opus-5[1m]}"   # modeller, judge  — read the sheet images
+MODEL_TEXT="${MODEL_TEXT:-claude-opus-4-8}"         # editor, verifier — text/code only
 
 TS="$(date +%Y%m%d-%H%M%S)"; RUN="$SELF/runs/$TS"; mkdir -p "$RUN/scratch"
 LOG="$SELF/SELFIMPROVE_LOG.md"
@@ -95,6 +99,15 @@ PY
 }
 list_text(){ "$PY" -c "import json,sys;print(chr(10).join('- '+str(x) for x in json.load(open(sys.argv[1])).get(sys.argv[2],[])))" "$1" "$2" 2>/dev/null; }
 
+# Stop the whole run once the Anthropic account is out of usage: every later agent just returns the
+# same "spend limit" text, so the loop would otherwise grind through its remaining iterations
+# producing empty artifacts and finish by reporting a best accuracy that means nothing.
+ABORT=""
+# Only the tail of a stream-json transcript is scanned: the terminal result record is the last
+# line, and a 5MB build transcript could otherwise match the phrase in ordinary content.
+limit_hit(){ { case "$1" in *.jsonl) tail -c 4000 "$1" 2>/dev/null;; *) cat "$1" 2>/dev/null;; esac; } \
+  | grep -qiE "spend limit|usage limit|usage-credits|exceed your account" && ABORT="spend-limit"; }
+
 RUN_START_HEAD="$(git -C "$WT" rev-parse HEAD)"
 { echo ""; echo "## Run $TS — drawing: \`$DRAWING_NAME\` ($N_SHEETS sheets) — effort ${EFFORT} — target ${TARGET}%"; } >> "$LOG"
 echo "run dir: $RUN"
@@ -108,11 +121,13 @@ for ((N=1; N<=MAX_ITERS; N++)); do
   # ---- ① MODELLER — prod-like, t2c only; cwd=scratch so it CANNOT read mcp_server/src.
   #      NEVER add `--add-dir "$WT"` here or that wall breaks.
   export DRAWING; MPROMPT="$(render "$SELF/prompts/modeler.md")"
-  ( cd "$RUN/scratch" && "$CLAUDE" -p "$MPROMPT" --model "$MODEL" --effort "$EFFORT" \
+  ( cd "$RUN/scratch" && "$CLAUDE" -p "$MPROMPT" --model "$MODEL_VISION" --effort "$EFFORT" \
       --strict-mcp-config --mcp-config "$RUN/mcp_t2c.json" --add-dir "$DRAW_DIR" \
-      --max-turns "${MODELER_TURNS:-200}" --permission-mode dontAsk --allowedTools "$MODELER_TOOLS" \
+      --permission-mode dontAsk --allowedTools "$MODELER_TOOLS" \
       --output-format stream-json --verbose < /dev/null \
       > "$RUN/modeller.$N.transcript.jsonl" 2>"$RUN/modeller.$N.err" )
+  limit_hit "$RUN/modeller.$N.transcript.jsonl"
+  [ -n "$ABORT" ] && break
   "$PY" "$SELF/extract_calls.py" "$RUN/modeller.$N.transcript.jsonl" --drawing "$DRAWING" \
     -o "$RUN/calls.$N.json" --friction-out "$RUN/friction.$N.json" 2>>"$RUN/modeller.$N.err"
   "$PY" "$SELF/export_model.py" "$RUN/calls.$N.json" "$RUN/CAD.$N.step" "$RUN/geometry.$N.json" 2>>"$RUN/modeller.$N.err" || true
@@ -120,12 +135,14 @@ for ((N=1; N<=MAX_ITERS; N++)); do
 
   # ---- ② JUDGE — t2c + docs + read src; scores geometry, verifies friction → one issue list
   export CALLS_JSON="$RUN/calls.$N.json" FRICTION_MD="$RUN/friction.$N.json" GEOMETRY_JSON="$RUN/geometry.$N.json"
-  "$CLAUDE" -p "$(render "$SELF/prompts/judge.md")" --model "$MODEL" --effort "$EFFORT" \
+  "$CLAUDE" -p "$(render "$SELF/prompts/judge.md")" --model "$MODEL_VISION" --effort "$EFFORT" \
     --strict-mcp-config --mcp-config "$RUN/mcp_t2c_ctx7.json" --add-dir "$DRAW_DIR" \
-    --max-turns 120 --permission-mode dontAsk --allowedTools "$JUDGE_TOOLS" \
+    --permission-mode dontAsk --allowedTools "$JUDGE_TOOLS" \
     --output-format json < /dev/null > "$RUN/judge.$N.raw.json" 2>"$RUN/judge.$N.err"
   save_transcript "$(sid_of "$RUN/judge.$N.raw.json")" "$RUN/judge.$N.transcript.jsonl"
   "$PY" "$SELF/parse_json_block.py" "$RUN/judge.$N.raw.json" "$RUN/judge.$N.json" >/dev/null 2>&1
+  limit_hit "$RUN/judge.$N.raw.json"
+  [ -n "$ABORT" ] && break
   ACC="$(jget "$RUN/judge.$N.json" accuracy -1)"
   logw judge "$N" "$RUN/judge.$N.transcript.jsonl" "$RUN/judge.$N.json"
   echo "accuracy=$ACC"
@@ -148,32 +165,44 @@ for ((N=1; N<=MAX_ITERS; N++)); do
     logw inner_header "$N" "$M"
 
     # ③ EDITOR — t2c repro + code edit + docs (no report_learning)
-    "$CLAUDE" -p "$(render "$SELF/prompts/editor.md")" --model "$MODEL" --effort "$EFFORT" \
+    "$CLAUDE" -p "$(render "$SELF/prompts/editor.md")" --model "$MODEL_TEXT" --effort "$EFFORT" \
       --strict-mcp-config --mcp-config "$RUN/mcp_t2c_ctx7.json" --add-dir "$WT" \
-      --max-turns 100 --permission-mode acceptEdits --allowedTools "$EDITOR_TOOLS" \
+      --permission-mode acceptEdits --allowedTools "$EDITOR_TOOLS" \
       --output-format json < /dev/null > "$RUN/editor.$N.$M.raw.json" 2>"$RUN/editor.$N.$M.err"
     save_transcript "$(sid_of "$RUN/editor.$N.$M.raw.json")" "$RUN/editor.$N.$M.transcript.jsonl"
     "$PY" "$SELF/parse_json_block.py" "$RUN/editor.$N.$M.raw.json" "$RUN/editor.$N.$M.json" >/dev/null 2>&1
+    limit_hit "$RUN/editor.$N.$M.raw.json"
+    [ -n "$ABORT" ] && break
     HEAD_AFTER="$(git -C "$WT" rev-parse HEAD)"
     EDITOR_COMMITS="$(git -C "$WT" log --oneline "$ITER_START_HEAD"..HEAD -- mcp_server/ 2>/dev/null)"
     logw editor "$N" "$M" "$RUN/editor.$N.$M.transcript.jsonl" "$RUN/editor.$N.$M.json" "$NISS" "$NUNRES" "$(git -C "$WT" log --oneline "$HEAD_BEFORE"..HEAD -- mcp_server/ 2>/dev/null)"
 
     if [ "$HEAD_BEFORE" = "$HEAD_AFTER" ]; then
-      logw note "editor $N.$M made no commit — ending inner loop"; break
+      # An editor that edited but never committed did NOT complete its task, and its changes stay
+      # live in the tree — silently altering the server for later iterations with no commit to
+      # show for it. Say so loudly instead of logging a bare "no commit".
+      if [ -n "$(git -C "$WT" status --porcelain -- mcp_server/ 2>/dev/null)" ]; then
+        logw note "editor $N.$M left UNCOMMITTED changes under mcp_server/ — they are live for later iterations but recorded by no commit; review \`git status\` before trusting anything downstream"
+      else
+        logw note "editor $N.$M made no commit and changed nothing — ending inner loop"
+      fi
+      break
     fi
 
     # ④ VERIFIER — t2c (fresh, edited code) + read src + read-only git
     export EDITOR_COMMITS
     export VERIFY_CHECKLIST="$(list_text "$RUN/editor.$N.$M.json" verify)"; [ -z "$VERIFY_CHECKLIST" ] && export VERIFY_CHECKLIST="(the author listed no specific checks)"
-    "$CLAUDE" -p "$(render "$SELF/prompts/verifier.md")" --model "$MODEL" --effort "$EFFORT" \
+    "$CLAUDE" -p "$(render "$SELF/prompts/verifier.md")" --model "$MODEL_TEXT" --effort "$EFFORT" \
       --strict-mcp-config --mcp-config "$RUN/mcp_t2c_ctx7.json" --add-dir "$WT" --add-dir "$DRAW_DIR" \
-      --max-turns 120 --permission-mode dontAsk --allowedTools "$VERIFY_TOOLS" \
+      --permission-mode dontAsk --allowedTools "$VERIFY_TOOLS" \
       --output-format json < /dev/null > "$RUN/verifier.$N.$M.raw.json" 2>"$RUN/verifier.$N.$M.err"
     save_transcript "$(sid_of "$RUN/verifier.$N.$M.raw.json")" "$RUN/verifier.$N.$M.transcript.jsonl"
     "$PY" "$SELF/parse_json_block.py" "$RUN/verifier.$N.$M.raw.json" "$RUN/verifier.$N.$M.json" >/dev/null 2>&1
     NCOMMITS="$(git -C "$WT" rev-list --count "$ITER_START_HEAD"..HEAD -- mcp_server/ 2>/dev/null || echo 0)"
     logw verifier "$N" "$M" "$RUN/verifier.$N.$M.transcript.jsonl" "$RUN/verifier.$N.$M.json" "$NISS" "$NCOMMITS"
 
+    limit_hit "$RUN/verifier.$N.$M.raw.json"
+    [ -n "$ABORT" ] && break
     EDITS_WORK="$(jget "$RUN/verifier.$N.$M.json" edits_work False)"
     NUNRES="$(jlen "$RUN/verifier.$N.$M.json" unresolved)"
     if [ "$EDITS_WORK" = "True" ] && [ "$NUNRES" -eq 0 ] 2>/dev/null; then break; fi
@@ -183,7 +212,9 @@ for ((N=1; N<=MAX_ITERS; N++)); do
 The re-check considers these NOT server problems; be careful before touching them again (it can be wrong — you decide):
 $_dec"
   done
+  [ -n "$ABORT" ] && { outcome="$ABORT"; break; }
 done
 
+[ -n "$ABORT" ] && { outcome="$ABORT"; logw note "run stopped early: Anthropic usage/spend limit reached"; }
 logw outcome "$outcome" "$best" "$N"
 echo "DONE: $outcome (best=$best%). Log: $LOG  Artifacts: $RUN"
