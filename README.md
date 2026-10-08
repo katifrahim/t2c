@@ -12,7 +12,7 @@ Conversational 2D and 3D parametric modeling, powered by structured CAD tools.
 ![CadQuery](https://img.shields.io/badge/CadQuery-2.7-2C8C57)
 ![MCP](https://img.shields.io/badge/MCP-HTTP%20%2B%20stdio-6554C0)
 
-[Quick start](#quick-start) · [Features](#features) · [Architecture](#architecture) · [Data model](#data-model) · [Development](#development)
+[Features](#features) · [Technology](#technology) · [Architecture](#architecture) · [Data model](#data-model) · [Quick start](#quick-start)
 
 </div>
 
@@ -60,16 +60,16 @@ Turn engineering drawings into 3D CAD models. Image2CAD is currently in **beta**
   </thead>
   <tbody>
     <tr>
-      <td align="center" valign="middle"><a href="docs/assets/image2cad/assy6-drawing.png"><img src="docs/assets/image2cad/assy6-drawing.png" alt="Assembly 6: sectional engineering drawing of a swivel bearing" width="420" /></a><br /><strong>Assembly 6 · Swivel bearing</strong></td>
-      <td align="center" valign="middle"><a href="docs/assets/image2cad/assy6-model.png"><img src="docs/assets/image2cad/assy6-model.png" alt="AI-generated 3D CAD model of the Assembly 6 swivel bearing" width="420" /></a><br /><strong>Generated swivel bearing</strong></td>
+      <td align="center" valign="middle"><a href="docs/assets/image2cad/assy6-drawing.png"><img src="docs/assets/image2cad/assy6-drawing.png" alt="12 Part Assembly: sectional engineering drawing of a swivel bearing" width="420" /></a><br /><strong>12 Part Assembly · Swivel bearing</strong></td>
+      <td align="center" valign="middle"><a href="docs/assets/image2cad/assy6-model.png"><img src="docs/assets/image2cad/assy6-model.png" alt="AI-generated 3D CAD model of the 12 Part Assembly swivel bearing" width="420" /></a><br /><strong>Generated swivel bearing</strong></td>
     </tr>
     <tr>
-      <td align="center" valign="middle"><a href="docs/assets/image2cad/assy24-drawing.png"><img src="docs/assets/image2cad/assy24-drawing.png" alt="Assembly 24: sectional engineering drawing of a stop valve" width="420" /></a><br /><strong>Assembly 24 · Stop valve</strong></td>
-      <td align="center" valign="middle"><a href="docs/assets/image2cad/assy24-model.png"><img src="docs/assets/image2cad/assy24-model.png" alt="AI-generated 3D CAD model of the Assembly 24 stop valve" width="420" /></a><br /><strong>Generated stop valve</strong></td>
+      <td align="center" valign="middle"><a href="docs/assets/image2cad/assy24-drawing.png"><img src="docs/assets/image2cad/assy24-drawing.png" alt="17 Part Assembly: sectional engineering drawing of a stop valve" width="420" /></a><br /><strong>17 Part Assembly · Stop valve</strong></td>
+      <td align="center" valign="middle"><a href="docs/assets/image2cad/assy24-model.png"><img src="docs/assets/image2cad/assy24-model.png" alt="AI-generated 3D CAD model of the 17 Part Assembly stop valve" width="420" /></a><br /><strong>Generated stop valve</strong></td>
     </tr>
     <tr>
-      <td align="center" valign="middle"><a href="docs/assets/image2cad/part-drawing.png"><img src="docs/assets/image2cad/part-drawing.png" alt="Dimensioned engineering drawing of a sheet metal pivot bracket" width="420" /></a><br /><strong>Part · Sheet metal pivot bracket</strong></td>
-      <td align="center" valign="middle"><a href="docs/assets/image2cad/part-model.png"><img src="docs/assets/image2cad/part-model.png" alt="AI-generated 3D CAD model of the sheet metal pivot bracket" width="420" /></a><br /><strong>Generated pivot bracket</strong></td>
+      <td align="center" valign="middle"><a href="docs/assets/image2cad/part-drawing.png"><img src="docs/assets/image2cad/part-drawing.png" alt="Single Part: dimensioned engineering drawing of a sheet metal pivot bracket" width="420" /></a><br /><strong>Single Part · Sheet metal pivot bracket</strong></td>
+      <td align="center" valign="middle"><a href="docs/assets/image2cad/part-model.png"><img src="docs/assets/image2cad/part-model.png" alt="AI-generated 3D CAD model of the Single Part sheet metal pivot bracket" width="420" /></a><br /><strong>Generated pivot bracket</strong></td>
     </tr>
   </tbody>
 </table>
@@ -78,13 +78,13 @@ Turn engineering drawings into 3D CAD models. Image2CAD is currently in **beta**
 
 - [Features](#features)
 - [Technology](#technology)
-- [Quick start](#quick-start)
-- [Accounts and persistence](#accounts-and-persistence)
-- [Configuration](#configuration)
 - [Architecture](#architecture)
 - [Data model](#data-model)
 - [MCP tools and standalone use](#mcp-tools-and-standalone-use)
 - [Repository map](#repository-map)
+- [Quick start](#quick-start)
+- [Accounts and persistence](#accounts-and-persistence)
+- [Configuration](#configuration)
 - [Development](#development)
 - [Deployment](#deployment)
 - [Troubleshooting and limitations](#troubleshooting-and-limitations)
@@ -125,155 +125,6 @@ CAD geometry remains B-rep internally; the browser preview and mesh exports are 
 | Testing and tooling | pytest, Ruff, Node's test runner, promptfoo evaluations, GitHub Actions |
 
 Dependency declarations live in [web/package.json](web/package.json) and [mcp_server/pyproject.toml](mcp_server/pyproject.toml). The Python package pins the CAD engine and extension commits; the web app includes an npm lockfile.
-
-## Quick start
-
-The shortest path runs the web app and CAD backend locally **without Supabase**. It skips account checks, persistent chat/model storage, and credit enforcement. You still need an OpenRouter API key with access to the models configured in [web/lib/models.js](web/lib/models.js).
-
-### 1. Prerequisites
-
-- Git and Node.js **22** with npm (the version used by the deployment workflow).
-- Python **3.13.7 or newer within 3.13**; the package requires `>=3.13.7,<3.14`.
-- A platform supported by the pinned CadQuery/OCP wheels, or Docker using the Linux amd64 image described below.
-
-Commands below use a POSIX shell and start from the repository root unless noted.
-
-```bash
-git clone https://github.com/katifrahim/t2c.git
-cd t2c
-
-python3.13 -m venv mcp_server/.venv
-mcp_server/.venv/bin/python -m pip install --upgrade pip
-mcp_server/.venv/bin/python -m pip install -e './mcp_server[dev]'
-
-cd web
-npm ci
-cp .env.local.example .env.local
-```
-
-### 2. Configure the web app
-
-Edit `web/.env.local` and fill in:
-
-```dotenv
-BACKEND_URL=http://localhost:8080
-OPENROUTER_API_KEY=your-openrouter-api-key
-```
-
-Leave `MCP_TOKEN` empty for this loopback-only setup and leave Supabase settings unset. Keep real keys in local environment files, outside version control.
-
-### 3. Start both services
-
-In one terminal, from the repository root:
-
-```bash
-MCP_TRANSPORT=http MCP_HOST=127.0.0.1 PORT=8080 \
-  mcp_server/.venv/bin/python mcp_server/src/t2c_mcp.py
-```
-
-In another terminal, from the repository root:
-
-```bash
-cd web
-npm run dev
-```
-
-Open **[localhost:3000](http://localhost:3000)**. Check backend health with:
-
-```bash
-curl http://localhost:8080/health
-# {"status":"ok"}
-```
-
-> [!NOTE]
-> Set `PORT=8080` explicitly: the Python HTTP server defaults to **9000**, while the web app's default backend URL uses **8080**. The backend defaults to **stdio** unless `MCP_TRANSPORT=http` is set.
-
-### 4. Build your first part
-
-Try:
-
-> Create a 60 × 40 × 6 mm rectangular plate with four 5 mm through-holes, each centered 8 mm from its two nearest edges. Round the four outside vertical edges with a 2 mm fillet.
-
-Follow up with a dimensional change, attach a reference image, or select geometry in the viewer to refer to it in chat. Use **Export** to download the active model. Use **Import** to start from a `.step` or `.stp` file.
-
-## Accounts and persistence
-
-Add Supabase to enable authentication, durable histories, CAD snapshots, and usage balances.
-
-### 1. Configure Supabase
-
-Create a Supabase project and add these values to `web/.env.local` (they are additional to the supplied example file):
-
-```dotenv
-NEXT_PUBLIC_SUPABASE_URL=https://your-project.supabase.co
-NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY=your-publishable-key
-
-# Server-only: needed for template preview storage and maintenance scripts.
-SUPABASE_SECRET_KEY=your-server-secret-key
-```
-
-Use the publishable key for the browser and a server secret/service-role key for `SUPABASE_SECRET_KEY`. Never give a secret key a `NEXT_PUBLIC_` prefix.
-
-### 2. Apply the SQL scripts
-
-For a fresh project, run these files in the Supabase SQL editor **in this order**:
-
-| Order | Script | Purpose |
-| --- | --- | --- |
-| 1 | [schema.sql](web/supabase/schema.sql) | Chats, messages, indexes, and access policies |
-| 2 | [credits.sql](web/supabase/credits.sql) | Credit balances, usage events, signup grants, and charging function |
-| 3 | [langfuse.sql](web/supabase/langfuse.sql) | Trace ID column and the charging function signature used by the app |
-| 4 | [snapshots.sql](web/supabase/snapshots.sql) | Legacy snapshot table, still queried as a restore fallback |
-| 5 | [snapshots-storage.sql](web/supabase/snapshots-storage.sql) | Private `cad-snapshots` bucket and owner-scoped storage policies |
-| 6 | [templates.sql](web/supabase/templates.sql) | pgvector, template recipes, and semantic retrieval |
-| 7 | [templates-library.sql](web/supabase/templates-library.sql) | Library metadata, preferences, listing, and preview authorization |
-| 8 | [templates-storage.sql](web/supabase/templates-storage.sql) | Private `cad-templates` preview bucket |
-
-> [!IMPORTANT]
-> Apply `langfuse.sql` after `credits.sql` **even if tracing is disabled**: it installs the `charge_usage` signature the application calls. If you rerun `credits.sql`, rerun `langfuse.sql` afterward to remove the obsolete overload.
-
-### 3. Configure authentication and restart
-
-In Supabase Auth, set the local site URL to `http://localhost:3000` and allow the application's callback and reset destinations:
-
-- `http://localhost:3000/auth/callback` (including the signup `?next=/` variant)
-- `http://localhost:3000/reset`
-
-Enable email/password sign-in; configure Google OAuth if you want the Google sign-in option. Optional email templates are in [web/supabase/email-templates/](web/supabase/email-templates/). Add your deployed origin's corresponding URLs when hosting the app.
-
-Restart Next.js after updating the environment. Sign up, build a part, then reopen the chat to check that both messages and geometry restore.
-
-## Configuration
-
-### Web application — `web/.env.local`
-
-| Variable | Purpose |
-| --- | --- |
-| `BACKEND_URL` | Python backend origin; defaults to `http://localhost:8080`. |
-| `OPENROUTER_API_KEY` | Required for model calls. |
-| `MCP_TOKEN` | Server-to-server bearer token; must match the backend when configured. |
-| `NEXT_PUBLIC_SUPABASE_URL` | Enables Supabase-backed authentication and persistence. |
-| `NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY` | Browser-safe Supabase project key. |
-| `SUPABASE_SECRET_KEY` | Server-only access for template preview blobs and maintenance scripts. |
-| `GOOGLE_GENERATIVE_AI_API_KEY` | Enables template embeddings and semantic retrieval; omit to use chat without retrieval. |
-| `TEMPLATE_MATCH_THRESHOLD` | Template similarity threshold; defaults to `0.5`. |
-| `LANGFUSE_PUBLIC_KEY`, `LANGFUSE_SECRET_KEY`, `LANGFUSE_BASE_URL` | Optional tracing. Set the base URL for your Langfuse region. |
-| `NEXT_PUBLIC_POSTHOG_KEY`, `NEXT_PUBLIC_POSTHOG_HOST` | Optional product analytics; the current proxy configuration targets the US region. |
-| `NEXT_PUBLIC_ANALYTICS_DEV` | Set to `true` to opt into analytics capture during development. |
-| `TURN_SOFT_LIMIT_MS` | Agent turn soft time limit; defaults to `240000` ms, with client continuation support. |
-
-### Python backend — process environment
-
-| Variable | Default | Purpose |
-| --- | --- | --- |
-| `MCP_TRANSPORT` | `stdio` | Set to `http` for the web application. |
-| `MCP_HOST` | `0.0.0.0` | HTTP bind address; use `127.0.0.1` for local-only access. |
-| `PORT` / `MCP_PORT` | `9000` | HTTP port; `PORT` takes precedence. |
-| `MCP_TOKEN` | Unset | Enables bearer checks on MCP and protected CAD routes. |
-| `SESSION_TTL_SECONDS` | `3600` | Idle in-memory session eviction interval. |
-| `SNAPSHOT_KEEP_RECENT` | `10` | Number of recent auto-named objects retained by snapshot pruning. |
-
-The backend reads process environment variables; it does not automatically load `web/.env.local`.
 
 ## Architecture
 
@@ -517,6 +368,155 @@ t2c/
 ├── selfimprove/               Drawing-driven server improvement workflow
 └── .github/workflows/         CI, automation, and web deployment
 ```
+
+## Quick start
+
+The shortest path runs the web app and CAD backend locally **without Supabase**. It skips account checks, persistent chat/model storage, and credit enforcement. You still need an OpenRouter API key with access to the models configured in [web/lib/models.js](web/lib/models.js).
+
+### 1. Prerequisites
+
+- Git and Node.js **22** with npm (the version used by the deployment workflow).
+- Python **3.13.7 or newer within 3.13**; the package requires `>=3.13.7,<3.14`.
+- A platform supported by the pinned CadQuery/OCP wheels, or Docker using the Linux amd64 image described below.
+
+Commands below use a POSIX shell and start from the repository root unless noted.
+
+```bash
+git clone https://github.com/katifrahim/t2c.git
+cd t2c
+
+python3.13 -m venv mcp_server/.venv
+mcp_server/.venv/bin/python -m pip install --upgrade pip
+mcp_server/.venv/bin/python -m pip install -e './mcp_server[dev]'
+
+cd web
+npm ci
+cp .env.local.example .env.local
+```
+
+### 2. Configure the web app
+
+Edit `web/.env.local` and fill in:
+
+```dotenv
+BACKEND_URL=http://localhost:8080
+OPENROUTER_API_KEY=your-openrouter-api-key
+```
+
+Leave `MCP_TOKEN` empty for this loopback-only setup and leave Supabase settings unset. Keep real keys in local environment files, outside version control.
+
+### 3. Start both services
+
+In one terminal, from the repository root:
+
+```bash
+MCP_TRANSPORT=http MCP_HOST=127.0.0.1 PORT=8080 \
+  mcp_server/.venv/bin/python mcp_server/src/t2c_mcp.py
+```
+
+In another terminal, from the repository root:
+
+```bash
+cd web
+npm run dev
+```
+
+Open **[localhost:3000](http://localhost:3000)**. Check backend health with:
+
+```bash
+curl http://localhost:8080/health
+# {"status":"ok"}
+```
+
+> [!NOTE]
+> Set `PORT=8080` explicitly: the Python HTTP server defaults to **9000**, while the web app's default backend URL uses **8080**. The backend defaults to **stdio** unless `MCP_TRANSPORT=http` is set.
+
+### 4. Build your first part
+
+Try:
+
+> Create a 60 × 40 × 6 mm rectangular plate with four 5 mm through-holes, each centered 8 mm from its two nearest edges. Round the four outside vertical edges with a 2 mm fillet.
+
+Follow up with a dimensional change, attach a reference image, or select geometry in the viewer to refer to it in chat. Use **Export** to download the active model. Use **Import** to start from a `.step` or `.stp` file.
+
+## Accounts and persistence
+
+Add Supabase to enable authentication, durable histories, CAD snapshots, and usage balances.
+
+### 1. Configure Supabase
+
+Create a Supabase project and add these values to `web/.env.local` (they are additional to the supplied example file):
+
+```dotenv
+NEXT_PUBLIC_SUPABASE_URL=https://your-project.supabase.co
+NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY=your-publishable-key
+
+# Server-only: needed for template preview storage and maintenance scripts.
+SUPABASE_SECRET_KEY=your-server-secret-key
+```
+
+Use the publishable key for the browser and a server secret/service-role key for `SUPABASE_SECRET_KEY`. Never give a secret key a `NEXT_PUBLIC_` prefix.
+
+### 2. Apply the SQL scripts
+
+For a fresh project, run these files in the Supabase SQL editor **in this order**:
+
+| Order | Script | Purpose |
+| --- | --- | --- |
+| 1 | [schema.sql](web/supabase/schema.sql) | Chats, messages, indexes, and access policies |
+| 2 | [credits.sql](web/supabase/credits.sql) | Credit balances, usage events, signup grants, and charging function |
+| 3 | [langfuse.sql](web/supabase/langfuse.sql) | Trace ID column and the charging function signature used by the app |
+| 4 | [snapshots.sql](web/supabase/snapshots.sql) | Legacy snapshot table, still queried as a restore fallback |
+| 5 | [snapshots-storage.sql](web/supabase/snapshots-storage.sql) | Private `cad-snapshots` bucket and owner-scoped storage policies |
+| 6 | [templates.sql](web/supabase/templates.sql) | pgvector, template recipes, and semantic retrieval |
+| 7 | [templates-library.sql](web/supabase/templates-library.sql) | Library metadata, preferences, listing, and preview authorization |
+| 8 | [templates-storage.sql](web/supabase/templates-storage.sql) | Private `cad-templates` preview bucket |
+
+> [!IMPORTANT]
+> Apply `langfuse.sql` after `credits.sql` **even if tracing is disabled**: it installs the `charge_usage` signature the application calls. If you rerun `credits.sql`, rerun `langfuse.sql` afterward to remove the obsolete overload.
+
+### 3. Configure authentication and restart
+
+In Supabase Auth, set the local site URL to `http://localhost:3000` and allow the application's callback and reset destinations:
+
+- `http://localhost:3000/auth/callback` (including the signup `?next=/` variant)
+- `http://localhost:3000/reset`
+
+Enable email/password sign-in; configure Google OAuth if you want the Google sign-in option. Optional email templates are in [web/supabase/email-templates/](web/supabase/email-templates/). Add your deployed origin's corresponding URLs when hosting the app.
+
+Restart Next.js after updating the environment. Sign up, build a part, then reopen the chat to check that both messages and geometry restore.
+
+## Configuration
+
+### Web application — `web/.env.local`
+
+| Variable | Purpose |
+| --- | --- |
+| `BACKEND_URL` | Python backend origin; defaults to `http://localhost:8080`. |
+| `OPENROUTER_API_KEY` | Required for model calls. |
+| `MCP_TOKEN` | Server-to-server bearer token; must match the backend when configured. |
+| `NEXT_PUBLIC_SUPABASE_URL` | Enables Supabase-backed authentication and persistence. |
+| `NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY` | Browser-safe Supabase project key. |
+| `SUPABASE_SECRET_KEY` | Server-only access for template preview blobs and maintenance scripts. |
+| `GOOGLE_GENERATIVE_AI_API_KEY` | Enables template embeddings and semantic retrieval; omit to use chat without retrieval. |
+| `TEMPLATE_MATCH_THRESHOLD` | Template similarity threshold; defaults to `0.5`. |
+| `LANGFUSE_PUBLIC_KEY`, `LANGFUSE_SECRET_KEY`, `LANGFUSE_BASE_URL` | Optional tracing. Set the base URL for your Langfuse region. |
+| `NEXT_PUBLIC_POSTHOG_KEY`, `NEXT_PUBLIC_POSTHOG_HOST` | Optional product analytics; the current proxy configuration targets the US region. |
+| `NEXT_PUBLIC_ANALYTICS_DEV` | Set to `true` to opt into analytics capture during development. |
+| `TURN_SOFT_LIMIT_MS` | Agent turn soft time limit; defaults to `240000` ms, with client continuation support. |
+
+### Python backend — process environment
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `MCP_TRANSPORT` | `stdio` | Set to `http` for the web application. |
+| `MCP_HOST` | `0.0.0.0` | HTTP bind address; use `127.0.0.1` for local-only access. |
+| `PORT` / `MCP_PORT` | `9000` | HTTP port; `PORT` takes precedence. |
+| `MCP_TOKEN` | Unset | Enables bearer checks on MCP and protected CAD routes. |
+| `SESSION_TTL_SECONDS` | `3600` | Idle in-memory session eviction interval. |
+| `SNAPSHOT_KEEP_RECENT` | `10` | Number of recent auto-named objects retained by snapshot pruning. |
+
+The backend reads process environment variables; it does not automatically load `web/.env.local`.
 
 ## Development
 
