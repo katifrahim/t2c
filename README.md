@@ -20,17 +20,59 @@ Text2CAD AI (`t2c`) turns text prompts and reference images into editable CAD ge
 
 The agent describes **structured modeling operations** instead of generating Python scripts. The backend executes those operations with CadQuery and Open Cascade, keeping real boundary-representation (B-rep) geometry behind the visual preview. The project is aimed at mechanical design, manufacturing workflows, and makers who need exportable parts.
 
-## A look at what you can build
+## Built with Text2CAD AI
 
 <table>
   <tr>
-    <td align="center" width="33%"><img src="web/public/examples/deriaz-turbine-runner.jpeg" alt="CAD model of a Deriaz turbine runner with curved blades" width="300" /><br /><strong>Turbine runner</strong></td>
-    <td align="center" width="33%"><img src="web/public/examples/planetary-gear.png" alt="CAD model of a planetary helical gear assembly" width="300" /><br /><strong>Planetary gears</strong></td>
-    <td align="center" width="33%"><img src="web/public/examples/workbench.jpeg" alt="CAD model of a workbench assembly" width="300" /><br /><strong>Multi-part assemblies</strong></td>
+    <td align="center" width="33%"><img src="web/public/examples/deriaz-turbine-runner.jpeg" alt="CAD model of a Deriaz turbine runner with curved blades" width="300" /><br /><strong>Deriaz turbine runner</strong></td>
+    <td align="center" width="33%"><img src="web/public/examples/francis-turbine.png" alt="CAD model of a Francis turbine assembly" width="300" /><br /><strong>Francis turbine assembly</strong></td>
+    <td align="center" width="33%"><img src="web/public/examples/chain-drive.png" alt="CAD model of a chain drive" width="300" /><br /><strong>Chain drive</strong></td>
+  </tr>
+  <tr>
+    <td align="center" width="33%"><img src="web/public/examples/bearings.png" alt="CAD model of a ball bearing" width="300" /><br /><strong>Ball bearing</strong></td>
+    <td align="center" width="33%"><img src="web/public/examples/planetary-gear.png" alt="CAD model of a planetary helical gear assembly" width="300" /><br /><strong>Planetary helical gear</strong></td>
+    <td align="center" width="33%"><img src="web/public/examples/fastner.png" alt="CAD models of an M3 bolt, nut, and heatsert" width="300" /><br /><strong>M3 bolt, nut &amp; heatsert</strong></td>
+  </tr>
+  <tr>
+    <td align="center" width="33%"><img src="web/public/examples/workbench.jpeg" alt="CAD model of a workbench assembly" width="300" /><br /><strong>Workbench</strong></td>
+    <td align="center" width="33%"><img src="web/public/examples/twisted-hexa-vase.jpeg" alt="CAD model of a twisted flower vase" width="300" /><br /><strong>Flower vase</strong></td>
+    <td align="center" width="33%"><img src="web/public/examples/roller-coaster.png" alt="CAD model of a roller coaster toy" width="300" /><br /><strong>Roller coaster toy</strong></td>
+  </tr>
+  <tr>
+    <td align="center" width="33%"><img src="web/public/examples/texture-totem.png" alt="Texture totem CAD example" width="300" /><br /><strong>Texture totem</strong></td>
+    <td align="center" width="33%"><img src="web/public/examples/materials.png" alt="CAD material appearance examples" width="300" /><br /><strong>Materials</strong></td>
+    <td align="center" width="33%"><img src="web/public/examples/textures.png" alt="CAD texture examples" width="300" /><br /><strong>Textures</strong></td>
   </tr>
 </table>
 
-Examples from the application's existing gallery. Results depend on the prompt, model, and supported CAD operations.
+All 12 examples from the application's gallery. Results depend on the prompt, model, and supported CAD operations.
+
+## Built with Image2CAD AI (Beta)
+
+Turn engineering drawings into 3D CAD models. Image2CAD is currently in **beta**; the examples below pair each reference drawing on the left with its AI-generated model on the right. Click an image to view it at full size.
+
+<table>
+  <thead>
+    <tr>
+      <th align="center" width="50%">2D reference drawing</th>
+      <th align="center" width="50%">AI-generated 3D model</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td align="center" valign="middle"><a href="docs/assets/image2cad/assy6-drawing.png"><img src="docs/assets/image2cad/assy6-drawing.png" alt="Assembly 6: sectional engineering drawing of a swivel bearing" width="420" /></a><br /><strong>Assembly 6 · Swivel bearing</strong></td>
+      <td align="center" valign="middle"><a href="docs/assets/image2cad/assy6-model.png"><img src="docs/assets/image2cad/assy6-model.png" alt="AI-generated 3D CAD model of the Assembly 6 swivel bearing" width="420" /></a><br /><strong>Generated swivel bearing</strong></td>
+    </tr>
+    <tr>
+      <td align="center" valign="middle"><a href="docs/assets/image2cad/assy24-drawing.png"><img src="docs/assets/image2cad/assy24-drawing.png" alt="Assembly 24: sectional engineering drawing of a stop valve" width="420" /></a><br /><strong>Assembly 24 · Stop valve</strong></td>
+      <td align="center" valign="middle"><a href="docs/assets/image2cad/assy24-model.png"><img src="docs/assets/image2cad/assy24-model.png" alt="AI-generated 3D CAD model of the Assembly 24 stop valve" width="420" /></a><br /><strong>Generated stop valve</strong></td>
+    </tr>
+    <tr>
+      <td align="center" valign="middle"><a href="docs/assets/image2cad/part-drawing.png"><img src="docs/assets/image2cad/part-drawing.png" alt="Dimensioned engineering drawing of a sheet metal pivot bracket" width="420" /></a><br /><strong>Part · Sheet metal pivot bracket</strong></td>
+      <td align="center" valign="middle"><a href="docs/assets/image2cad/part-model.png"><img src="docs/assets/image2cad/part-model.png" alt="AI-generated 3D CAD model of the sheet metal pivot bracket" width="420" /></a><br /><strong>Generated pivot bracket</strong></td>
+    </tr>
+  </tbody>
+</table>
 
 ## Contents
 
@@ -53,7 +95,7 @@ Examples from the application's existing gallery. Results depend on the prompt, 
 
 | Capability | What it does |
 | --- | --- |
-| **Text and image to CAD** | Routes prompts through OpenRouter; the latest user prompt determines text or image mode. Routing targets are defined in [models.js](web/lib/models.js). |
+| **Text and image to CAD** | Routes prompts through OpenRouter; the latest user prompt determines text or image mode. Image2CAD is in **beta**. Routing targets are defined in [models.js](web/lib/models.js). |
 | **Live 3D workspace** | Combines streaming chat with an interactive CAD viewer, geometry selection, and measurement tools. |
 | **2D and 3D modeling** | Builds sketches, extrusions, revolutions, lofts, sweeps, booleans, fillets, and parametric curves and surfaces through structured operations. |
 | **Assemblies** | Combines named parts with placements and constraints; STEP export preserves assembly names, colors, and hierarchy. |
